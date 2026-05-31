@@ -306,5 +306,18 @@ def status(agent_name, base_path):
         raise click.ClickException(str(e))
 
 
+@cli.command()
+@click.option("--port", default=8080, type=int, help="Port to serve on (default: 8080)")
+@click.option("--base-path", default=".", help="Project root")
+def dashboard(port, base_path):
+    """Launch web dashboard for monitoring agents."""
+    try:
+        from agentgit.dashboard import run_dashboard
+        base_path = Path(base_path)
+        run_dashboard(base_path, port)
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+
 if __name__ == "__main__":
     cli()
