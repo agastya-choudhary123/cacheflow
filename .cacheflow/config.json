@@ -1,0 +1,8 @@
+{
+  "model_path": "/Users/agastya/.ollama/models/blobs/sha256-667b0c1932bc6ffc593ed1d03f895bf2dc8dc6df21db3042284a6f4416b06a29",
+  "model_name": "llama3.1:8b",
+  "model_hash": "4f56915a149a3186a4c4fe009912897d7a234069302cfacad5bec3238f090cbd",
+  "ctx_size": 8192,
+  "n_gpu_layers": 99,
+  "slot_save_path": ".agentgit/snapshots"
+}

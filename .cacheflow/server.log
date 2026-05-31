@@ -1,0 +1,14 @@
+llama_context: n_ctx_seq (8192) < n_ctx_train (131072) -- the full capacity of the model will not be utilized
+Loading model: /Users/agastya/.ollama/models/blobs/sha256-667b0c1932bc6ffc593ed1d03f895bf2dc8dc6df21db3042284a6f4416b06a29
+Starting custom llama server on port 8081
+ * Serving Flask app 'llama_server_custom'
+ * Debug mode: off
+[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://127.0.0.1:8081
+[33mPress CTRL+C to quit[0m
+127.0.0.1 - - [31/May/2026 00:10:13] "GET /health HTTP/1.1" 200 -
+127.0.0.1 - - [31/May/2026 00:10:13] "POST /slots/0/restore HTTP/1.1" 200 -
+127.0.0.1 - - [31/May/2026 00:10:41] "POST /completion HTTP/1.1" 200 -
+127.0.0.1 - - [31/May/2026 00:10:41] "POST /slots/0/erase HTTP/1.1" 200 -
+127.0.0.1 - - [31/May/2026 00:10:44] "POST /completion HTTP/1.1" 200 -
+127.0.0.1 - - [31/May/2026 00:10:44] "POST /slots/0/save HTTP/1.1" 200 -

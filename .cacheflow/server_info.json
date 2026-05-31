@@ -1,0 +1,7 @@
+{
+  "server_type": "custom_llama_cpp_python",
+  "model_path": "/Users/agastya/.ollama/models/blobs/llama3.1:8b.gguf",
+  "ctx_size": 2048,
+  "save_time_ms": 27,
+  "restore_time_ms": 110
+}
