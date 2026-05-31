@@ -2,6 +2,7 @@
 
 import fcntl
 import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,6 +78,82 @@ class AgentSession:
             self.lock_file_obj.close()
             self.lock_file_obj = None
 
+    def _collect_codebase_context(self, task: str, budget_chars: int) -> str:
+        """
+        Walk the project and build a codebase context string for the first session.
+
+        Args:
+            task: The task text, used to prioritize relevant files
+            budget_chars: Maximum total characters to inject
+
+        Returns:
+            Formatted codebase context string, or empty string if nothing useful found
+        """
+        SOURCE_EXTS = {
+            ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs",
+            ".c", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php", ".swift",
+            ".kt", ".scala", ".sh", ".bash", ".yaml", ".yml", ".toml",
+            ".json", ".md", ".txt", ".sql", ".html", ".css", ".env.example",
+        }
+        SKIP_DIRS = {".git", ".agentgit", "__pycache__", "node_modules",
+                     ".venv", "venv", ".tox", "dist", "build", ".mypy_cache"}
+
+        files: list[Path] = []
+        try:
+            result = subprocess.run(
+                ["git", "ls-files"],
+                cwd=self.base_path,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                for rel in result.stdout.splitlines():
+                    p = self.base_path / rel
+                    if p.suffix in SOURCE_EXTS and p.is_file():
+                        files.append(p)
+            else:
+                raise RuntimeError("git ls-files failed")
+        except Exception:
+            for p in self.base_path.rglob("*"):
+                if any(part in SKIP_DIRS for part in p.parts):
+                    continue
+                if p.is_file() and p.suffix in SOURCE_EXTS:
+                    files.append(p)
+
+        if not files:
+            return ""
+
+        task_words = set(task.lower().split())
+        def score(p: Path) -> int:
+            name_words = set(p.stem.lower().replace("_", " ").replace("-", " ").split())
+            return len(name_words & task_words)
+
+        files.sort(key=lambda p: (-score(p), str(p)))
+
+        parts = []
+        used = 0
+        for f in files:
+            try:
+                content = f.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            rel_path = f.relative_to(self.base_path)
+            header = f"\n--- {rel_path} ---\n"
+            available = budget_chars - used - len(header)
+            if available <= 0:
+                break
+            chunk = content[:available]
+            parts.append(header + chunk)
+            used += len(header) + len(chunk)
+            if used >= budget_chars:
+                break
+
+        if not parts:
+            return ""
+
+        return "Codebase:\n" + "".join(parts)
+
     def run(
         self,
         task: str,
@@ -119,9 +196,8 @@ class AgentSession:
                 n_gpu_layers=self.config.n_gpu_layers,
             )
 
-            # Step d: Restore snapshot or compute baseline
+            # Step d: Restore snapshot
             restore_time_ms = 0
-            baseline_tokens = 0
             is_first_session = agent.head_commit_id is None
 
             if not is_first_session:
@@ -132,13 +208,15 @@ class AgentSession:
                     snapshot_filename = Path(head_commit.snapshot_path).name
                     self.server.restore_slot(snapshot_filename)
                     restore_time_ms = int((time.time() - restore_start) * 1000)
-                    baseline_tokens = self.config.ctx_size
-            else:
-                baseline_tokens = 0
 
             # Step e: Build prompt
             if is_first_session:
-                full_prompt = f"{system_prompt}\n\nTask: {task}"
+                budget_chars = (self.config.ctx_size // 2) * 4
+                codebase_ctx = self._collect_codebase_context(task, budget_chars)
+                if codebase_ctx:
+                    full_prompt = f"{system_prompt}\n\n{codebase_ctx}\n\nTask: {task}"
+                else:
+                    full_prompt = f"{system_prompt}\n\nTask: {task}"
             else:
                 full_prompt = f"Task: {task}"
 
@@ -155,7 +233,13 @@ class AgentSession:
             tokens_in = response_data.get("tokens_evaluated", 0)
             tokens_out = response_data.get("tokens_predicted", 0)
             tokens_this_session = tokens_in + tokens_out
-            tokens_saved = baseline_tokens if not is_first_session else 0
+
+            if is_first_session:
+                tokens_saved = 0
+                self.store.update_agent_baseline(agent, tokens_in)
+            else:
+                stored_baseline = agent.baseline_tokens_evaluated or self.config.ctx_size
+                tokens_saved = max(0, stored_baseline - tokens_in)
 
             # Step g: Save slot
             save_start = time.time()

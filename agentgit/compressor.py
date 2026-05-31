@@ -174,7 +174,7 @@ class Compressor:
                 snapshot_path=str(temp_snapshot_path),
                 task=consolidation_task,
                 tokens_this_session=0,  # Fresh start
-                tokens_saved=agent.ctx_size,  # We preserved context knowledge
+                tokens_saved=0,  # Consolidation resets the window; it doesn't represent avoided evaluation
                 parent_id=agent.head_commit_id,
                 llama_cpp_version="0.0.0",
                 snapshot_save_time_ms=save_result.get("save_time_ms", 0),

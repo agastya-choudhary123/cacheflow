@@ -6,7 +6,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, ForeignKey, Uuid, event
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, ForeignKey, Uuid, event, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session as SQLSession
 from sqlalchemy.exc import IntegrityError
 
@@ -24,6 +24,7 @@ class Agent(Base):
     model_hash = Column(String, nullable=False)  # sha256 of model file
     model_name = Column(String, nullable=False)  # e.g. "llama3.1:8b"
     ctx_size = Column(Integer, nullable=False)
+    baseline_tokens_evaluated = Column(Integer, nullable=True)  # tokens from first session, used to compute real savings
     head_commit_id = Column(
         Uuid, ForeignKey("commits.id"), nullable=True
     )  # current HEAD
@@ -91,8 +92,18 @@ class AgentGitStore:
             cursor.close()
 
     def init_db(self) -> None:
-        """Create all tables."""
+        """Create all tables, running any needed schema migrations."""
         Base.metadata.create_all(self.engine)
+        self._migrate_schema()
+
+    def _migrate_schema(self) -> None:
+        """Apply additive schema migrations safely."""
+        with self.engine.connect() as conn:
+            result = conn.execute(text("PRAGMA table_info(agents)"))
+            cols = {row[1] for row in result}
+            if "baseline_tokens_evaluated" not in cols:
+                conn.execute(text("ALTER TABLE agents ADD COLUMN baseline_tokens_evaluated INTEGER"))
+                conn.commit()
 
     def _get_session(self) -> SQLSession:
         """Get a new database session."""
@@ -119,6 +130,16 @@ class AgentGitStore:
             if "UNIQUE constraint failed" in str(e):
                 raise ValueError(f"Agent '{name}' already exists")
             raise
+        finally:
+            session.close()
+
+    def update_agent_baseline(self, agent: Agent, baseline: int) -> None:
+        """Persist baseline_tokens_evaluated on first session completion."""
+        session = self._get_session()
+        try:
+            agent.baseline_tokens_evaluated = baseline
+            session.merge(agent)
+            session.commit()
         finally:
             session.close()
 

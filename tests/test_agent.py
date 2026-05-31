@@ -116,6 +116,10 @@ def test_agent_consecutive_session(agent_session, temp_dir):
         snapshot_restore_time_ms=0,
     )
 
+    # Set baseline for this agent (simulating first session completing)
+    store.update_agent_baseline(agent, 100)
+    agent = store.get_agent("test-agent")  # Refresh agent to get updated baseline
+
     # Rename to match commit ID
     final_path = snapshot_path.parent / f"{commit.id}.bin"
     snapshot_path.rename(final_path)
@@ -146,7 +150,8 @@ def test_agent_consecutive_session(agent_session, temp_dir):
         )
 
     assert result.is_first_session is False
-    assert result.tokens_saved == 8192  # ctx_size when restoring
+    # tokens_saved = baseline (100) - tokens_evaluated (40) = 60
+    assert result.tokens_saved == 60
     assert result.tokens_this_session == 60  # 40 + 20
     assert mock_server.restore_slot.called
 
@@ -270,3 +275,72 @@ def test_fork_agent_no_head_commit(temp_dir, config):
 
     with pytest.raises(ValueError, match="no HEAD commit"):
         fork_agent("main", "child", temp_dir)
+
+
+def test_first_session_stores_baseline(agent_session, temp_dir):
+    """Test that baseline_tokens_evaluated is stored after first session."""
+    # Create a fake snapshot file
+    snapshots_dir = temp_dir / ".agentgit" / "snapshots"
+    snapshots_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_file = snapshots_dir / "snapshot.bin"
+    snapshot_file.write_bytes(os.urandom(1024))
+
+    # Mock the server with specific token counts
+    mock_server = MagicMock()
+    mock_server.completion.return_value = {
+        "content": "Task completed successfully.",
+        "tokens_evaluated": 1234,  # First session baseline
+        "tokens_predicted": 567,
+    }
+    mock_server.save_slot.return_value = {
+        "filename": "snapshot.bin",
+        "save_time_ms": 100,
+        "size_bytes": 1024,
+    }
+
+    with patch("agentgit.agent.LlamaServer", return_value=mock_server):
+        result = agent_session.run(
+            task="Test task",
+            system_prompt=DEFAULT_SYSTEM_PROMPT,
+            max_tokens=512,
+        )
+
+    # Verify baseline was stored
+    agent = agent_session.store.get_agent("test-agent")
+    assert agent.baseline_tokens_evaluated == 1234
+
+
+def test_codebase_injection_first_session(agent_session, temp_dir):
+    """Test that codebase is injected into first session prompt."""
+    # Create some source files
+    (temp_dir / "main.py").write_text("def main():\n    pass\n")
+    (temp_dir / "utils.py").write_text("def helper():\n    pass\n")
+    (temp_dir / ".agentgit").mkdir(parents=True, exist_ok=True)
+    (temp_dir / ".agentgit" / "snapshots").mkdir(parents=True, exist_ok=True)
+    snapshot_file = temp_dir / ".agentgit" / "snapshots" / "snapshot.bin"
+    snapshot_file.write_bytes(os.urandom(1024))
+
+    # Mock the server
+    mock_server = MagicMock()
+    mock_server.completion.return_value = {
+        "content": "Task completed successfully.",
+        "tokens_evaluated": 100,
+        "tokens_predicted": 50,
+    }
+    mock_server.save_slot.return_value = {
+        "filename": "snapshot.bin",
+        "save_time_ms": 100,
+        "size_bytes": 1024,
+    }
+
+    with patch("agentgit.agent.LlamaServer", return_value=mock_server):
+        agent_session.run(
+            task="Analyze this codebase",
+            system_prompt=DEFAULT_SYSTEM_PROMPT,
+            max_tokens=512,
+        )
+
+    # Check that codebase context was included in the prompt
+    completion_call_args = mock_server.completion.call_args
+    prompt_arg = completion_call_args[1]["prompt"]
+    assert "Codebase:" in prompt_arg or "main.py" in prompt_arg or "utils.py" in prompt_arg

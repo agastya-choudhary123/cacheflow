@@ -185,3 +185,42 @@ def test_fork_tracking(store, temp_dir):
     assert retrieved_fork is not None
     assert retrieved_fork.forked_from_id == parent_commit.id
     assert retrieved_fork.parent_id is None
+
+
+def test_update_agent_baseline(store):
+    """Test updating agent baseline tokens."""
+    agent = store.create_agent(
+        name="test-agent",
+        model_name="llama3.1:8b",
+        model_hash="abc123def456",
+        ctx_size=8192,
+    )
+
+    # Initially baseline should be None
+    assert agent.baseline_tokens_evaluated is None
+
+    # Update baseline
+    store.update_agent_baseline(agent, 5000)
+
+    # Retrieve and verify
+    updated_agent = store.get_agent("test-agent")
+    assert updated_agent.baseline_tokens_evaluated == 5000
+
+
+def test_migrate_schema_idempotent(temp_dir):
+    """Test that migration can be called multiple times safely."""
+    db_path = temp_dir / "dag.db"
+    store = AgentGitStore(db_path)
+    store.init_db()  # First init
+    store.init_db()  # Second init should not fail
+
+    # Verify the column exists and works
+    agent = store.create_agent(
+        name="test-agent",
+        model_name="llama3.1:8b",
+        model_hash="abc123def456",
+        ctx_size=8192,
+    )
+    store.update_agent_baseline(agent, 2000)
+    updated_agent = store.get_agent("test-agent")
+    assert updated_agent.baseline_tokens_evaluated == 2000
