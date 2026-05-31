@@ -1,0 +1,287 @@
+"""SQLite DAG store for commits and agent state."""
+
+import hashlib
+import time
+from pathlib import Path
+from datetime import datetime, timezone
+from uuid import UUID, uuid4
+
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, ForeignKey, Uuid, event
+from sqlalchemy.orm import declarative_base, sessionmaker, Session as SQLSession
+from sqlalchemy.exc import IntegrityError
+
+Base = declarative_base()
+
+
+class Agent(Base):
+    """An agent that runs tasks and accumulates KV cache state."""
+
+    __tablename__ = "agents"
+
+    id = Column(Uuid, primary_key=True, default=uuid4)
+    name = Column(String, unique=True, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+    model_hash = Column(String, nullable=False)  # sha256 of model file
+    model_name = Column(String, nullable=False)  # e.g. "llama3.1:8b"
+    ctx_size = Column(Integer, nullable=False)
+    head_commit_id = Column(
+        Uuid, ForeignKey("commits.id"), nullable=True
+    )  # current HEAD
+
+
+class Commit(Base):
+    """A snapshot of agent state at a point in time."""
+
+    __tablename__ = "commits"
+
+    id = Column(Uuid, primary_key=True)
+    agent_id = Column(Uuid, ForeignKey("agents.id"), nullable=False)
+    parent_id = Column(
+        Uuid, ForeignKey("commits.id"), nullable=True
+    )  # previous commit
+    forked_from_id = Column(
+        Uuid, ForeignKey("commits.id"), nullable=True
+    )  # set when forked
+    snapshot_path = Column(String, nullable=False)  # relative path to .bin file
+    snapshot_size_bytes = Column(Integer, nullable=False)
+    task = Column(String, nullable=False)  # what the agent did
+    tokens_this_session = Column(Integer, nullable=False)
+    tokens_saved = Column(Integer, nullable=False)
+    llama_cpp_version = Column(String, nullable=False)
+    snapshot_save_time_ms = Column(Integer, nullable=False)
+    snapshot_restore_time_ms = Column(Integer, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
+class SessionLog(Base):
+    """Log of a single session with an agent."""
+
+    __tablename__ = "sessions"
+
+    id = Column(Uuid, primary_key=True, default=uuid4)
+    agent_id = Column(Uuid, ForeignKey("agents.id"), nullable=False)
+    commit_id = Column(Uuid, ForeignKey("commits.id"), nullable=True)
+    prompt = Column(String, nullable=False)
+    response = Column(String, nullable=False)
+    tokens_in = Column(Integer, nullable=False)
+    tokens_out = Column(Integer, nullable=False)
+    duration_ms = Column(Integer, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
+class AgentGitStore:
+    """Manages the SQLite DAG database."""
+
+    def __init__(self, db_path: Path):
+        """Initialize store with a database path."""
+        self.db_path = db_path
+        self.engine = create_engine(
+            f"sqlite:///{db_path}",
+            echo=False,
+            isolation_level="SERIALIZABLE",
+            connect_args={"timeout": 10},
+        )
+        self.SessionLocal = sessionmaker(bind=self.engine)
+
+        # Enable WAL mode for better concurrency
+        @event.listens_for(self.engine, "connect")
+        def set_sqlite_pragma(dbapi_conn, connection_record):
+            cursor = dbapi_conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.close()
+
+    def init_db(self) -> None:
+        """Create all tables."""
+        Base.metadata.create_all(self.engine)
+
+    def _get_session(self) -> SQLSession:
+        """Get a new database session."""
+        return self.SessionLocal()
+
+    def create_agent(
+        self, name: str, model_name: str, model_hash: str, ctx_size: int
+    ) -> Agent:
+        """Create a new agent. Raises ValueError if agent name already exists."""
+        session = self._get_session()
+        try:
+            agent = Agent(
+                name=name,
+                model_name=model_name,
+                model_hash=model_hash,
+                ctx_size=ctx_size,
+            )
+            session.add(agent)
+            session.commit()
+            session.refresh(agent)
+            return agent
+        except IntegrityError as e:
+            session.rollback()
+            if "UNIQUE constraint failed" in str(e):
+                raise ValueError(f"Agent '{name}' already exists")
+            raise
+        finally:
+            session.close()
+
+    def get_agent(self, name: str) -> Agent | None:
+        """Get an agent by name."""
+        session = self._get_session()
+        try:
+            return session.query(Agent).filter(Agent.name == name).first()
+        finally:
+            session.close()
+
+    def list_agents(self) -> list[Agent]:
+        """List all agents."""
+        session = self._get_session()
+        try:
+            return session.query(Agent).all()
+        finally:
+            session.close()
+
+    def create_commit(
+        self,
+        agent: Agent,
+        snapshot_path: str,
+        task: str,
+        tokens_this_session: int,
+        tokens_saved: int,
+        parent_id: UUID | None = None,
+        forked_from_id: UUID | None = None,
+        llama_cpp_version: str = "0.0.0",
+        snapshot_save_time_ms: int = 0,
+        snapshot_restore_time_ms: int = 0,
+    ) -> Commit:
+        """
+        Create a new commit from a snapshot file.
+
+        Args:
+            All parameters as specified
+
+        Returns:
+            Commit object
+
+        Raises:
+            FileNotFoundError: if snapshot file doesn't exist
+            ValueError: if snapshot file is empty
+        """
+        # Validate snapshot file exists and is readable
+        snapshot_full_path = Path(snapshot_path)
+        if not snapshot_full_path.exists():
+            raise FileNotFoundError(f"Snapshot file not found: {snapshot_path}")
+
+        # Verify snapshot is not empty
+        snapshot_size_bytes = snapshot_full_path.stat().st_size
+        if snapshot_size_bytes == 0:
+            raise ValueError(f"Snapshot file is empty: {snapshot_path}")
+
+        # Compute commit ID as sha256(snapshot content + agent_id + timestamp)
+        # This ensures different commits even if snapshot content is identical (e.g., forks)
+        with open(snapshot_full_path, "rb") as f:
+            file_contents = f.read()
+
+        # Hash includes snapshot content, agent ID, and timestamp for uniqueness
+        hash_input = file_contents + str(agent.id).encode() + str(int(time.time() * 1e9)).encode()
+        commit_hash = hashlib.sha256(hash_input).digest()
+        commit_id = UUID(bytes=commit_hash[:16])
+
+        session = self._get_session()
+        try:
+            commit = Commit(
+                id=commit_id,
+                agent_id=agent.id,
+                parent_id=parent_id,
+                forked_from_id=forked_from_id,
+                snapshot_path=snapshot_path,
+                snapshot_size_bytes=snapshot_size_bytes,
+                task=task,
+                tokens_this_session=tokens_this_session,
+                tokens_saved=tokens_saved,
+                llama_cpp_version=llama_cpp_version,
+                snapshot_save_time_ms=snapshot_save_time_ms,
+                snapshot_restore_time_ms=snapshot_restore_time_ms,
+            )
+            session.add(commit)
+
+            # Update agent's head commit
+            agent.head_commit_id = commit_id
+            session.merge(agent)
+
+            session.commit()
+            session.refresh(commit)
+            return commit
+        except IntegrityError as e:
+            session.rollback()
+            raise RuntimeError(f"Failed to create commit: {e}")
+        finally:
+            session.close()
+
+    def get_commit(self, commit_id: UUID) -> Commit | None:
+        """Get a commit by ID."""
+        session = self._get_session()
+        try:
+            return session.query(Commit).filter(Commit.id == commit_id).first()
+        finally:
+            session.close()
+
+    def get_commit_by_id_prefix(self, commit_id_prefix: str) -> Commit | None:
+        """Get a commit by ID prefix (short hash)."""
+        session = self._get_session()
+        try:
+            # Try parsing as UUID first
+            try:
+                commit_id = UUID(commit_id_prefix)
+                return session.query(Commit).filter(Commit.id == commit_id).first()
+            except ValueError:
+                # If not a valid UUID, treat as a prefix
+                all_commits = session.query(Commit).all()
+                for commit in all_commits:
+                    if str(commit.id).startswith(commit_id_prefix):
+                        return commit
+                return None
+        finally:
+            session.close()
+
+    def get_commit_history(self, agent: Agent) -> list[Commit]:
+        """Get commits from HEAD back to root, oldest last."""
+        commits = []
+        session = self._get_session()
+        try:
+            current_id = agent.head_commit_id
+            while current_id:
+                commit = session.query(Commit).filter(Commit.id == current_id).first()
+                if not commit:
+                    break
+                commits.append(commit)
+                current_id = commit.parent_id
+            return list(reversed(commits))
+        finally:
+            session.close()
+
+    def log_session(
+        self,
+        agent: Agent,
+        commit: Commit,
+        prompt: str,
+        response: str,
+        tokens_in: int,
+        tokens_out: int,
+        duration_ms: int,
+    ) -> SessionLog:
+        """Log a session."""
+        session = self._get_session()
+        try:
+            session_log = SessionLog(
+                agent_id=agent.id,
+                commit_id=commit.id,
+                prompt=prompt,
+                response=response,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                duration_ms=duration_ms,
+            )
+            session.add(session_log)
+            session.commit()
+            session.refresh(session_log)
+            return session_log
+        finally:
+            session.close()
