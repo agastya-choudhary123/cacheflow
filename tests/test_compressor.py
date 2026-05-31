@@ -7,10 +7,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agentgit.agent import AgentSession, DEFAULT_SYSTEM_PROMPT
-from agentgit.compressor import Compressor
-from agentgit.config import AgentGitConfig, save_config
-from agentgit.store import AgentGitStore
+from cacheflow.agent import AgentSession, DEFAULT_SYSTEM_PROMPT
+from cacheflow.compressor import Compressor
+from cacheflow.config import AgentGitConfig, save_config
+from cacheflow.store import AgentGitStore
 
 
 @pytest.fixture
@@ -23,7 +23,7 @@ def temp_dir():
 @pytest.fixture
 def config(temp_dir):
     """Create a test configuration."""
-    (temp_dir / ".agentgit").mkdir(parents=True)
+    (temp_dir / ".cacheflow").mkdir(parents=True)
     config = AgentGitConfig(
         base_path=temp_dir,
         model_path="/path/to/model.gguf",
@@ -31,7 +31,7 @@ def config(temp_dir):
         model_hash="abc123def456",
         ctx_size=8192,
         n_gpu_layers=99,
-        slot_save_path=temp_dir / ".agentgit/snapshots",
+        slot_save_path=temp_dir / ".cacheflow/snapshots",
     )
     save_config(config)
     return config
@@ -40,7 +40,7 @@ def config(temp_dir):
 @pytest.fixture
 def store(temp_dir, config):
     """Create an initialized agent store."""
-    db_path = temp_dir / ".agentgit" / "agents.db"
+    db_path = temp_dir / ".cacheflow" / "agents.db"
     store = AgentGitStore(db_path)
     store.init_db()
     return store
@@ -66,7 +66,7 @@ def test_consolidation_triggers_at_threshold(store, config, compressor, temp_dir
     threshold = int(0.7 * agent.ctx_size)
 
     # Create multiple snapshots
-    snapshots_dir = temp_dir / ".agentgit" / "snapshots"
+    snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
     snapshots_dir.mkdir(parents=True, exist_ok=True)
 
     # First commit: 3000 tokens
@@ -119,7 +119,7 @@ def test_consolidation_not_triggered_below_threshold(store, config, compressor, 
     )
 
     # Create commits that sum to <70% of ctx_size (<5734 tokens)
-    snapshots_dir = temp_dir / ".agentgit" / "snapshots"
+    snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
     snapshots_dir.mkdir(parents=True, exist_ok=True)
 
     # First commit: 2000 tokens (below threshold)
@@ -157,7 +157,7 @@ def test_consolidation_compact_returns_none_if_not_needed(
     )
 
     # Create single commit with low tokens
-    snapshots_dir = temp_dir / ".agentgit" / "snapshots"
+    snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
     snapshots_dir.mkdir(parents=True, exist_ok=True)
 
     snapshot = snapshots_dir / "snap.bin"
@@ -193,7 +193,7 @@ def test_consolidation_logs_result(store, config, compressor, temp_dir):
     )
 
     # Create commits that exceed threshold
-    snapshots_dir = temp_dir / ".agentgit" / "snapshots"
+    snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
     snapshots_dir.mkdir(parents=True, exist_ok=True)
 
     # Create two commits with high tokens
@@ -254,7 +254,7 @@ def test_consolidation_logs_result(store, config, compressor, temp_dir):
     assert "consolidation" in result.task
 
     # Check that log file was created and contains the consolidation entry
-    log_file = temp_dir / ".agentgit" / "consolidation.log"
+    log_file = temp_dir / ".cacheflow" / "consolidation.log"
     assert log_file.exists()
 
     log_content = log_file.read_text()
@@ -266,14 +266,14 @@ def test_consolidation_logs_result(store, config, compressor, temp_dir):
 def test_consolidation_save_restore(config, temp_dir):
     """Test that consolidation preserves agent knowledge across sessions."""
     # This is a higher-level integration test
-    db_path = temp_dir / ".agentgit" / "agents.db"
+    db_path = temp_dir / ".cacheflow" / "agents.db"
     store = AgentGitStore(db_path)
     store.init_db()
 
     # Run agent 3 times to accumulate knowledge
     session = AgentSession("test-agent", temp_dir)
 
-    snapshots_dir = temp_dir / ".agentgit" / "snapshots"
+    snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
     snapshots_dir.mkdir(parents=True, exist_ok=True)
 
     def mock_save_slot_side_effect(slot_id=0):
@@ -311,7 +311,7 @@ def test_consolidation_save_restore(config, temp_dir):
     assert agent is not None
 
     # Get consolidation log
-    log_file = temp_dir / ".agentgit" / "consolidation.log"
+    log_file = temp_dir / ".cacheflow" / "consolidation.log"
 
     # Consolidation may or may not have run depending on timing
     # but the key is that the agent can continue to run
@@ -346,7 +346,7 @@ def test_consolidation_async_execution(store, config, temp_dir):
         8192,
     )
 
-    snapshots_dir = temp_dir / ".agentgit" / "snapshots"
+    snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
     snapshots_dir.mkdir(parents=True, exist_ok=True)
 
     snapshot = snapshots_dir / "snap.bin"

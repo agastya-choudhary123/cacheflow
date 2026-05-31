@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from agentgit.config import (
+from cacheflow.config import (
     AgentGitConfig,
     compute_model_hash,
     find_gguf_for_model,
@@ -51,7 +51,7 @@ def test_config_save_and_load():
     """Test saving and loading configuration."""
     with tempfile.TemporaryDirectory() as tmpdir:
         base_path = Path(tmpdir)
-        (base_path / ".agentgit").mkdir(parents=True)
+        (base_path / ".cacheflow").mkdir(parents=True)
 
         # Create and save config
         config = AgentGitConfig(
@@ -61,12 +61,12 @@ def test_config_save_and_load():
             model_hash="abc123def456",
             ctx_size=4096,
             n_gpu_layers=50,
-            slot_save_path=base_path / ".agentgit/snapshots",
+            slot_save_path=base_path / ".cacheflow/snapshots",
         )
         save_config(config)
 
         # Verify file was written
-        config_file = base_path / ".agentgit" / "config.json"
+        config_file = base_path / ".cacheflow" / "config.json"
         assert config_file.exists()
 
         # Load and verify

@@ -1,41 +1,41 @@
-"""AgentGit: Persistent KV cache memory for AI agents."""
+"""CacheFlow: Persistent KV cache memory for AI agents."""
 
 __version__ = "0.1.0"
 
 
 # Exception hierarchy
-class AgentGitError(Exception):
-    """Base exception for all AgentGit errors."""
+class CacheFlowError(Exception):
+    """Base exception for all CacheFlow errors."""
     pass
 
 
-class ServerError(AgentGitError):
+class ServerError(CacheFlowError):
     """Errors related to llama-server process management."""
     pass
 
 
-class SnapshotError(AgentGitError):
+class SnapshotError(CacheFlowError):
     """Errors related to snapshot save/restore/validation."""
     pass
 
 
-class ModelMismatchError(AgentGitError):
+class ModelMismatchError(CacheFlowError):
     """Model hash or version mismatch error."""
     pass
 
 
-class VersionMismatchError(AgentGitError):
+class VersionMismatchError(CacheFlowError):
     """llama.cpp version mismatch error."""
     pass
 
 
-class AgentSessionError(AgentGitError):
+class AgentSessionError(CacheFlowError):
     """Errors during agent session execution."""
     pass
 
 
 __all__ = [
-    "AgentGitError",
+    "CacheFlowError",
     "ServerError",
     "SnapshotError",
     "ModelMismatchError",

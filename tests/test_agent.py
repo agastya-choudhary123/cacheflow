@@ -7,9 +7,9 @@ from unittest.mock import MagicMock, patch, mock_open
 
 import pytest
 
-from agentgit.agent import AgentSession, SessionResult, DEFAULT_SYSTEM_PROMPT, fork_agent
-from agentgit.config import AgentGitConfig, save_config
-from agentgit.store import AgentGitStore
+from cacheflow.agent import AgentSession, SessionResult, DEFAULT_SYSTEM_PROMPT, fork_agent
+from cacheflow.config import AgentGitConfig, save_config
+from cacheflow.store import AgentGitStore
 
 
 @pytest.fixture
@@ -22,7 +22,7 @@ def temp_dir():
 @pytest.fixture
 def config(temp_dir):
     """Create a test configuration."""
-    (temp_dir / ".agentgit").mkdir(parents=True)
+    (temp_dir / ".cacheflow").mkdir(parents=True)
     config = AgentGitConfig(
         base_path=temp_dir,
         model_path="/path/to/model.gguf",
@@ -30,7 +30,7 @@ def config(temp_dir):
         model_hash="abc123def456",
         ctx_size=8192,
         n_gpu_layers=99,
-        slot_save_path=temp_dir / ".agentgit/snapshots",
+        slot_save_path=temp_dir / ".cacheflow/snapshots",
     )
     save_config(config)
     return config
@@ -54,7 +54,7 @@ def test_agent_session_init(agent_session, config):
 def test_agent_first_session(agent_session, temp_dir):
     """Test running an agent for the first time."""
     # Create a fake snapshot file
-    snapshots_dir = temp_dir / ".agentgit" / "snapshots"
+    snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
     snapshots_dir.mkdir(parents=True, exist_ok=True)
     snapshot_file = snapshots_dir / "snapshot.bin"
     snapshot_file.write_bytes(os.urandom(1024))
@@ -100,7 +100,7 @@ def test_agent_consecutive_session(agent_session, temp_dir):
         8192,
     )
 
-    snapshot_path = temp_dir / ".agentgit" / "snapshots" / "initial.bin"
+    snapshot_path = temp_dir / ".cacheflow" / "snapshots" / "initial.bin"
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     snapshot_path.write_bytes(os.urandom(1024))
 
@@ -158,7 +158,7 @@ def test_agent_consecutive_session(agent_session, temp_dir):
 
 def test_agent_session_lock(agent_session):
     """Test that lock is acquired and released properly."""
-    lock_file = agent_session.base_path / ".agentgit" / ".agentgit.lock"
+    lock_file = agent_session.base_path / ".cacheflow" / ".cacheflow.lock"
 
     # Lock should not exist yet
     assert not lock_file.exists()
@@ -204,14 +204,14 @@ def test_session_result_dataclass():
 
 def test_fork_agent(temp_dir, config):
     """Test forking an agent."""
-    db_path = temp_dir / ".agentgit" / "agents.db"
+    db_path = temp_dir / ".cacheflow" / "agents.db"
     store = AgentGitStore(db_path)
     store.init_db()
 
     # Create parent agent with a commit
     parent = store.create_agent("main", "llama3.1:8b", "abc123", 8192)
 
-    snapshot_path = temp_dir / ".agentgit" / "snapshots" / "parent_snapshot.bin"
+    snapshot_path = temp_dir / ".cacheflow" / "snapshots" / "parent_snapshot.bin"
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     snapshot_path.write_bytes(os.urandom(1024))
 
@@ -256,7 +256,7 @@ def test_fork_agent(temp_dir, config):
 
 def test_fork_agent_nonexistent_parent(temp_dir, config):
     """Test forking with non-existent parent."""
-    db_path = temp_dir / ".agentgit" / "agents.db"
+    db_path = temp_dir / ".cacheflow" / "agents.db"
     store = AgentGitStore(db_path)
     store.init_db()
 
@@ -266,7 +266,7 @@ def test_fork_agent_nonexistent_parent(temp_dir, config):
 
 def test_fork_agent_no_head_commit(temp_dir, config):
     """Test forking parent with no HEAD commit."""
-    db_path = temp_dir / ".agentgit" / "agents.db"
+    db_path = temp_dir / ".cacheflow" / "agents.db"
     store = AgentGitStore(db_path)
     store.init_db()
 
@@ -280,7 +280,7 @@ def test_fork_agent_no_head_commit(temp_dir, config):
 def test_first_session_stores_baseline(agent_session, temp_dir):
     """Test that baseline_tokens_evaluated is stored after first session."""
     # Create a fake snapshot file
-    snapshots_dir = temp_dir / ".agentgit" / "snapshots"
+    snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
     snapshots_dir.mkdir(parents=True, exist_ok=True)
     snapshot_file = snapshots_dir / "snapshot.bin"
     snapshot_file.write_bytes(os.urandom(1024))
@@ -315,9 +315,9 @@ def test_codebase_injection_first_session(agent_session, temp_dir):
     # Create some source files
     (temp_dir / "main.py").write_text("def main():\n    pass\n")
     (temp_dir / "utils.py").write_text("def helper():\n    pass\n")
-    (temp_dir / ".agentgit").mkdir(parents=True, exist_ok=True)
-    (temp_dir / ".agentgit" / "snapshots").mkdir(parents=True, exist_ok=True)
-    snapshot_file = temp_dir / ".agentgit" / "snapshots" / "snapshot.bin"
+    (temp_dir / ".cacheflow").mkdir(parents=True, exist_ok=True)
+    (temp_dir / ".cacheflow" / "snapshots").mkdir(parents=True, exist_ok=True)
+    snapshot_file = temp_dir / ".cacheflow" / "snapshots" / "snapshot.bin"
     snapshot_file.write_bytes(os.urandom(1024))
 
     # Mock the server

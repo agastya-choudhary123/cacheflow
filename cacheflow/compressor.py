@@ -5,9 +5,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4
 
-from agentgit.config import AgentGitConfig
-from agentgit.server import LlamaServer
-from agentgit.store import Agent, AgentGitStore, Commit
+from cacheflow.config import CacheFlowConfig
+from cacheflow.server import LlamaServer
+from cacheflow.store import Agent, CacheFlowStore, Commit
 
 
 logger = logging.getLogger(__name__)
@@ -30,13 +30,13 @@ Now produce the snapshot:"""
 class Compressor:
     """Manages context consolidation when an agent's context exceeds threshold."""
 
-    def __init__(self, store: AgentGitStore, config: AgentGitConfig):
+    def __init__(self, store: CacheFlowStore, config: CacheFlowConfig):
         """
         Initialize compressor.
 
         Args:
-            store: AgentGitStore instance
-            config: AgentGitConfig instance
+            store: CacheFlowStore instance
+            config: CacheFlowConfig instance
         """
         self.store = store
         self.config = config
@@ -226,7 +226,7 @@ class Compressor:
         self, agent: Agent, commit: Commit, num_sessions: int
     ) -> None:
         """Log consolidation event."""
-        log_file = self.config.base_path / ".agentgit" / "consolidation.log"
+        log_file = self.config.base_path / ".cacheflow" / "consolidation.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
 
         message = (
@@ -241,7 +241,7 @@ class Compressor:
 
     def _log_error(self, agent: Agent, error: Exception) -> None:
         """Log consolidation error."""
-        log_file = self.config.base_path / ".agentgit" / "consolidation.log"
+        log_file = self.config.base_path / ".cacheflow" / "consolidation.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
 
         message = (

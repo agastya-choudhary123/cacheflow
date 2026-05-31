@@ -7,8 +7,8 @@ import tempfile
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from agentgit.server import LlamaServer
-from agentgit.config import find_gguf_for_model, compute_model_hash
+from cacheflow.server import LlamaServer
+from cacheflow.config import find_gguf_for_model, compute_model_hash
 
 
 def find_model():

@@ -1,17 +1,17 @@
-"""Command-line interface for agentgit."""
+"""Command-line interface for CacheFlow."""
 
 from pathlib import Path
 
 import click
 
-from agentgit.agent import AgentSession, DEFAULT_SYSTEM_PROMPT, fork_agent
-from agentgit.config import AgentGitConfig, compute_model_hash, save_config
-from agentgit.store import AgentGitStore
+from cacheflow.agent import AgentSession, DEFAULT_SYSTEM_PROMPT, fork_agent
+from cacheflow.config import CacheFlowConfig, compute_model_hash, save_config
+from cacheflow.store import CacheFlowStore
 
 
 @click.group()
 def cli():
-    """AgentGit: Persistent KV cache memory for AI agents."""
+    """CacheFlow: Persistent KV cache memory for AI agents."""
     pass
 
 
@@ -39,25 +39,25 @@ def init(agent_name, model_path, model_name, ctx_size, n_gpu_layers, base_path):
             model_name = model_path_abs.stem
 
         # Create config
-        config = AgentGitConfig(
+        config = CacheFlowConfig(
             base_path=base_path,
             model_path=str(model_path_abs),
             model_name=model_name,
             model_hash=model_hash,
             ctx_size=ctx_size,
             n_gpu_layers=n_gpu_layers,
-            slot_save_path=base_path / ".agentgit" / "snapshots",
+            slot_save_path=base_path / ".cacheflow" / "snapshots",
         )
         save_config(config)
 
         # Initialize database
-        db_path = base_path / ".agentgit" / "agents.db"
+        db_path = base_path / ".cacheflow" / "agents.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = AgentGitStore(db_path)
+        store = CacheFlowStore(db_path)
         store.init_db()
 
         click.echo("✓ Initialized agentgit project")
-        click.echo(f"  Config: {base_path / '.agentgit' / 'config.json'}")
+        click.echo(f"  Config: {base_path / '.cacheflow' / 'config.json'}")
         click.echo(f"  Database: {db_path}")
         click.echo(f"  Model: {model_name}")
         click.echo(f"  Context size: {ctx_size}")
@@ -102,12 +102,12 @@ def log(agent_name, limit, base_path):
     """Display commit history for an agent."""
     try:
         base_path = Path(base_path)
-        db_path = base_path / ".agentgit" / "agents.db"
+        db_path = base_path / ".cacheflow" / "agents.db"
 
         if not db_path.exists():
             raise click.ClickException("No database found. Run 'agentgit init' first.")
 
-        store = AgentGitStore(db_path)
+        store = CacheFlowStore(db_path)
         agent = store.get_agent(agent_name)
 
         if not agent:
@@ -142,12 +142,12 @@ def agents(base_path):
     """List all agents in the project."""
     try:
         base_path = Path(base_path)
-        db_path = base_path / ".agentgit" / "agents.db"
+        db_path = base_path / ".cacheflow" / "agents.db"
 
         if not db_path.exists():
             raise click.ClickException("No database found. Run 'agentgit init' first.")
 
-        store = AgentGitStore(db_path)
+        store = CacheFlowStore(db_path)
         agent_list = store.list_agents()
 
         if not agent_list:
@@ -177,7 +177,7 @@ def fork(parent_agent, child_agent, scope, base_path):
     """Fork an agent from a parent agent."""
     try:
         base_path = Path(base_path)
-        db_path = base_path / ".agentgit" / "agents.db"
+        db_path = base_path / ".cacheflow" / "agents.db"
 
         if not db_path.exists():
             raise click.ClickException("No database found. Run 'agentgit init' first.")
@@ -186,7 +186,7 @@ def fork(parent_agent, child_agent, scope, base_path):
         new_agent = fork_agent(parent_agent, child_agent, base_path, scope=scope)
 
         # Get the head commit for size info
-        store = AgentGitStore(db_path)
+        store = CacheFlowStore(db_path)
         head_commit = store.get_commit(new_agent.head_commit_id)
         snapshot_size = (
             head_commit.snapshot_size_bytes if head_commit else 0
@@ -208,12 +208,12 @@ def diff(commit_a, commit_b, agent_name, base_path):
     """Show semantic diff between two commits."""
     try:
         base_path = Path(base_path)
-        db_path = base_path / ".agentgit" / "agents.db"
+        db_path = base_path / ".cacheflow" / "agents.db"
 
         if not db_path.exists():
             raise click.ClickException("No database found. Run 'agentgit init' first.")
 
-        store = AgentGitStore(db_path)
+        store = CacheFlowStore(db_path)
         agent = store.get_agent(agent_name)
 
         if not agent:
@@ -260,12 +260,12 @@ def status(agent_name, base_path):
     """Show current status of the project."""
     try:
         base_path = Path(base_path)
-        db_path = base_path / ".agentgit" / "agents.db"
+        db_path = base_path / ".cacheflow" / "agents.db"
 
         if not db_path.exists():
             raise click.ClickException("No database found. Run 'agentgit init' first.")
 
-        store = AgentGitStore(db_path)
+        store = CacheFlowStore(db_path)
 
         # Get the specified agent
         agent = store.get_agent(agent_name)
@@ -279,7 +279,7 @@ def status(agent_name, base_path):
         total_tokens_saved = sum(c.tokens_saved for c in commits)
 
         # Calculate snapshot sizes
-        snapshots_dir = base_path / ".agentgit" / "snapshots"
+        snapshots_dir = base_path / ".cacheflow" / "snapshots"
         total_snapshot_size = 0
         num_snapshots = 0
         if snapshots_dir.exists():
@@ -312,7 +312,7 @@ def status(agent_name, base_path):
 def dashboard(port, base_path):
     """Launch web dashboard for monitoring agents."""
     try:
-        from agentgit.dashboard import run_dashboard
+        from cacheflow.dashboard import run_dashboard
         base_path = Path(base_path)
         run_dashboard(base_path, port)
     except Exception as e:

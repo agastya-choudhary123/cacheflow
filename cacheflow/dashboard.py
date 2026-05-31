@@ -1,9 +1,9 @@
-"""Web dashboard for agentgit using Flask."""
+"""Web dashboard for CacheFlow using Flask."""
 
 from pathlib import Path
 from flask import Flask, render_template_string, jsonify
 from sqlalchemy.orm import Session as SQLSession
-from agentgit.store import AgentGitStore, Commit, SessionLog
+from cacheflow.store import CacheFlowStore, Commit, SessionLog
 import json
 
 
@@ -410,7 +410,7 @@ HTML_TEMPLATE = """
 def get_dashboard_data(base_path: Path) -> dict:
     """Query the store and return all dashboard metrics."""
     base_path = Path(base_path)
-    db_path = base_path / ".agentgit" / "agents.db"
+    db_path = base_path / ".cacheflow" / "agents.db"
 
     if not db_path.exists():
         return {
@@ -420,7 +420,7 @@ def get_dashboard_data(base_path: Path) -> dict:
             "snapshots": {"count": 0, "total_size_mb": 0, "files": []},
         }
 
-    store = AgentGitStore(db_path)
+    store = CacheFlowStore(db_path)
 
     # Fetch all agents and compute stats
     all_agents = store.list_agents()
@@ -510,7 +510,7 @@ def get_dashboard_data(base_path: Path) -> dict:
         })
 
     # Fetch snapshot stats
-    snapshots_dir = base_path / ".agentgit" / "snapshots"
+    snapshots_dir = base_path / ".cacheflow" / "snapshots"
     snapshot_files = []
     total_snapshot_size = 0
 

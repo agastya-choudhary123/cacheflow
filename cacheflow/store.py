@@ -70,7 +70,7 @@ class SessionLog(Base):
     created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
-class AgentGitStore:
+class CacheFlowStore:
     """Manages the SQLite DAG database."""
 
     def __init__(self, db_path: Path):

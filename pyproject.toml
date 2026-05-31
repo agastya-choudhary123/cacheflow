@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agentgit"
+name = "cacheflow"
 version = "0.1.0"
-description = "Persistent KV cache memory for AI agents"
+description = "Persistent KV cache memory for AI agents with intelligent snapshotting"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -25,4 +25,4 @@ dev = [
 ]
 
 [project.scripts]
-agentgit = "agentgit.cli:cli"
+cf = "cacheflow.cli:cli"

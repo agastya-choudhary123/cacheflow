@@ -52,7 +52,7 @@ class LlamaServer:
 
         # Get project root for logging
         project_root = Path(__file__).parent.parent
-        log_dir = project_root / ".agentgit"
+        log_dir = project_root / ".cacheflow"
         log_dir.mkdir(exist_ok=True)
         server_log = log_dir / "server.log"
 

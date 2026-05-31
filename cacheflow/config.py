@@ -1,5 +1,5 @@
 """
-Configuration for AgentGit: model paths, context size, and defaults.
+Configuration for CacheFlow: model paths, context size, and defaults.
 """
 
 import hashlib
@@ -10,7 +10,7 @@ from typing import Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-class AgentGitConfig(BaseModel):
+class CacheFlowConfig(BaseModel):
     """Configuration for an agentgit project."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -21,7 +21,7 @@ class AgentGitConfig(BaseModel):
     model_hash: str
     ctx_size: int = 8192
     n_gpu_layers: int = 99
-    slot_save_path: Path = Field(default_factory=lambda: Path(".agentgit/snapshots"))
+    slot_save_path: Path = Field(default_factory=lambda: Path(".cacheflow/snapshots"))
 
     @field_validator("ctx_size")
     @classmethod
@@ -40,8 +40,8 @@ class AgentGitConfig(BaseModel):
         return v
 
     def save(self) -> None:
-        """Save config to .agentgit/config.json."""
-        config_file = self.base_path / ".agentgit" / "config.json"
+        """Save config to .cacheflow/config.json."""
+        config_file = self.base_path / ".cacheflow" / "config.json"
         config_file.parent.mkdir(parents=True, exist_ok=True)
 
         # Convert paths to strings for JSON serialization
@@ -76,30 +76,30 @@ def compute_model_hash(model_path: str, bytes_to_read: int = 10 * 1024 * 1024) -
     return sha256.hexdigest()
 
 
-def save_config(config: AgentGitConfig) -> None:
+def save_config(config: CacheFlowConfig) -> None:
     """
-    Save config to .agentgit/config.json.
+    Save config to .cacheflow/config.json.
 
     Args:
-        config: AgentGitConfig instance to save
+        config: CacheFlowConfig instance to save
     """
     config.save()
 
 
-def load_config(base_path: Path) -> AgentGitConfig:
+def load_config(base_path: Path) -> CacheFlowConfig:
     """
-    Load config from .agentgit/config.json.
+    Load config from .cacheflow/config.json.
 
     Args:
         base_path: Project root path
 
     Returns:
-        AgentGitConfig instance
+        CacheFlowConfig instance
 
     Raises:
         FileNotFoundError: If config file doesn't exist
     """
-    config_file = base_path / ".agentgit" / "config.json"
+    config_file = base_path / ".cacheflow" / "config.json"
 
     if not config_file.exists():
         raise FileNotFoundError(
@@ -109,14 +109,14 @@ def load_config(base_path: Path) -> AgentGitConfig:
     with open(config_file) as f:
         data = json.load(f)
 
-    return AgentGitConfig(
+    return CacheFlowConfig(
         base_path=base_path,
         model_path=data["model_path"],
         model_name=data["model_name"],
         model_hash=data["model_hash"],
         ctx_size=data.get("ctx_size", 8192),
         n_gpu_layers=data.get("n_gpu_layers", 99),
-        slot_save_path=Path(data.get("slot_save_path", ".agentgit/snapshots")),
+        slot_save_path=Path(data.get("slot_save_path", ".cacheflow/snapshots")),
     )
 
 

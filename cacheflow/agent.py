@@ -9,10 +9,10 @@ from pathlib import Path
 from uuid import UUID, uuid4
 from typing import Optional
 
-from agentgit.config import load_config, AgentGitConfig
-from agentgit.store import AgentGitStore, Agent
-from agentgit.server import LlamaServer
-from agentgit.compressor import Compressor
+from cacheflow.config import load_config, CacheFlowConfig
+from cacheflow.store import CacheFlowStore, Agent
+from cacheflow.server import LlamaServer
+from cacheflow.compressor import Compressor
 
 
 DEFAULT_SYSTEM_PROMPT = """You are an expert software engineer with deep knowledge of the codebase you've been given access to. You help with coding tasks efficiently and precisely. When you complete a task, briefly summarize what you did and what you learned about the codebase."""
@@ -46,8 +46,8 @@ class AgentSession:
         """
         self.agent_name = agent_name
         self.base_path = Path(base_path)
-        self.config: Optional[AgentGitConfig] = None
-        self.store: Optional[AgentGitStore] = None
+        self.config: Optional[CacheFlowConfig] = None
+        self.store: Optional[CacheFlowStore] = None
         self.server: Optional[LlamaServer] = None
         self.lock_file: Optional[Path] = None
         self.lock_file_obj: Optional[object] = None
@@ -56,13 +56,13 @@ class AgentSession:
     def _setup(self) -> None:
         """Load config and initialize store."""
         self.config = load_config(self.base_path)
-        db_path = self.base_path / ".agentgit" / "agents.db"
-        self.store = AgentGitStore(db_path)
+        db_path = self.base_path / ".cacheflow" / "agents.db"
+        self.store = CacheFlowStore(db_path)
         self.store.init_db()
 
     def _acquire_lock(self) -> None:
         """Acquire file lock to prevent concurrent runs."""
-        self.lock_file = self.base_path / ".agentgit" / ".agentgit.lock"
+        self.lock_file = self.base_path / ".cacheflow" / ".cacheflow.lock"
         self.lock_file.parent.mkdir(parents=True, exist_ok=True)
 
         # Open or create lock file and keep the object alive
@@ -95,7 +95,7 @@ class AgentSession:
             ".kt", ".scala", ".sh", ".bash", ".yaml", ".yml", ".toml",
             ".json", ".md", ".txt", ".sql", ".html", ".css", ".env.example",
         }
-        SKIP_DIRS = {".git", ".agentgit", "__pycache__", "node_modules",
+        SKIP_DIRS = {".git", ".cacheflow", "__pycache__", "node_modules",
                      ".venv", "venv", ".tox", "dist", "build", ".mypy_cache"}
 
         files: list[Path] = []
@@ -357,8 +357,8 @@ def fork_agent(
         ValueError: If parent agent not found or has no HEAD commit
     """
     base_path = Path(base_path)
-    db_path = base_path / ".agentgit" / "agents.db"
-    store = AgentGitStore(db_path)
+    db_path = base_path / ".cacheflow" / "agents.db"
+    store = CacheFlowStore(db_path)
 
     # Load parent agent
     parent_agent = store.get_agent(parent_name)
@@ -382,12 +382,12 @@ def fork_agent(
     )
 
     # Copy parent's snapshot to a new file for the child
-    snapshots_dir = base_path / ".agentgit" / "snapshots"
+    snapshots_dir = base_path / ".cacheflow" / "snapshots"
     snapshots_dir.mkdir(parents=True, exist_ok=True)
 
     parent_snapshot_path = Path(head_commit.snapshot_path)
     if not parent_snapshot_path.is_absolute():
-        parent_snapshot_path = base_path / ".agentgit" / parent_snapshot_path
+        parent_snapshot_path = base_path / ".cacheflow" / parent_snapshot_path
 
     fork_snapshot_name = f"fork_{child_name}_{str(parent_agent.head_commit_id)[:8]}.bin"
     fork_snapshot_path = snapshots_dir / fork_snapshot_name

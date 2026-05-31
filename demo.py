@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-AgentGit Live Demo Script
+CacheFlow Live Demo Script
 
-Demonstrates the value of AgentGit by running a coding agent against its own
+Demonstrates the value of CacheFlow by running a coding agent against its own
 codebase across 5 sessions, tracking token cost reduction via KV cache snapshots.
 Then forks a sub-agent to show inherited context at zero re-ingestion cost.
 
@@ -31,7 +31,7 @@ class DemoRunner:
         """Print demo banner."""
         print()
         print("╔══════════════════════════════════════════════════╗")
-        print("║            AgentGit — Live Demo                  ║")
+        print("║            CacheFlow — Live Demo                  ║")
         print("║   Agents that remember. Costs that drop.         ║")
         print("╚══════════════════════════════════════════════════╝")
         print()
@@ -73,8 +73,8 @@ class DemoRunner:
         """
         print("\n🔧 Initializing agentgit project...")
 
-        # Create mock .agentgit directory and config
-        agentgit_dir = self.temp_dir / ".agentgit"
+        # Create mock .cacheflow directory and config
+        agentgit_dir = self.temp_dir / ".cacheflow"
         agentgit_dir.mkdir(parents=True, exist_ok=True)
 
         # Create mock config
@@ -279,7 +279,7 @@ class DemoRunner:
         print(f"Total tokens saved: {self.cumulative_tokens_saved:,}")
         print(f"Efficiency improvement: {efficiency_pct}%")
         print()
-        print("AgentGit's KV cache snapshots enable:")
+        print("CacheFlow's KV cache snapshots enable:")
         print("  ✓ Fast context restoration (180ms average)")
         print("  ✓ 80%+ token savings by session 5")
         print("  ✓ Agent forking with inherited context (zero cost)")

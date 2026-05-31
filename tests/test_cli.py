@@ -8,10 +8,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
-from agentgit.cli import cli, init, run, log, agents, fork, diff, status
-from agentgit.config import AgentGitConfig, save_config
-from agentgit.store import AgentGitStore
-from agentgit.agent import fork_agent
+from cacheflow.cli import cli, init, run, log, agents, fork, diff, status
+from cacheflow.config import AgentGitConfig, save_config
+from cacheflow.store import AgentGitStore
+from cacheflow.agent import fork_agent
 
 
 @pytest.fixture
@@ -30,7 +30,7 @@ def temp_dir():
 @pytest.fixture
 def config(temp_dir):
     """Create a test configuration."""
-    (temp_dir / ".agentgit").mkdir(parents=True)
+    (temp_dir / ".cacheflow").mkdir(parents=True)
     config = AgentGitConfig(
         base_path=temp_dir,
         model_path="/path/to/model.gguf",
@@ -38,11 +38,11 @@ def config(temp_dir):
         model_hash="abc123def456",
         ctx_size=8192,
         n_gpu_layers=99,
-        slot_save_path=temp_dir / ".agentgit" / "snapshots",
+        slot_save_path=temp_dir / ".cacheflow" / "snapshots",
     )
     save_config(config)
     # Initialize database
-    db_path = temp_dir / ".agentgit" / "agents.db"
+    db_path = temp_dir / ".cacheflow" / "agents.db"
     store = AgentGitStore(db_path)
     store.init_db()
     return config
@@ -71,11 +71,11 @@ class TestInitCommand:
         assert "Config:" in result.output
 
         # Check config file exists
-        config_file = temp_dir / ".agentgit" / "config.json"
+        config_file = temp_dir / ".cacheflow" / "config.json"
         assert config_file.exists()
 
         # Check database exists
-        db_file = temp_dir / ".agentgit" / "agents.db"
+        db_file = temp_dir / ".cacheflow" / "agents.db"
         assert db_file.exists()
 
     def test_init_command_with_model_name(self, runner, temp_dir, model_file):
@@ -131,7 +131,7 @@ class TestRunCommand:
     def test_run_command_first_session(self, runner, temp_dir, config):
         """Test running a command for the first time."""
         # Create a dummy snapshot file
-        snapshots_dir = temp_dir / ".agentgit" / "snapshots"
+        snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
         snapshots_dir.mkdir(parents=True, exist_ok=True)
         snapshot_file = snapshots_dir / "snapshot.bin"
         snapshot_file.write_bytes(os.urandom(1024))
@@ -164,7 +164,7 @@ class TestRunCommand:
 
     def test_run_command_with_custom_max_tokens(self, runner, temp_dir, config):
         """Test run command with custom max tokens."""
-        snapshots_dir = temp_dir / ".agentgit" / "snapshots"
+        snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
         snapshots_dir.mkdir(parents=True, exist_ok=True)
         snapshot_file = snapshots_dir / "snapshot.bin"
         snapshot_file.write_bytes(os.urandom(1024))
@@ -206,7 +206,7 @@ class TestLogCommand:
 
     def test_log_command_empty(self, runner, temp_dir, config):
         """Test log command with no commits."""
-        db_path = temp_dir / ".agentgit" / "agents.db"
+        db_path = temp_dir / ".cacheflow" / "agents.db"
         store = AgentGitStore(db_path)
 
         # Create an agent with no commits
@@ -220,13 +220,13 @@ class TestLogCommand:
 
     def test_log_command_with_commits(self, runner, temp_dir, config):
         """Test log command with commit history."""
-        db_path = temp_dir / ".agentgit" / "agents.db"
+        db_path = temp_dir / ".cacheflow" / "agents.db"
         store = AgentGitStore(db_path)
 
         # Create agent and commits
         agent = store.create_agent("test-agent", "llama3.1:8b", "abc123", 8192)
 
-        snapshot_path = temp_dir / ".agentgit" / "snapshots" / "snapshot1.bin"
+        snapshot_path = temp_dir / ".cacheflow" / "snapshots" / "snapshot1.bin"
         snapshot_path.parent.mkdir(parents=True, exist_ok=True)
         snapshot_path.write_bytes(os.urandom(1024))
 
@@ -254,14 +254,14 @@ class TestLogCommand:
 
     def test_log_command_limit(self, runner, temp_dir, config):
         """Test log command with limit option."""
-        db_path = temp_dir / ".agentgit" / "agents.db"
+        db_path = temp_dir / ".cacheflow" / "agents.db"
         store = AgentGitStore(db_path)
 
         agent = store.create_agent("test-agent", "llama3.1:8b", "abc123", 8192)
 
         # Create multiple commits
         for i in range(3):
-            snapshot_path = temp_dir / ".agentgit" / "snapshots" / f"snapshot{i}.bin"
+            snapshot_path = temp_dir / ".cacheflow" / "snapshots" / f"snapshot{i}.bin"
             snapshot_path.parent.mkdir(parents=True, exist_ok=True)
             snapshot_path.write_bytes(os.urandom(1024))
 
@@ -314,7 +314,7 @@ class TestAgentsCommand:
 
     def test_agents_command_empty(self, runner, temp_dir, config):
         """Test agents command with no agents."""
-        db_path = temp_dir / ".agentgit" / "agents.db"
+        db_path = temp_dir / ".cacheflow" / "agents.db"
         store = AgentGitStore(db_path)
         # Database exists but is empty
 
@@ -326,7 +326,7 @@ class TestAgentsCommand:
 
     def test_agents_command_list(self, runner, temp_dir, config):
         """Test agents command listing agents."""
-        db_path = temp_dir / ".agentgit" / "agents.db"
+        db_path = temp_dir / ".cacheflow" / "agents.db"
         store = AgentGitStore(db_path)
 
         # Create multiple agents
@@ -344,12 +344,12 @@ class TestAgentsCommand:
 
     def test_agents_command_with_commits(self, runner, temp_dir, config):
         """Test agents command showing head commits."""
-        db_path = temp_dir / ".agentgit" / "agents.db"
+        db_path = temp_dir / ".cacheflow" / "agents.db"
         store = AgentGitStore(db_path)
 
         agent = store.create_agent("test-agent", "llama3.1:8b", "abc123", 8192)
 
-        snapshot_path = temp_dir / ".agentgit" / "snapshots" / "snapshot.bin"
+        snapshot_path = temp_dir / ".cacheflow" / "snapshots" / "snapshot.bin"
         snapshot_path.parent.mkdir(parents=True, exist_ok=True)
         snapshot_path.write_bytes(os.urandom(1024))
 
@@ -388,7 +388,7 @@ class TestRunCommandWithAgent:
 
     def test_run_command_with_agent_option(self, runner, temp_dir, config):
         """Test run command with --agent option."""
-        snapshots_dir = temp_dir / ".agentgit" / "snapshots"
+        snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
         snapshots_dir.mkdir(parents=True, exist_ok=True)
         snapshot_file = snapshots_dir / "snapshot.bin"
         snapshot_file.write_bytes(os.urandom(1024))
@@ -427,13 +427,13 @@ class TestForkCommand:
 
     def test_fork_command_success(self, runner, temp_dir, config):
         """Test forking an agent."""
-        db_path = temp_dir / ".agentgit" / "agents.db"
+        db_path = temp_dir / ".cacheflow" / "agents.db"
         store = AgentGitStore(db_path)
 
         # Create parent agent with a commit
         parent = store.create_agent("main", "llama3.1:8b", "abc123", 8192)
 
-        snapshot_path = temp_dir / ".agentgit" / "snapshots" / "snapshot.bin"
+        snapshot_path = temp_dir / ".cacheflow" / "snapshots" / "snapshot.bin"
         snapshot_path.parent.mkdir(parents=True, exist_ok=True)
         snapshot_path.write_bytes(os.urandom(1024))
 
@@ -490,14 +490,14 @@ class TestDiffCommand:
 
     def test_diff_command_with_commits(self, runner, temp_dir, config):
         """Test diff command with two commits."""
-        db_path = temp_dir / ".agentgit" / "agents.db"
+        db_path = temp_dir / ".cacheflow" / "agents.db"
         store = AgentGitStore(db_path)
 
         agent = store.create_agent("main", "llama3.1:8b", "abc123", 8192)
 
         # Create two commits
         for i in range(2):
-            snapshot_path = temp_dir / ".agentgit" / "snapshots" / f"snapshot{i}.bin"
+            snapshot_path = temp_dir / ".cacheflow" / "snapshots" / f"snapshot{i}.bin"
             snapshot_path.parent.mkdir(parents=True, exist_ok=True)
             snapshot_path.write_bytes(os.urandom(1024))
 
@@ -553,7 +553,7 @@ class TestStatusCommand:
 
     def test_status_command_empty(self, runner, temp_dir, config):
         """Test status command with no commits."""
-        db_path = temp_dir / ".agentgit" / "agents.db"
+        db_path = temp_dir / ".cacheflow" / "agents.db"
         store = AgentGitStore(db_path)
 
         store.create_agent("main", "llama3.1:8b", "abc123", 8192)
@@ -566,12 +566,12 @@ class TestStatusCommand:
 
     def test_status_command_with_commits(self, runner, temp_dir, config):
         """Test status command with commits."""
-        db_path = temp_dir / ".agentgit" / "agents.db"
+        db_path = temp_dir / ".cacheflow" / "agents.db"
         store = AgentGitStore(db_path)
 
         agent = store.create_agent("main", "llama3.1:8b", "abc123", 8192)
 
-        snapshot_path = temp_dir / ".agentgit" / "snapshots" / "snapshot.bin"
+        snapshot_path = temp_dir / ".cacheflow" / "snapshots" / "snapshot.bin"
         snapshot_path.parent.mkdir(parents=True, exist_ok=True)
         snapshot_path.write_bytes(os.urandom(2048))
 
@@ -599,7 +599,7 @@ class TestStatusCommand:
 
     def test_status_command_custom_agent(self, runner, temp_dir, config):
         """Test status command with custom agent."""
-        db_path = temp_dir / ".agentgit" / "agents.db"
+        db_path = temp_dir / ".cacheflow" / "agents.db"
         store = AgentGitStore(db_path)
 
         store.create_agent("custom", "llama3.1:8b", "abc123", 8192)

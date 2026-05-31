@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import pytest
 
-from agentgit.store import AgentGitStore, Agent, Commit
+from cacheflow.store import AgentGitStore, Agent, Commit
 
 
 @pytest.fixture
