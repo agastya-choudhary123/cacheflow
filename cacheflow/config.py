@@ -23,6 +23,11 @@ class CacheFlowConfig(BaseModel):
     n_gpu_layers: int = 99
     slot_save_path: Path = Field(default_factory=lambda: Path(".cacheflow/snapshots"))
 
+    @property
+    def index_path(self) -> Path:
+        """Path to semantic index file."""
+        return self.base_path / ".cacheflow" / "index.json"
+
     @field_validator("ctx_size")
     @classmethod
     def validate_ctx_size(cls, v: int) -> int:

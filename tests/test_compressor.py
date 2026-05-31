@@ -9,8 +9,8 @@ import pytest
 
 from cacheflow.agent import AgentSession, DEFAULT_SYSTEM_PROMPT
 from cacheflow.compressor import Compressor
-from cacheflow.config import AgentGitConfig, save_config
-from cacheflow.store import AgentGitStore
+from cacheflow.config import CacheFlowConfig, save_config
+from cacheflow.store import CacheFlowStore
 
 
 @pytest.fixture
@@ -24,7 +24,7 @@ def temp_dir():
 def config(temp_dir):
     """Create a test configuration."""
     (temp_dir / ".cacheflow").mkdir(parents=True)
-    config = AgentGitConfig(
+    config = CacheFlowConfig(
         base_path=temp_dir,
         model_path="/path/to/model.gguf",
         model_name="llama3.1:8b",
@@ -41,7 +41,7 @@ def config(temp_dir):
 def store(temp_dir, config):
     """Create an initialized agent store."""
     db_path = temp_dir / ".cacheflow" / "agents.db"
-    store = AgentGitStore(db_path)
+    store = CacheFlowStore(db_path)
     store.init_db()
     return store
 
@@ -246,7 +246,7 @@ def test_consolidation_logs_result(store, config, compressor, temp_dir):
         "size_bytes": 2048,
     }
 
-    with patch("agentgit.compressor.LlamaServer", return_value=mock_server):
+    with patch("cacheflow.compressor.LlamaServer", return_value=mock_server):
         result = compressor.compact(agent)
 
     # Check that consolidation happened
@@ -267,7 +267,7 @@ def test_consolidation_save_restore(config, temp_dir):
     """Test that consolidation preserves agent knowledge across sessions."""
     # This is a higher-level integration test
     db_path = temp_dir / ".cacheflow" / "agents.db"
-    store = AgentGitStore(db_path)
+    store = CacheFlowStore(db_path)
     store.init_db()
 
     # Run agent 3 times to accumulate knowledge
@@ -296,7 +296,7 @@ def test_consolidation_save_restore(config, temp_dir):
     }
     mock_server.save_slot.side_effect = mock_save_slot_side_effect
 
-    with patch("agentgit.agent.LlamaServer", return_value=mock_server):
+    with patch("cacheflow.agent.LlamaServer", return_value=mock_server):
         # Run 3 sessions to accumulate tokens
         for i in range(3):
             result = session.run(
@@ -324,7 +324,7 @@ def test_consolidation_save_restore(config, temp_dir):
     }
     mock_server.save_slot.side_effect = mock_save_slot_side_effect
 
-    with patch("agentgit.agent.LlamaServer", return_value=mock_server):
+    with patch("cacheflow.agent.LlamaServer", return_value=mock_server):
         result = session.run(
             task="Follow-up task",
             system_prompt=DEFAULT_SYSTEM_PROMPT,

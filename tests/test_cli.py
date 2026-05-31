@@ -9,8 +9,8 @@ import pytest
 from click.testing import CliRunner
 
 from cacheflow.cli import cli, init, run, log, agents, fork, diff, status
-from cacheflow.config import AgentGitConfig, save_config
-from cacheflow.store import AgentGitStore
+from cacheflow.config import CacheFlowConfig, save_config
+from cacheflow.store import CacheFlowStore
 from cacheflow.agent import fork_agent
 
 
@@ -31,7 +31,7 @@ def temp_dir():
 def config(temp_dir):
     """Create a test configuration."""
     (temp_dir / ".cacheflow").mkdir(parents=True)
-    config = AgentGitConfig(
+    config = CacheFlowConfig(
         base_path=temp_dir,
         model_path="/path/to/model.gguf",
         model_name="llama3.1:8b",
@@ -43,7 +43,7 @@ def config(temp_dir):
     save_config(config)
     # Initialize database
     db_path = temp_dir / ".cacheflow" / "agents.db"
-    store = AgentGitStore(db_path)
+    store = CacheFlowStore(db_path)
     store.init_db()
     return config
 
@@ -149,7 +149,7 @@ class TestRunCommand:
             "size_bytes": 1024,
         }
 
-        with patch("agentgit.agent.LlamaServer", return_value=mock_server):
+        with patch("cacheflow.agent.LlamaServer", return_value=mock_server):
             result = runner.invoke(
                 cli,
                 ["run", "Test task", "--agent", "test-agent", "--base-path", str(temp_dir)],
@@ -181,7 +181,7 @@ class TestRunCommand:
             "size_bytes": 1024,
         }
 
-        with patch("agentgit.agent.LlamaServer", return_value=mock_server):
+        with patch("cacheflow.agent.LlamaServer", return_value=mock_server):
             result = runner.invoke(
                 cli,
                 [
@@ -207,7 +207,7 @@ class TestLogCommand:
     def test_log_command_empty(self, runner, temp_dir, config):
         """Test log command with no commits."""
         db_path = temp_dir / ".cacheflow" / "agents.db"
-        store = AgentGitStore(db_path)
+        store = CacheFlowStore(db_path)
 
         # Create an agent with no commits
         store.create_agent("test-agent", "llama3.1:8b", "abc123", 8192)
@@ -221,7 +221,7 @@ class TestLogCommand:
     def test_log_command_with_commits(self, runner, temp_dir, config):
         """Test log command with commit history."""
         db_path = temp_dir / ".cacheflow" / "agents.db"
-        store = AgentGitStore(db_path)
+        store = CacheFlowStore(db_path)
 
         # Create agent and commits
         agent = store.create_agent("test-agent", "llama3.1:8b", "abc123", 8192)
@@ -255,7 +255,7 @@ class TestLogCommand:
     def test_log_command_limit(self, runner, temp_dir, config):
         """Test log command with limit option."""
         db_path = temp_dir / ".cacheflow" / "agents.db"
-        store = AgentGitStore(db_path)
+        store = CacheFlowStore(db_path)
 
         agent = store.create_agent("test-agent", "llama3.1:8b", "abc123", 8192)
 
@@ -315,7 +315,7 @@ class TestAgentsCommand:
     def test_agents_command_empty(self, runner, temp_dir, config):
         """Test agents command with no agents."""
         db_path = temp_dir / ".cacheflow" / "agents.db"
-        store = AgentGitStore(db_path)
+        store = CacheFlowStore(db_path)
         # Database exists but is empty
 
         result = runner.invoke(cli, ["agents", "--base-path", str(temp_dir)])
@@ -327,7 +327,7 @@ class TestAgentsCommand:
     def test_agents_command_list(self, runner, temp_dir, config):
         """Test agents command listing agents."""
         db_path = temp_dir / ".cacheflow" / "agents.db"
-        store = AgentGitStore(db_path)
+        store = CacheFlowStore(db_path)
 
         # Create multiple agents
         store.create_agent("agent1", "llama3.1:8b", "hash1", 8192)
@@ -345,7 +345,7 @@ class TestAgentsCommand:
     def test_agents_command_with_commits(self, runner, temp_dir, config):
         """Test agents command showing head commits."""
         db_path = temp_dir / ".cacheflow" / "agents.db"
-        store = AgentGitStore(db_path)
+        store = CacheFlowStore(db_path)
 
         agent = store.create_agent("test-agent", "llama3.1:8b", "abc123", 8192)
 
@@ -405,7 +405,7 @@ class TestRunCommandWithAgent:
             "size_bytes": 1024,
         }
 
-        with patch("agentgit.agent.LlamaServer", return_value=mock_server):
+        with patch("cacheflow.agent.LlamaServer", return_value=mock_server):
             result = runner.invoke(
                 cli,
                 [
@@ -428,7 +428,7 @@ class TestForkCommand:
     def test_fork_command_success(self, runner, temp_dir, config):
         """Test forking an agent."""
         db_path = temp_dir / ".cacheflow" / "agents.db"
-        store = AgentGitStore(db_path)
+        store = CacheFlowStore(db_path)
 
         # Create parent agent with a commit
         parent = store.create_agent("main", "llama3.1:8b", "abc123", 8192)
@@ -491,7 +491,7 @@ class TestDiffCommand:
     def test_diff_command_with_commits(self, runner, temp_dir, config):
         """Test diff command with two commits."""
         db_path = temp_dir / ".cacheflow" / "agents.db"
-        store = AgentGitStore(db_path)
+        store = CacheFlowStore(db_path)
 
         agent = store.create_agent("main", "llama3.1:8b", "abc123", 8192)
 
@@ -554,7 +554,7 @@ class TestStatusCommand:
     def test_status_command_empty(self, runner, temp_dir, config):
         """Test status command with no commits."""
         db_path = temp_dir / ".cacheflow" / "agents.db"
-        store = AgentGitStore(db_path)
+        store = CacheFlowStore(db_path)
 
         store.create_agent("main", "llama3.1:8b", "abc123", 8192)
 
@@ -567,7 +567,7 @@ class TestStatusCommand:
     def test_status_command_with_commits(self, runner, temp_dir, config):
         """Test status command with commits."""
         db_path = temp_dir / ".cacheflow" / "agents.db"
-        store = AgentGitStore(db_path)
+        store = CacheFlowStore(db_path)
 
         agent = store.create_agent("main", "llama3.1:8b", "abc123", 8192)
 
@@ -600,7 +600,7 @@ class TestStatusCommand:
     def test_status_command_custom_agent(self, runner, temp_dir, config):
         """Test status command with custom agent."""
         db_path = temp_dir / ".cacheflow" / "agents.db"
-        store = AgentGitStore(db_path)
+        store = CacheFlowStore(db_path)
 
         store.create_agent("custom", "llama3.1:8b", "abc123", 8192)
 

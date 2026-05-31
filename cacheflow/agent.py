@@ -13,6 +13,8 @@ from cacheflow.config import load_config, CacheFlowConfig
 from cacheflow.store import CacheFlowStore, Agent
 from cacheflow.server import LlamaServer
 from cacheflow.compressor import Compressor
+from cacheflow.indexer import CodeIndexer
+from cacheflow.retriever import CodeRetriever
 
 
 DEFAULT_SYSTEM_PROMPT = """You are an expert software engineer with deep knowledge of the codebase you've been given access to. You help with coding tasks efficiently and precisely. When you complete a task, briefly summarize what you did and what you learned about the codebase."""
@@ -218,7 +220,15 @@ class AgentSession:
                 else:
                     full_prompt = f"{system_prompt}\n\nTask: {task}"
             else:
-                full_prompt = f"Task: {task}"
+                # Use semantic retrieval on follow-up sessions
+                retriever = CodeRetriever(self.config.index_path)
+                retrieved_items = retriever.retrieve(task, top_k=5)
+                context = retriever.format_context(retrieved_items, budget_chars=2000, task=task)
+
+                if context:
+                    full_prompt = f"{context}\n\nTask: {task}"
+                else:
+                    full_prompt = f"Task: {task}"
 
             # Step f: Run completion
             completion_start = time.time()
@@ -306,6 +316,18 @@ class AgentSession:
                 tokens_out=tokens_out,
                 duration_ms=completion_time_ms,
             )
+
+            # Step k2: Extract and index codebase on first session
+            if is_first_session:
+                try:
+                    indexer = CodeIndexer()
+                    items = indexer.extract_from_codebase(self.base_path)
+                    items = indexer.embed_items(items)
+                    indexer.save_index(items, self.config.index_path)
+                except Exception as e:
+                    # Log but don't fail the session
+                    import traceback
+                    logger.warning(f"Failed to index codebase: {e}\n{traceback.format_exc()}")
 
             # Calculate total duration
             total_duration_ms = int((time.time() - start_time) * 1000)

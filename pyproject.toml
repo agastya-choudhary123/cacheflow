@@ -16,6 +16,7 @@ dependencies = [
     "pydantic >= 2.0",
     "llama-cpp-python >= 0.2.0",
     "flask >= 2.3",
+    "sentence-transformers >= 2.2",
 ]
 
 [project.optional-dependencies]

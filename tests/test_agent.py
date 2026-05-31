@@ -8,8 +8,8 @@ from unittest.mock import MagicMock, patch, mock_open
 import pytest
 
 from cacheflow.agent import AgentSession, SessionResult, DEFAULT_SYSTEM_PROMPT, fork_agent
-from cacheflow.config import AgentGitConfig, save_config
-from cacheflow.store import AgentGitStore
+from cacheflow.config import CacheFlowConfig, save_config
+from cacheflow.store import CacheFlowStore
 
 
 @pytest.fixture
@@ -23,7 +23,7 @@ def temp_dir():
 def config(temp_dir):
     """Create a test configuration."""
     (temp_dir / ".cacheflow").mkdir(parents=True)
-    config = AgentGitConfig(
+    config = CacheFlowConfig(
         base_path=temp_dir,
         model_path="/path/to/model.gguf",
         model_name="llama3.1:8b",
@@ -72,7 +72,7 @@ def test_agent_first_session(agent_session, temp_dir):
         "size_bytes": 1024,
     }
 
-    with patch("agentgit.agent.LlamaServer", return_value=mock_server):
+    with patch("cacheflow.agent.LlamaServer", return_value=mock_server):
         result = agent_session.run(
             task="Test task",
             system_prompt=DEFAULT_SYSTEM_PROMPT,
@@ -142,7 +142,7 @@ def test_agent_consecutive_session(agent_session, temp_dir):
     }
     mock_server.restore_slot = MagicMock()
 
-    with patch("agentgit.agent.LlamaServer", return_value=mock_server):
+    with patch("cacheflow.agent.LlamaServer", return_value=mock_server):
         result = agent_session.run(
             task="Second task",
             system_prompt=DEFAULT_SYSTEM_PROMPT,
@@ -205,7 +205,7 @@ def test_session_result_dataclass():
 def test_fork_agent(temp_dir, config):
     """Test forking an agent."""
     db_path = temp_dir / ".cacheflow" / "agents.db"
-    store = AgentGitStore(db_path)
+    store = CacheFlowStore(db_path)
     store.init_db()
 
     # Create parent agent with a commit
@@ -257,7 +257,7 @@ def test_fork_agent(temp_dir, config):
 def test_fork_agent_nonexistent_parent(temp_dir, config):
     """Test forking with non-existent parent."""
     db_path = temp_dir / ".cacheflow" / "agents.db"
-    store = AgentGitStore(db_path)
+    store = CacheFlowStore(db_path)
     store.init_db()
 
     with pytest.raises(ValueError, match="not found"):
@@ -267,7 +267,7 @@ def test_fork_agent_nonexistent_parent(temp_dir, config):
 def test_fork_agent_no_head_commit(temp_dir, config):
     """Test forking parent with no HEAD commit."""
     db_path = temp_dir / ".cacheflow" / "agents.db"
-    store = AgentGitStore(db_path)
+    store = CacheFlowStore(db_path)
     store.init_db()
 
     # Create parent with no commits
@@ -298,7 +298,7 @@ def test_first_session_stores_baseline(agent_session, temp_dir):
         "size_bytes": 1024,
     }
 
-    with patch("agentgit.agent.LlamaServer", return_value=mock_server):
+    with patch("cacheflow.agent.LlamaServer", return_value=mock_server):
         result = agent_session.run(
             task="Test task",
             system_prompt=DEFAULT_SYSTEM_PROMPT,
@@ -333,7 +333,7 @@ def test_codebase_injection_first_session(agent_session, temp_dir):
         "size_bytes": 1024,
     }
 
-    with patch("agentgit.agent.LlamaServer", return_value=mock_server):
+    with patch("cacheflow.agent.LlamaServer", return_value=mock_server):
         agent_session.run(
             task="Analyze this codebase",
             system_prompt=DEFAULT_SYSTEM_PROMPT,

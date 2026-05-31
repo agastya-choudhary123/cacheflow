@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import pytest
 
-from cacheflow.store import AgentGitStore, Agent, Commit
+from cacheflow.store import CacheFlowStore, Agent, Commit
 
 
 @pytest.fixture
@@ -21,7 +21,7 @@ def temp_dir():
 def store(temp_dir):
     """Create a store instance in a temp directory."""
     db_path = temp_dir / "dag.db"
-    store = AgentGitStore(db_path)
+    store = CacheFlowStore(db_path)
     store.init_db()
     return store
 
@@ -29,7 +29,7 @@ def store(temp_dir):
 def test_init_db(temp_dir):
     """Test that init_db creates the database and tables."""
     db_path = temp_dir / "dag.db"
-    store = AgentGitStore(db_path)
+    store = CacheFlowStore(db_path)
     store.init_db()
 
     assert db_path.exists(), "Database file should exist"
@@ -210,7 +210,7 @@ def test_update_agent_baseline(store):
 def test_migrate_schema_idempotent(temp_dir):
     """Test that migration can be called multiple times safely."""
     db_path = temp_dir / "dag.db"
-    store = AgentGitStore(db_path)
+    store = CacheFlowStore(db_path)
     store.init_db()  # First init
     store.init_db()  # Second init should not fail
 

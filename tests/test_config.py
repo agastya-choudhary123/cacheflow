@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from cacheflow.config import (
-    AgentGitConfig,
+    CacheFlowConfig,
     compute_model_hash,
     find_gguf_for_model,
     load_config,
@@ -32,8 +32,8 @@ def test_compute_model_hash():
 
 
 def test_agentgit_config_creation():
-    """Test creating an AgentGitConfig instance."""
-    config = AgentGitConfig(
+    """Test creating an CacheFlowConfig instance."""
+    config = CacheFlowConfig(
         base_path=Path("/tmp/test"),
         model_path="/path/to/model.gguf",
         model_name="llama3.1:8b",
@@ -54,7 +54,7 @@ def test_config_save_and_load():
         (base_path / ".cacheflow").mkdir(parents=True)
 
         # Create and save config
-        config = AgentGitConfig(
+        config = CacheFlowConfig(
             base_path=base_path,
             model_path="/path/to/model.gguf",
             model_name="llama3.1:8b",
@@ -93,7 +93,7 @@ def test_find_gguf_for_model_not_found():
 
 def test_default_values():
     """Test that default values are set correctly."""
-    config = AgentGitConfig(
+    config = CacheFlowConfig(
         base_path=Path("/tmp"),
         model_path="/path/to/model.gguf",
         model_name="test",

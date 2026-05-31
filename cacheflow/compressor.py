@@ -8,6 +8,7 @@ from uuid import uuid4
 from cacheflow.config import CacheFlowConfig
 from cacheflow.server import LlamaServer
 from cacheflow.store import Agent, CacheFlowStore, Commit
+from cacheflow.indexer import CodeIndexer
 
 
 logger = logging.getLogger(__name__)
@@ -135,6 +136,23 @@ class Compressor:
                 max_tokens=512,
             )
             consolidation_text = response_data.get("content", "")
+
+            # Step e2: Extract structured knowledge from consolidation
+            try:
+                indexer = CodeIndexer()
+                knowledge = indexer.consolidate_knowledge(consolidation_text)
+
+                # Update index with new knowledge
+                index_path = self.config.index_path
+                if index_path.exists():
+                    import json
+                    with open(index_path, "r") as f:
+                        index = json.load(f)
+                    index["knowledge"] = knowledge
+                    with open(index_path, "w") as f:
+                        json.dump(index, f, indent=2)
+            except Exception as e:
+                logger.warning(f"Failed to extract knowledge during consolidation: {e}")
 
             # Step f: Erase the current slot
             server.erase_slot(slot_id=0)

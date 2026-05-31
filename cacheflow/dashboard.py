@@ -14,6 +14,7 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>agentgit Dashboard</title>
+    <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -215,6 +216,33 @@ HTML_TEMPLATE = """
             margin-bottom: 20px;
             color: #fed7aa;
         }
+
+        #dag-container {
+            width: 100%;
+            height: 600px;
+            background: #1a202c;
+            border: 1px solid #2d3748;
+            border-radius: 8px;
+            margin-top: 20px;
+        }
+
+        .agent-select {
+            margin-bottom: 16px;
+        }
+
+        .agent-select select {
+            padding: 8px 12px;
+            background: #2d3748;
+            color: #e0e6ed;
+            border: 1px solid #3d4860;
+            border-radius: 4px;
+            font-size: 14px;
+            cursor: pointer;
+        }
+
+        .agent-select select:hover {
+            background: #3d4860;
+        }
     </style>
 </head>
 <body>
@@ -319,6 +347,19 @@ HTML_TEMPLATE = """
                 });
 
                 html += `</tbody></table>`;
+
+                // DAG visualization
+                html += `<h2 style="margin-top: 40px;">Commit DAG</h2>`;
+                html += `<div class="agent-select">`;
+                html += `<label>Select agent: </label>`;
+                html += `<select id="agent-select" onchange="loadDAG(this.value)">`;
+                html += `<option value="">-- Choose an agent --</option>`;
+                agents.forEach(agent => {
+                    html += `<option value="${agent.name}">${agent.name}</option>`;
+                });
+                html += `</select>`;
+                html += `</div>`;
+                html += `<div id="dag-container"></div>`;
             }
 
             // Sessions table
@@ -396,6 +437,61 @@ HTML_TEMPLATE = """
                     document.getElementById('content').innerHTML =
                         '<div class="error">Failed to load dashboard data: ' + err.message + '</div>';
                 });
+        }
+
+        function loadDAG(agentName) {
+            if (!agentName) {
+                document.getElementById('dag-container').innerHTML = '';
+                return;
+            }
+
+            fetch(`/api/agents/${agentName}/dag`)
+                .then(r => r.json())
+                .then(data => renderDAG(data))
+                .catch(err => {
+                    document.getElementById('dag-container').innerHTML =
+                        '<div class="error">Failed to load DAG: ' + err.message + '</div>';
+                });
+        }
+
+        function renderDAG(data) {
+            const nodes = new vis.DataSet(data.nodes.map(n => ({
+                id: n.id,
+                label: n.label,
+                title: n.title,
+                color: '#4299e1',
+                font: { color: '#e0e6ed', size: 12 },
+            })));
+
+            const edges = new vis.DataSet(data.edges.map(e => ({
+                from: e.from,
+                to: e.to,
+                label: e.label,
+                arrows: 'to',
+                color: { color: '#3d4860', highlight: '#4299e1' },
+                font: { size: 10, color: '#a0aec0' },
+                smooth: { type: 'cubicBezier' },
+            })));
+
+            const container = document.getElementById('dag-container');
+            const options = {
+                physics: { enabled: true, barnesHut: { gravitationalConstant: -5000 } },
+                layout: { hierarchical: { direction: 'UD', sortMethod: 'hubsize' } },
+                nodes: {
+                    shape: 'box',
+                    margin: { top: 10, bottom: 10, left: 10, right: 10 },
+                    widthConstraint: { maximum: 150 },
+                },
+                edges: {
+                    width: 2,
+                },
+                interaction: {
+                    navigationButtons: true,
+                    keyboard: true,
+                },
+            };
+
+            new vis.Network(container, { nodes, edges }, options);
         }
 
         // Initial render and set up refresh interval
@@ -540,6 +636,41 @@ def get_dashboard_data(base_path: Path) -> dict:
     }
 
 
+def get_agent_dag(base_path: Path, agent_name: str) -> dict:
+    """Get commit DAG for an agent."""
+    base_path = Path(base_path)
+    db_path = base_path / ".cacheflow" / "agents.db"
+    store = CacheFlowStore(db_path)
+
+    agent = store.get_agent(agent_name)
+    if not agent:
+        return {"nodes": [], "edges": []}
+
+    commits = store.get_commit_history(agent)
+
+    nodes = []
+    edges = []
+
+    for commit in commits:
+        task_short = commit.task[:30] + "..." if len(commit.task) > 30 else commit.task
+        commit_short = str(commit.id)[:8]
+
+        nodes.append({
+            "id": str(commit.id),
+            "label": f"{commit_short}\n{task_short}",
+            "title": f"Task: {commit.task}\nTokens: {commit.tokens_this_session}",
+        })
+
+        if commit.parent_id:
+            edges.append({
+                "from": str(commit.parent_id),
+                "to": str(commit.id),
+                "label": f"{commit.tokens_saved}T saved" if commit.tokens_saved > 0 else "",
+            })
+
+    return {"nodes": nodes, "edges": edges}
+
+
 def run_dashboard(base_path: Path, port: int = 8080) -> None:
     """Run the Flask dashboard server."""
     base_path = Path(base_path)
@@ -554,6 +685,11 @@ def run_dashboard(base_path: Path, port: int = 8080) -> None:
     def api_data():
         data = get_dashboard_data(base_path)
         return jsonify(data)
+
+    @app.route("/api/agents/<agent_name>/dag")
+    def api_agent_dag(agent_name):
+        dag = get_agent_dag(base_path, agent_name)
+        return jsonify(dag)
 
     print(f"\n✓ Dashboard running at http://localhost:{port}")
     print(f"  Press Ctrl+C to stop\n")
