@@ -1,6 +1,6 @@
 # CacheFlow
 
-**Persistent KV cache for AI agents. Same model, same quality. Agents just stop being amnesiac.**
+**Persistent KV cache for AI agents with multi-agent concurrency. Same model, same quality. Agents remember everything and run in parallel.**
 
 ## The Problem
 
@@ -43,6 +43,51 @@ agentgit run "What are the three highest-priority bugs to fix?"
 agentgit log
 ```
 
+## Multi-Agent Workflows
+
+CacheFlow supports **concurrent execution of multiple agents** using the same model instance. Each agent gets an independent KV cache slot, enabling true parallelism without duplicating the model in memory.
+
+```python
+from cacheflow.agent import AgentSession
+import threading
+
+# Create multiple agents
+research = AgentSession("research", ".")
+implement = AgentSession("implement", ".")
+test = AgentSession("test", ".")
+
+# Run tasks concurrently
+def run_agent(agent, task):
+    result = agent.run(task)
+    print(f"{agent.agent_name}: {result.response[:100]}")
+
+threads = [
+    threading.Thread(target=run_agent, args=(research, "Research architecture")),
+    threading.Thread(target=run_agent, args=(implement, "Implement design")),
+    threading.Thread(target=run_agent, args=(test, "Write tests")),
+]
+
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+```
+
+**Benefits:**
+- **True Parallelism**: Multiple agents run simultaneously without blocking
+- **Memory Efficient**: Single model instance shared across agents
+- **Token Independent**: Each agent's token savings tracked separately
+- **Automatic LRU**: When slots are full, least-recently-used agent's slot is reclaimed
+- **Backward Compatible**: Single-agent code works unchanged
+
+Each agent:
+- Saves its own snapshots
+- Tracks its own baseline tokens
+- Can fork from other agents
+- Has independent commit history
+
+See [MULTI_AGENT_DESIGN.md](MULTI_AGENT_DESIGN.md) for architecture details.
+
 ## CLI Reference
 
 ```
@@ -71,11 +116,20 @@ agentgit dashboard (optional)
 
 ## How It Works: Technical
 
+**Multi-Slot KV Cache Architecture**
+
+CacheFlow uses llama.cpp's multi-slot API to enable concurrent agent execution. The `SlotPool` class manages allocation and LRU eviction:
+
+- Each agent gets an independent KV cache slot
+- Up to 8 concurrent agents (typical llama.cpp limit)
+- Least-recently-used slot evicted when pool is full
+- All agents share a single model instance in memory
+
 **KV Cache Persistence**
 
-llama.cpp exposes a REST API for KV cache slot management (`/slots/{id}/save`, `/slots/{id}/restore`). The llama-server binary starts with `--slots` enabled, allowing multiple named snapshots per model. agentgit uses slot 0 as the active context window and saves its binary state to disk after each session.
+llama.cpp exposes a REST API for KV cache slot management (`/slots/{id}/save`, `/slots/{id}/restore`). Each agent's snapshot is loaded into its assigned slot from disk. After completion, the KV cache is saved to disk by its slot ID.
 
-Each snapshot is named by SHA256 hash of its binary contents (content-addressing). A commit stores: the snapshot file path, token usage (prompt + completion), tokens saved vs. re-ingestion baseline, model hash, llama.cpp version, and save/restore timings. This creates an immutable audit trail.
+Each snapshot is named by SHA256 hash of its binary contents (content-addressing). A commit stores: the snapshot file path, token usage (prompt + completion), tokens saved vs. re-ingestion baseline, model hash, llama.cpp version, and save/restore timings. This creates an immutable audit trail per agent.
 
 **DAG + Consolidation**
 
@@ -85,71 +139,89 @@ The snapshot file persists to disk only after DB transaction succeeds (atomic co
 
 ## Roadmap
 
-**Coming soon: OS-inspired optimizations**
+**Coming soon: Multi-agent and OS-inspired optimizations**
 
+**Multi-agent enhancements:**
+- **Slot pinning**: Prevent eviction of critical agents
+- **Priority scheduling**: Higher-priority agents get preference for slots
+- **Heterogeneous models**: Support different model versions in different slots
+- **Async orchestration**: Full async/await support for orchestrating complex workflows
+
+**Storage optimizations:**
 - **Tiered paging**: Move old snapshots to compressed storage. Load on-demand.
 - **Copy-on-write forking**: Child forks reference parent snapshot until diverging. Snapshot duplication happens lazily.
-- **Idle consolidation**: Compress snapshots in the background while agent is idle, trading I/O for disk space.
+- **Idle consolidation**: Compress snapshots in the background while agents are idle, trading I/O for disk space.
 - **Merge operation**: Combine two branches' knowledge via semantic diff + consolidation.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────┐
-│           agentgit CLI                  │
-│  (init, run, log, fork, diff, status)   │
-└──────────────┬──────────────────────────┘
-               │
-      ┌────────┴────────┐
-      │                 │
- ┌────▼────┐      ┌─────▼──────┐
- │ Agent   │      │  AgentGit  │
- │ Session │      │   Store    │
- │         │      │ (SQLite)   │
- └────┬────┘      └─────┬──────┘
-      │                 │
-      │    ┌────────────┴─────────────┐
-      │    │                          │
- ┌────▼────────────┐      ┌──────────▼──────┐
- │  LlamaServer    │      │ Snapshot Files  │
- │  (slots API)    │      │ (.agentgit/     │
- │                 │      │  snapshots/)    │
- └────┬────────────┘      └─────────────────┘
-      │
-      │
- ┌────▼──────────────┐
- │ Model Weights     │
- │ (GGUF file)       │
- └───────────────────┘
+┌──────────────────────────────────────────────┐
+│           CacheFlow CLI                      │
+│  (init, run, log, fork, diff, status, agents)
+└──────────────────┬─────────────────────────┘
+                   │
+      ┌────────────┴───────────┐
+      │                        │
+ ┌────▼────────┐      ┌───────▼────────┐
+ │ SlotPool    │      │  CacheFlow     │
+ │ (8 slots)   │      │   Store        │
+ │             │      │ (SQLite DAG)   │
+ └────┬────────┘      └────────┬───────┘
+      │                        │
+ ┌────┴────────────┐           │
+ │ Agent A (Slot 0)│           │
+ │ Agent B (Slot 1)├──┐        │
+ │ Agent C (Slot 2)│  │   ┌────▼──────────────┐
+ │ [Slots 3-7: free] │   │ Snapshot Files    │
+ └────────┬──────────┘   │ (.cacheflow/      │
+          │              │  snapshots/)      │
+    ┌─────▼──────────┐   └────┬─────────────┘
+    │ LlamaServer    │        │
+    │ (multi-slot)   │◄───────┘
+    └─────┬──────────┘
+          │
+    ┌─────▼──────────────┐
+    │ Model Weights      │
+    │ (GGUF file)        │
+    │ (Single instance)  │
+    └────────────────────┘
 ```
 
 **Data flow:**
-1. CLI → AgentSession.run()
-2. AgentSession restores previous snapshot via LlamaServer (if exists)
-3. LlamaServer loads GGUF + restores KV cache from snapshot
-4. Completion runs; new KV cache is saved to disk
-5. AgentGitStore creates commit record (SHA256 of snapshot)
-6. Background compressor monitors token accumulation
-7. At 70% threshold, consolidation triggers asynchronously
+1. CLI → AgentSession.run() [multiple agents in parallel via threads]
+2. SlotPool allocates or reuses a slot for the agent (or evicts LRU)
+3. AgentSession restores previous snapshot via LlamaServer to its assigned slot
+4. LlamaServer loads GGUF (once, shared) + restores KV cache from snapshot
+5. Completion runs in agent's slot; new KV cache is saved to disk
+6. CacheFlowStore creates commit record (SHA256 of snapshot) per agent
+7. Background compressor monitors token accumulation per agent
+8. At 70% threshold, consolidation triggers asynchronously
 
 ## Project Structure
 
 ```
-agentgit/
-├── agentgit/
-│   ├── cli.py          # Click CLI: init, run, log, fork, diff, status
+cacheflow/
+├── cacheflow/
+│   ├── cli.py          # Click CLI: init, run, log, fork, diff, status, agents
 │   ├── server.py       # llama-server subprocess manager
 │   ├── store.py        # SQLite DAG + session history
 │   ├── agent.py        # Core loop: restore → run → save → commit
+│   ├── slot_pool.py    # Multi-slot orchestrator (LRU eviction, concurrency)
 │   ├── compressor.py   # Background idle consolidation
-│   └── config.py       # Model config, paths, defaults
-├── tests/              # Pytest suite
+│   ├── config.py       # Model config, paths, defaults
+│   ├── retriever.py    # Semantic RAG for follow-up sessions
+│   └── indexer.py      # Codebase semantic indexing
+├── tests/              # Pytest suite (75 tests)
 ├── scripts/
 │   └── validate_llama_api.py  # Pre-flight API validation
-└── .agentgit/          # Created at runtime per project
+├── MULTI_AGENT_DESIGN.md      # Multi-agent architecture doc
+├── IMPLEMENTATION_SUMMARY.md  # Implementation details
+└── .cacheflow/         # Created at runtime per project
     ├── config.json     # Model hash, ctx_size, quantization
-    ├── dag.db          # SQLite: commits, branches, sessions
-    ├── snapshots/      # KV cache .bin files (named by hash)
+    ├── agents.db       # SQLite: agents, commits, sessions (WAL mode)
+    ├── snapshots/      # KV cache .bin files (named by commit ID)
+    ├── index.pkl       # Semantic index of codebase
     └── server.log      # llama-server output
 ```
 
