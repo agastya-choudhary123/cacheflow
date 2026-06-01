@@ -157,20 +157,22 @@ def test_agent_consecutive_session(agent_session, temp_dir):
 
 
 def test_agent_session_lock(agent_session):
-    """Test that lock is acquired and released properly."""
-    lock_file = agent_session.base_path / ".cacheflow" / ".cacheflow.lock"
+    """Test that slot is acquired and released properly."""
+    # Before acquiring, no slot lease should exist
+    assert agent_session.slot_lease is None
+    assert agent_session.slot_id is None
 
-    # Lock should not exist yet
-    assert not lock_file.exists()
-
-    # Acquire lock
+    # Acquire slot
     agent_session._acquire_lock()
-    assert lock_file.exists()
-    assert agent_session.lock_file_obj is not None
+    assert agent_session.slot_lease is not None
+    assert agent_session.slot_id is not None
+    assert isinstance(agent_session.slot_id, int)
+    assert 0 <= agent_session.slot_id < 8  # Within valid slot range
 
-    # Release lock
+    # Release slot
     agent_session._release_lock()
-    assert agent_session.lock_file_obj is None
+    assert agent_session.slot_lease is None
+    assert agent_session.slot_id is None
 
 
 def test_default_system_prompt():

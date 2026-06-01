@@ -5,8 +5,92 @@ from pathlib import Path
 import click
 
 from cacheflow.agent import AgentSession, DEFAULT_SYSTEM_PROMPT, fork_agent
-from cacheflow.config import CacheFlowConfig, compute_model_hash, save_config
+from cacheflow.config import CacheFlowConfig, compute_model_hash, save_config, load_config
 from cacheflow.store import CacheFlowStore
+from cacheflow.ollama import list_ollama_models, get_ollama_model_path, ollama_is_installed
+
+
+def ensure_initialized(base_path: Path) -> None:
+    """
+    Ensure project is initialized. Auto-init if needed.
+
+    Args:
+        base_path: Project root path
+
+    Raises:
+        click.ClickException: If auto-init fails
+    """
+    config_file = base_path / ".cacheflow" / "config.json"
+
+    # Already initialized
+    if config_file.exists():
+        return
+
+    # Not initialized, try auto-init
+    click.echo("No CacheFlow config found. Auto-initializing...")
+
+    # Check if ollama is available
+    if not ollama_is_installed():
+        raise click.ClickException(
+            "CacheFlow not initialized and ollama not found.\n\n"
+            "To get started:\n"
+            "  1. Install ollama: https://ollama.ai\n"
+            "  2. Pull a model: ollama pull llama3.1:8b\n"
+            "  3. Then run: cacheflow run <task>"
+        )
+
+    # List available models
+    models = list_ollama_models()
+
+    if not models:
+        raise click.ClickException(
+            "No ollama models found.\n\n"
+            "To get started:\n"
+            "  1. Pull a model: ollama pull llama3.1:8b\n"
+            "  2. Then run: cacheflow run <task>"
+        )
+
+    # Pick model
+    if len(models) == 1:
+        model_name = models[0]
+        click.echo(f"Found model: {model_name}")
+    else:
+        click.echo(f"Found models: {', '.join(models)}")
+        model_name = click.prompt(
+            "Select model",
+            type=click.Choice(models),
+            default=models[0],
+        )
+
+    # Get model path
+    model_path = get_ollama_model_path(model_name)
+    if not model_path:
+        raise click.ClickException(
+            f"Model {model_name} installed in ollama but .gguf file not found.\n"
+            "Try reinstalling: ollama pull {model_name}"
+        )
+
+    # Create config
+    model_hash = compute_model_hash(str(model_path))
+    config = CacheFlowConfig(
+        base_path=base_path,
+        model_path=str(model_path),
+        model_name=model_name,
+        model_hash=model_hash,
+        ctx_size=8192,
+        n_gpu_layers=99,
+        slot_save_path=base_path / ".cacheflow" / "snapshots",
+    )
+    save_config(config)
+
+    # Initialize database
+    db_path = base_path / ".cacheflow" / "agents.db"
+    store = CacheFlowStore(db_path)
+    store.init_db()
+
+    click.echo(f"✓ Initialized with {model_name}")
+    click.echo(f"  Config: {config_file}")
+    click.echo(f"  Model: {model_path}")
 
 
 @click.group()
@@ -16,16 +100,33 @@ def cli():
 
 
 @cli.command()
-@click.argument("agent_name")
-@click.argument("model_path", type=click.Path(exists=True))
+@click.argument("agent_name", required=False, default=None)
+@click.argument("model_path", required=False, default=None, type=click.Path(exists=True))
 @click.option("--model-name", default=None, help="Model name (e.g., llama3.1:8b)")
 @click.option("--ctx-size", default=8192, help="Context size")
 @click.option("--n-gpu-layers", default=99, help="GPU layers")
 @click.option("--base-path", default=".", help="Project root")
 def init(agent_name, model_path, model_name, ctx_size, n_gpu_layers, base_path):
-    """Initialize a new project with config."""
+    """Initialize a new project with config.
+
+    Usage:
+      cacheflow init [AGENT_NAME] [MODEL_PATH]     # Explicit init with model
+      cacheflow init                               # Auto-init from ollama
+    """
     try:
         base_path = Path(base_path)
+
+        # If neither agent_name nor model_path provided, use auto-init
+        if not agent_name and not model_path:
+            ensure_initialized(base_path)
+            return
+
+        # Old-style explicit init: agent_name and model_path both required
+        if not agent_name or not model_path:
+            raise click.ClickException(
+                "Must provide both AGENT_NAME and MODEL_PATH, or neither (for auto-init)"
+            )
+
         model_path_abs = Path(model_path).resolve()
 
         if not model_path_abs.exists():
@@ -72,9 +173,16 @@ def init(agent_name, model_path, model_name, ctx_size, n_gpu_layers, base_path):
 @click.option("--max-tokens", default=1024, help="Max tokens to generate")
 @click.option("--base-path", default=".", help="Project root")
 def run(task, agent_name, system_prompt, max_tokens, base_path):
-    """Run a single agent session."""
+    """Run a single agent session.
+
+    Auto-initializes project if not already configured.
+    """
     try:
         base_path = Path(base_path)
+
+        # Auto-initialize if needed (first run)
+        ensure_initialized(base_path)
+
         session = AgentSession(agent_name, base_path)
         result = session.run(task, system_prompt=system_prompt, max_tokens=max_tokens)
 
@@ -105,7 +213,7 @@ def log(agent_name, limit, base_path):
         db_path = base_path / ".cacheflow" / "agents.db"
 
         if not db_path.exists():
-            raise click.ClickException("No database found. Run 'agentgit init' first.")
+            raise click.ClickException("No database found. Run 'cacheflow run' first to create a session.")
 
         store = CacheFlowStore(db_path)
         agent = store.get_agent(agent_name)
@@ -145,7 +253,7 @@ def agents(base_path):
         db_path = base_path / ".cacheflow" / "agents.db"
 
         if not db_path.exists():
-            raise click.ClickException("No database found. Run 'agentgit init' first.")
+            raise click.ClickException("Database not found. Run 'cacheflow run' first to initialize the project.")
 
         store = CacheFlowStore(db_path)
         agent_list = store.list_agents()
@@ -180,7 +288,7 @@ def fork(parent_agent, child_agent, scope, base_path):
         db_path = base_path / ".cacheflow" / "agents.db"
 
         if not db_path.exists():
-            raise click.ClickException("No database found. Run 'agentgit init' first.")
+            raise click.ClickException("No database found. Run 'cacheflow run' first to create an agent.")
 
         # Fork the agent
         new_agent = fork_agent(parent_agent, child_agent, base_path, scope=scope)
@@ -211,7 +319,7 @@ def diff(commit_a, commit_b, agent_name, base_path):
         db_path = base_path / ".cacheflow" / "agents.db"
 
         if not db_path.exists():
-            raise click.ClickException("No database found. Run 'agentgit init' first.")
+            raise click.ClickException("No database found. Run 'cacheflow run' first to create commits.")
 
         store = CacheFlowStore(db_path)
         agent = store.get_agent(agent_name)
@@ -263,7 +371,7 @@ def status(agent_name, base_path):
         db_path = base_path / ".cacheflow" / "agents.db"
 
         if not db_path.exists():
-            raise click.ClickException("No database found. Run 'agentgit init' first.")
+            raise click.ClickException("No database found. Run 'cacheflow run' first to create a session.")
 
         store = CacheFlowStore(db_path)
 

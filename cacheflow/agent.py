@@ -1,6 +1,5 @@
 """Agent loop: completion, save, commit."""
 
-import fcntl
 import shutil
 import subprocess
 import time
@@ -15,9 +14,13 @@ from cacheflow.server import LlamaServer
 from cacheflow.compressor import Compressor
 from cacheflow.indexer import CodeIndexer
 from cacheflow.retriever import CodeRetriever
+from cacheflow.slot_pool import SlotPool, SlotLease
 
 
 DEFAULT_SYSTEM_PROMPT = """You are an expert software engineer with deep knowledge of the codebase you've been given access to. You help with coding tasks efficiently and precisely. When you complete a task, briefly summarize what you did and what you learned about the codebase."""
+
+# Global slot pool for managing concurrent agent execution
+_SLOT_POOL = SlotPool(max_slots=8)
 
 
 @dataclass
@@ -51,8 +54,8 @@ class AgentSession:
         self.config: Optional[CacheFlowConfig] = None
         self.store: Optional[CacheFlowStore] = None
         self.server: Optional[LlamaServer] = None
-        self.lock_file: Optional[Path] = None
-        self.lock_file_obj: Optional[object] = None
+        self.slot_lease: Optional[SlotLease] = None
+        self.slot_id: Optional[int] = None
         self._setup()
 
     def _setup(self) -> None:
@@ -63,22 +66,31 @@ class AgentSession:
         self.store.init_db()
 
     def _acquire_lock(self) -> None:
-        """Acquire file lock to prevent concurrent runs."""
-        self.lock_file = self.base_path / ".cacheflow" / ".cacheflow.lock"
-        self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+        """Acquire a KV cache slot for this agent.
 
-        # Open or create lock file and keep the object alive
-        self.lock_file_obj = open(self.lock_file, "w")
-
-        # Try to acquire exclusive lock
-        fcntl.flock(self.lock_file_obj.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        Uses SlotPool for multi-agent concurrency instead of file lock.
+        Backward compatible with old lock-based code.
+        """
+        agent = self.store.get_agent(self.agent_name)
+        if not agent:
+            agent = self.store.create_agent(
+                self.agent_name,
+                self.config.model_name,
+                self.config.model_hash,
+                self.config.ctx_size,
+            )
+        self.slot_lease = _SLOT_POOL.acquire_slot(agent.id)
+        self.slot_id = self.slot_lease.slot_id
 
     def _release_lock(self) -> None:
-        """Release file lock."""
-        if self.lock_file_obj is not None:
-            fcntl.flock(self.lock_file_obj.fileno(), fcntl.LOCK_UN)
-            self.lock_file_obj.close()
-            self.lock_file_obj = None
+        """Release the KV cache slot.
+
+        Backward compatible with old lock-based code.
+        """
+        if self.slot_lease is not None:
+            self.slot_lease.__exit__(None, None, None)
+            self.slot_lease = None
+            self.slot_id = None
 
     def _collect_codebase_context(self, task: str, budget_chars: int) -> str:
         """
@@ -208,7 +220,7 @@ class AgentSession:
                 if head_commit:
                     restore_start = time.time()
                     snapshot_filename = Path(head_commit.snapshot_path).name
-                    self.server.restore_slot(snapshot_filename)
+                    self.server.restore_slot(snapshot_filename, slot_id=self.slot_id)
                     restore_time_ms = int((time.time() - restore_start) * 1000)
 
             # Step e: Build prompt
@@ -234,7 +246,7 @@ class AgentSession:
             completion_start = time.time()
             response_data = self.server.completion(
                 prompt=full_prompt,
-                slot_id=0,
+                slot_id=self.slot_id,
                 max_tokens=max_tokens,
             )
             completion_time_ms = int((time.time() - completion_start) * 1000)
@@ -253,7 +265,7 @@ class AgentSession:
 
             # Step g: Save slot
             save_start = time.time()
-            save_result = self.server.save_slot(slot_id=0)
+            save_result = self.server.save_slot(slot_id=self.slot_id)
             save_time_ms = int((time.time() - save_start) * 1000)
 
             # Validate save succeeded
