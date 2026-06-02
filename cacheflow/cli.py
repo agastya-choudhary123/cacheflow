@@ -415,6 +415,225 @@ def status(agent_name, base_path):
 
 
 @cli.command()
+@click.argument("text")
+@click.option("--agent", "agent_name", default=None, help="Filter by agent name")
+@click.option("--top-k", default=5, type=int, help="Number of results (default: 5)")
+@click.option("--live", is_flag=True, help="Query the best matching snapshot live")
+@click.option("--base-path", default=".", help="Project root")
+def query(text, agent_name, top_k, live, base_path):
+    """Search snapshots semantically or query them live.
+
+    Examples:
+      cf query "What do you know about auth?"
+      cf query "database schema" --agent main --top-k 3
+      cf query --live "How does token refresh work?"
+    """
+    try:
+        from cacheflow.snapshot_query import SnapshotQueryEngine
+        from cacheflow.server import LlamaServer
+        from cacheflow.config import load_config
+
+        base_path = Path(base_path)
+        db_path = base_path / ".cacheflow" / "agents.db"
+
+        if not db_path.exists():
+            raise click.ClickException("No database found. Run 'cf run' first.")
+
+        store = CacheFlowStore(db_path)
+        engine = SnapshotQueryEngine(store)
+
+        if live:
+            # Live query: restore snapshot and ask the model
+            config = load_config(base_path)
+            server = LlamaServer(
+                model_path=config.model_path,
+                ctx_size=config.ctx_size,
+                n_gpu_layers=config.n_gpu_layers,
+            )
+            try:
+                click.echo("Querying restored snapshot...\n")
+                for chunk in engine.query_live(text, agent_name=agent_name, server=server):
+                    click.echo(chunk, nl=False)
+                click.echo()
+            finally:
+                server.stop()
+        else:
+            # Semantic search
+            matches = engine.query(text, agent_name=agent_name, top_k=top_k)
+            if not matches:
+                click.echo("No relevant snapshots found.")
+                return
+
+            click.echo(f"Found {len(matches)} matching snapshots:\n")
+            for i, match in enumerate(matches, 1):
+                click.echo(f"{i}. {match.commit_id} ({match.agent_name})")
+                click.echo(f"   Score: {match.score:.3f}")
+                click.echo(f"   Task: {match.task}")
+                click.echo(f"   Summary: {match.short_summary}")
+                click.echo()
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+
+@cli.command()
+@click.argument("commit_id")
+@click.option("--agent", "agent_name", default=None, help="Agent name")
+@click.option("--deep", is_flag=True, help="Generate deep dive summary (on-demand, slower)")
+@click.option("--base-path", default=".", help="Project root")
+def snapshot_describe(commit_id, agent_name, deep, base_path):
+    """Show natural language summary of a snapshot.
+
+    Examples:
+      cf snapshot describe b353c3e6
+      cf snapshot describe b353c3e6 --deep
+    """
+    try:
+        from cacheflow.snapshot_query import SnapshotQueryEngine
+        from cacheflow.server import LlamaServer
+        from cacheflow.config import load_config
+        import json
+
+        base_path = Path(base_path)
+        db_path = base_path / ".cacheflow" / "agents.db"
+
+        if not db_path.exists():
+            raise click.ClickException("No database found. Run 'cf run' first.")
+
+        store = CacheFlowStore(db_path)
+
+        # Find the commit
+        commit = store.get_commit_by_id_prefix(commit_id)
+        if not commit:
+            raise click.ClickException(f"Commit {commit_id} not found.")
+
+        # Get embedding
+        emb = store.get_snapshot_embedding(commit.id)
+        if not emb:
+            raise click.ClickException(f"Snapshot {commit_id} not indexed yet.")
+
+        click.echo(f"Snapshot: {str(commit.id)[:8]}")
+        click.echo(f"Task: {commit.task}")
+        click.echo(f"Created: {commit.created_at}")
+        click.echo()
+
+        # Show short summary
+        click.echo("Summary:")
+        click.echo(emb.short_summary)
+        click.echo()
+
+        # Show facets
+        facets = json.loads(emb.facets)
+        click.echo("Knowledge Facets:")
+        for facet_name, items in facets.items():
+            if items:
+                click.echo(f"  {facet_name.title()}:")
+                for item in items[:3]:  # Show first 3
+                    click.echo(f"    - {item}")
+        click.echo()
+
+        # Generate deep dive if requested
+        if deep:
+            if emb.deep_summary:
+                click.echo("Deep Dive (cached):")
+                click.echo(emb.deep_summary)
+            else:
+                click.echo("Generating deep dive...")
+                config = load_config(base_path)
+                server = LlamaServer(
+                    model_path=config.model_path,
+                    ctx_size=config.ctx_size,
+                    n_gpu_layers=config.n_gpu_layers,
+                )
+                try:
+                    # Restore snapshot and ask a richer question
+                    restore_response = server.restore_slot(
+                        path=commit.snapshot_path,
+                        slot_id=1,
+                    )
+                    if restore_response.get("success"):
+                        response = server.completion(
+                            prompt="Provide a comprehensive summary of what you learned in this session, including code references and design patterns.",
+                            slot_id=1,
+                            max_tokens=512,
+                        )
+                        deep_summary = response.get("content", "")
+                        # Cache it
+                        store.update_deep_summary(commit.id, deep_summary)
+                        click.echo("Deep Dive:")
+                        click.echo(deep_summary)
+                    else:
+                        raise click.ClickException("Failed to restore snapshot for deep dive.")
+                finally:
+                    server.stop()
+    except click.ClickException:
+        raise
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+
+@cli.command()
+@click.argument("commit_a")
+@click.argument("commit_b")
+@click.option("--agent", "agent_name", default=None, help="Agent name")
+@click.option("--base-path", default=".", help="Project root")
+def diff_knowledge(commit_a, commit_b, agent_name, base_path):
+    """Show what changed between two snapshots.
+
+    Example:
+      cf diff-knowledge b353c3e6 424c66b8 --agent main
+    """
+    try:
+        from cacheflow.snapshot_query import SnapshotQueryEngine
+
+        base_path = Path(base_path)
+        db_path = base_path / ".cacheflow" / "agents.db"
+
+        if not db_path.exists():
+            raise click.ClickException("No database found. Run 'cf run' first.")
+
+        store = CacheFlowStore(db_path)
+        engine = SnapshotQueryEngine(store)
+
+        diff = engine.diff(commit_a, commit_b)
+
+        if "error" in diff:
+            raise click.ClickException(diff["error"])
+
+        click.echo(f"Knowledge diff: {diff['commit_a']} → {diff['commit_b']}\n")
+        click.echo(f"Task A: {diff['task_a']}")
+        click.echo(f"Task B: {diff['task_b']}\n")
+
+        if diff["new_functions"]:
+            click.echo(f"New functions: {', '.join(diff['new_functions'])}")
+        if diff["removed_functions"]:
+            click.echo(f"Removed functions: {', '.join(diff['removed_functions'])}")
+        if diff["new_bugs"]:
+            click.echo(f"New issues found: {', '.join(diff['new_bugs'])}")
+        if diff["fixed_bugs"]:
+            click.echo(f"Fixed issues: {', '.join(diff['fixed_bugs'])}")
+        if diff["new_patterns"]:
+            click.echo(f"New patterns: {', '.join(diff['new_patterns'])}")
+        if diff["new_facts"]:
+            click.echo(f"New facts: {', '.join(diff['new_facts'])}")
+
+        if not any(
+            [
+                diff["new_functions"],
+                diff["removed_functions"],
+                diff["new_bugs"],
+                diff["fixed_bugs"],
+                diff["new_patterns"],
+                diff["new_facts"],
+            ]
+        ):
+            click.echo("No significant knowledge changes.")
+    except click.ClickException:
+        raise
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+
+@cli.command()
 @click.option("--port", default=8080, type=int, help="Port to serve on (default: 8080)")
 @click.option("--base-path", default=".", help="Project root")
 def dashboard(port, base_path):
