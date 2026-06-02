@@ -157,7 +157,7 @@ def init(agent_name, model_path, model_name, ctx_size, n_gpu_layers, base_path):
         store = CacheFlowStore(db_path)
         store.init_db()
 
-        click.echo("✓ Initialized agentgit project")
+        click.echo("✓ Initialized CacheFlow project")
         click.echo(f"  Config: {base_path / '.cacheflow' / 'config.json'}")
         click.echo(f"  Database: {db_path}")
         click.echo(f"  Model: {model_name}")

@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class CacheFlowConfig(BaseModel):
-    """Configuration for an agentgit project."""
+    """Configuration for a CacheFlow project."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -108,7 +108,7 @@ def load_config(base_path: Path) -> CacheFlowConfig:
 
     if not config_file.exists():
         raise FileNotFoundError(
-            f"Config not found at {config_file}. Run 'agentgit init' first."
+            f"Config not found at {config_file}. Run 'cf run' first to auto-initialize."
         )
 
     with open(config_file) as f:

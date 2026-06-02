@@ -13,7 +13,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>agentgit Dashboard</title>
+    <title>CacheFlow Dashboard</title>
     <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
     <style>
         * {
@@ -248,7 +248,7 @@ HTML_TEMPLATE = """
 <body>
     <header>
         <div class="header-content">
-            <h1>agentgit Dashboard</h1>
+            <h1>CacheFlow Dashboard</h1>
             <div class="refresh-time">Last refreshed: <span id="refresh-time">--:--</span></div>
         </div>
     </header>

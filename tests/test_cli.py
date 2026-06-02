@@ -67,7 +67,7 @@ class TestInitCommand:
         )
 
         assert result.exit_code == 0
-        assert "✓ Initialized agentgit project" in result.output
+        assert "✓ Initialized CacheFlow project" in result.output
         assert "Config:" in result.output
 
         # Check config file exists

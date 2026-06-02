@@ -26,21 +26,22 @@ Same model. Same quality. The cost just drops.
 ## Quick Start
 
 ```bash
-# 1. Install dependencies
-brew install llama.cpp
+# 1. Install CacheFlow
+pip install cacheflow
+
+# 2. Install and run ollama (auto-detected by CacheFlow)
+brew install ollama
 ollama pull llama3.1:8b
+ollama serve
 
-# 2. Initialize agentgit in your project
-agentgit init --model llama3.1:8b
+# 3. Run your first task (auto-initializes project)
+cf run "Analyze this codebase and summarize its architecture"
 
-# 3. Run an agent task (Session 1: full context ingestion)
-agentgit run "Analyze this codebase and summarize its architecture"
-
-# 4. Run again with a follow-up task (Session 2: uses cached knowledge)
-agentgit run "What are the three highest-priority bugs to fix?"
+# 4. Follow up with another task (uses cached knowledge)
+cf run "What are the three highest-priority bugs to fix?"
 
 # 5. See the cost breakdown
-agentgit log
+cf log main
 ```
 
 ## Multi-Agent Workflows
@@ -91,26 +92,27 @@ See [MULTI_AGENT_DESIGN.md](MULTI_AGENT_DESIGN.md) for architecture details.
 ## CLI Reference
 
 ```
-agentgit init [--model MODEL] [--ctx-size SIZE]
-  Initialize agentgit in current directory. Locks ctx_size immutably.
+cf init [--model MODEL] [--ctx-size SIZE]
+  Initialize CacheFlow in current directory. Locks ctx_size immutably.
+  (Usually unnecessary — auto-runs on first cf run)
 
-agentgit run [--agent AGENT_NAME] [--max-tokens N] TASK
+cf run [--agent AGENT_NAME] [--max-tokens N] TASK
   Run a task with an agent. Restores previous snapshot if available.
-  Prints: token usage, tokens saved, snapshot size, commit hash.
+  Prints: token usage, tokens saved, snapshot size, duration.
 
-agentgit log [--agent AGENT_NAME] [--limit N]
+cf log AGENT_NAME [--limit N]
   Show commit history with token savings per session.
 
-agentgit fork PARENT_AGENT CHILD_AGENT [--scope DESCRIPTION]
+cf fork PARENT_AGENT CHILD_AGENT [--scope DESCRIPTION]
   Fork an agent from parent's HEAD snapshot. Child inherits all knowledge.
 
-agentgit diff COMMIT_A COMMIT_B
+cf diff COMMIT_A COMMIT_B
   Semantic diff: what the agent knew at each commit.
 
-agentgit status
+cf status
   Show active agent, HEAD commit, total snapshots, disk usage.
 
-agentgit dashboard (optional)
+cf dashboard (optional)
   Live ASCII dashboard: commit DAG + token savings curve.
 ```
 
