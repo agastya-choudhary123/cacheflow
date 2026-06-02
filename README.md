@@ -89,6 +89,56 @@ Each agent:
 
 See [MULTI_AGENT_DESIGN.md](MULTI_AGENT_DESIGN.md) for architecture details.
 
+## Snapshot Intelligence Layer
+
+CacheFlow now features **knowledge probing** — a system that extracts and indexes what the model learned at each snapshot, enabling semantic search and live querying across past sessions.
+
+### How It Works
+
+After each session completes, while the KV cache is still hot, CacheFlow runs 4 targeted probes:
+- What key functions/classes did you analyze?
+- What bugs or risks did you identify?
+- What architectural patterns did you observe?
+- What are the 3 most important facts you learned?
+
+These responses are stored as **knowledge facets**, embedded, and indexed in SQLite. You can then:
+
+**Search semantically** across snapshots:
+```bash
+cf query "What do you know about authentication?"
+cf query "database schema" --agent main --top-k 3
+```
+
+**Query live** — restore the model's past memory state and ask directly:
+```bash
+cf query --live "How does token refresh work?"
+```
+
+**Search globally** across all your CacheFlow projects:
+```bash
+cf query "authentication" --global
+```
+
+**Show snapshots in natural language**:
+```bash
+cf snapshot describe b353c3e6
+cf snapshot describe b353c3e6 --deep    # Generate richer summary on-demand
+```
+
+**Compare knowledge between sessions**:
+```bash
+cf diff-knowledge b353c3e6 424c66b8    # What changed between these snapshots?
+```
+
+### Dashboard
+
+The web dashboard (`cf dashboard`) now includes:
+- **Click a commit node** → see its summary + structured facets
+- **Search box** → highlights matching snapshots with relevance scores
+- **API endpoints** → `/api/query`, `/api/agents/<agent>/commits/<id>/summary`
+
+**The novel part**: Most RAG systems inject context into a fresh model. CacheFlow restores the model's *actual past memory state* — the KV cache IS the context. No re-ingestion needed.
+
 ## CLI Reference
 
 ```
@@ -103,17 +153,24 @@ cf run [--agent AGENT_NAME] [--max-tokens N] TASK
 cf log AGENT_NAME [--limit N]
   Show commit history with token savings per session.
 
+cf query TEXT [--agent AGENT] [--top-k N] [--live] [--global]
+  Search snapshots semantically. With --live, query the best match's restored KV state.
+  With --global, search across all registered CacheFlow projects.
+
+cf snapshot describe COMMIT_ID [--deep]
+  Show natural language summary of a snapshot. With --deep, generate richer summary.
+
+cf diff-knowledge COMMIT_A COMMIT_B [--agent AGENT]
+  Show structured diff of knowledge facets between snapshots.
+
 cf fork PARENT_AGENT CHILD_AGENT [--scope DESCRIPTION]
   Fork an agent from parent's HEAD snapshot. Child inherits all knowledge.
 
-cf diff COMMIT_A COMMIT_B
-  Semantic diff: what the agent knew at each commit.
+cf status [--agent AGENT]
+  Show agent commit history, token usage, snapshots, disk usage.
 
-cf status
-  Show active agent, HEAD commit, total snapshots, disk usage.
-
-cf dashboard (optional)
-  Live ASCII dashboard: commit DAG + token savings curve.
+cf dashboard [--port PORT]
+  Launch web dashboard: commit DAG, search, summaries, live metrics.
 ```
 
 ## How It Works: Technical
@@ -141,7 +198,13 @@ The snapshot file persists to disk only after DB transaction succeeds (atomic co
 
 ## Roadmap
 
-**Coming soon: Multi-agent and OS-inspired optimizations**
+**Implemented:**
+- ✅ **Snapshot Intelligence Layer** — Knowledge probing, semantic indexing, live querying, cross-snapshot diffing
+- ✅ **Multi-agent concurrency** — Independent slots, LRU eviction, shared model memory
+- ✅ **Dashboard** — Live metrics, commit DAG, search, summary panels
+- ✅ **Global project registry** — Search across all CacheFlow projects
+
+**Coming soon:**
 
 **Multi-agent enhancements:**
 - **Slot pinning**: Prevent eviction of critical agents
@@ -149,11 +212,11 @@ The snapshot file persists to disk only after DB transaction succeeds (atomic co
 - **Heterogeneous models**: Support different model versions in different slots
 - **Async orchestration**: Full async/await support for orchestrating complex workflows
 
-**Storage optimizations:**
+**Storage & retrieval optimizations:**
 - **Tiered paging**: Move old snapshots to compressed storage. Load on-demand.
 - **Copy-on-write forking**: Child forks reference parent snapshot until diverging. Snapshot duplication happens lazily.
 - **Idle consolidation**: Compress snapshots in the background while agents are idle, trading I/O for disk space.
-- **Merge operation**: Combine two branches' knowledge via semantic diff + consolidation.
+- **Knowledge merge**: Combine two branches' knowledge via semantic diff + multi-way consolidation.
 
 ## Architecture
 
