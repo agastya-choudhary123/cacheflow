@@ -496,7 +496,16 @@ HTML_TEMPLATE = """
 
         // Initial render and set up refresh interval
         fetchAndRender();
-        setInterval(fetchAndRender, REFRESH_INTERVAL);
+        setInterval(() => {
+            const selectedAgent = document.getElementById('agent-select')?.value;
+            fetchAndRender();
+            if (selectedAgent) {
+                setTimeout(() => {
+                    document.getElementById('agent-select').value = selectedAgent;
+                    loadDAG(selectedAgent);
+                }, 100);
+            }
+        }, REFRESH_INTERVAL);
     </script>
 </body>
 </html>

@@ -70,6 +70,21 @@ class SessionLog(Base):
     created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
+class SnapshotEmbedding(Base):
+    """Semantic embedding and knowledge facets for a snapshot."""
+
+    __tablename__ = "snapshot_embeddings"
+
+    commit_id = Column(Uuid, ForeignKey("commits.id"), primary_key=True)
+    agent_id = Column(Uuid, ForeignKey("agents.id"), nullable=False)
+    short_summary = Column(String, nullable=False)  # 2-3 sentence NL summary derived from facets
+    facets = Column(String, nullable=False)  # JSON: {functions: [...], bugs: [...], patterns: [...], facts: [...]}
+    embedding = Column(String, nullable=False)  # JSON: list[float] 384-dim of short_summary
+    facet_embeddings = Column(String, nullable=False)  # JSON: {facet_name: list[float]}
+    deep_summary = Column(String, nullable=True)  # Populated on-demand, cached
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
 class CacheFlowStore:
     """Manages the SQLite DAG database."""
 
@@ -304,5 +319,67 @@ class CacheFlowStore:
             session.commit()
             session.refresh(session_log)
             return session_log
+        finally:
+            session.close()
+
+    def save_snapshot_embedding(
+        self,
+        commit_id: UUID,
+        agent_id: UUID,
+        short_summary: str,
+        facets: str,  # JSON string
+        embedding: str,  # JSON string: list[float]
+        facet_embeddings: str,  # JSON string: {facet_name: list[float]}
+    ) -> SnapshotEmbedding:
+        """Save semantic embedding and knowledge facets for a snapshot."""
+        session = self._get_session()
+        try:
+            snapshot_emb = SnapshotEmbedding(
+                commit_id=commit_id,
+                agent_id=agent_id,
+                short_summary=short_summary,
+                facets=facets,
+                embedding=embedding,
+                facet_embeddings=facet_embeddings,
+            )
+            session.add(snapshot_emb)
+            session.commit()
+            session.refresh(snapshot_emb)
+            return snapshot_emb
+        finally:
+            session.close()
+
+    def get_snapshot_embedding(self, commit_id: UUID) -> SnapshotEmbedding | None:
+        """Get semantic embedding for a specific commit."""
+        session = self._get_session()
+        try:
+            return session.query(SnapshotEmbedding).filter(
+                SnapshotEmbedding.commit_id == commit_id
+            ).first()
+        finally:
+            session.close()
+
+    def get_all_embeddings(self, agent_name: str | None = None) -> list[SnapshotEmbedding]:
+        """Get all snapshot embeddings, optionally filtered by agent name."""
+        session = self._get_session()
+        try:
+            query = session.query(SnapshotEmbedding)
+            if agent_name:
+                query = query.join(Agent).filter(Agent.name == agent_name)
+            return query.all()
+        finally:
+            session.close()
+
+    def update_deep_summary(self, commit_id: UUID, deep_summary: str) -> None:
+        """Update the deep summary for a snapshot (generated on-demand, cached)."""
+        session = self._get_session()
+        try:
+            snapshot_emb = session.query(SnapshotEmbedding).filter(
+                SnapshotEmbedding.commit_id == commit_id
+            ).first()
+            if snapshot_emb:
+                snapshot_emb.deep_summary = deep_summary
+                session.merge(snapshot_emb)
+                session.commit()
         finally:
             session.close()
