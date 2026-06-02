@@ -10,6 +10,10 @@ from typing import Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
+# Global project registry path
+GLOBAL_REGISTRY_PATH = Path.home() / ".cacheflow" / "projects.json"
+
+
 class CacheFlowConfig(BaseModel):
     """Configuration for a CacheFlow project."""
 
@@ -163,3 +167,51 @@ def find_gguf_for_model(model_name: str) -> Optional[str]:
                 return str(file_path)
 
     return None
+
+
+def register_project(project_path: Path, db_path: Path) -> None:
+    """Register a CacheFlow project in the global registry.
+
+    Args:
+        project_path: Absolute path to the project directory
+        db_path: Absolute path to the agents.db file
+    """
+    from datetime import datetime, timezone
+
+    registry_path = GLOBAL_REGISTRY_PATH
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Load existing registry or create new
+    registry = {}
+    if registry_path.exists():
+        try:
+            with open(registry_path) as f:
+                registry = json.load(f)
+        except Exception:
+            registry = {}
+
+    # Register this project
+    registry[str(project_path)] = {
+        "registered_at": datetime.now(timezone.utc).isoformat(),
+        "db": str(db_path),
+    }
+
+    # Write back
+    with open(registry_path, "w") as f:
+        json.dump(registry, f, indent=2)
+
+
+def get_global_registry() -> dict:
+    """Load the global project registry.
+
+    Returns:
+        Dict mapping project paths to their metadata
+    """
+    if not GLOBAL_REGISTRY_PATH.exists():
+        return {}
+
+    try:
+        with open(GLOBAL_REGISTRY_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}

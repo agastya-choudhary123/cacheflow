@@ -71,22 +71,56 @@ class SnapshotQueryEngine:
         # Embed query
         query_embedding = self.embedding_model.encode(text, normalize_embeddings=True).tolist()
 
-        # Load embeddings
-        embeddings = self.store.get_all_embeddings(agent_name=agent_name)
+        matches = []
 
-        if not embeddings:
-            return []
+        if global_search:
+            # Search across all registered projects
+            from cacheflow.config import get_global_registry
+            from pathlib import Path
 
-        # Compute similarity scores
+            registry = get_global_registry()
+            for project_path, project_info in registry.items():
+                try:
+                    db_path = Path(project_info["db"])
+                    if db_path.exists():
+                        project_store = CacheFlowStore(db_path)
+                        project_embeddings = project_store.get_all_embeddings(
+                            agent_name=agent_name
+                        )
+                        matches.extend(
+                            self._compute_matches(
+                                query_embedding,
+                                project_embeddings,
+                                project_store,
+                            )
+                        )
+                except Exception:
+                    continue  # Skip projects with errors
+        else:
+            # Search current project only
+            embeddings = self.store.get_all_embeddings(agent_name=agent_name)
+            matches = self._compute_matches(query_embedding, embeddings, self.store)
+
+        # Sort by score descending and return top-k
+        matches.sort(key=lambda m: m.score, reverse=True)
+        return matches[:top_k]
+
+    def _compute_matches(
+        self,
+        query_embedding: list[float],
+        embeddings,
+        store: CacheFlowStore,
+    ) -> list[SnapshotMatch]:
+        """Compute similarity scores for embeddings against query."""
         matches = []
         for emb in embeddings:
             stored_embedding = json.loads(emb.embedding)
             score = self._cosine_similarity(query_embedding, stored_embedding)
 
             # Fetch commit and agent metadata
-            commit = self.store.get_commit_by_id_prefix(str(emb.commit_id))
-            agent = self.store.get_agent_by_id(emb.agent_id) if hasattr(
-                self.store, "get_agent_by_id"
+            commit = store.get_commit_by_id_prefix(str(emb.commit_id))
+            agent = store.get_agent_by_id(emb.agent_id) if hasattr(
+                store, "get_agent_by_id"
             ) else None
 
             if commit and agent:
@@ -101,9 +135,7 @@ class SnapshotQueryEngine:
                     )
                 )
 
-        # Sort by score descending and return top-k
-        matches.sort(key=lambda m: m.score, reverse=True)
-        return matches[:top_k]
+        return matches
 
     def query_live(
         self,

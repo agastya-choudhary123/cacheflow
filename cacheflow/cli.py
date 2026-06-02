@@ -5,7 +5,7 @@ from pathlib import Path
 import click
 
 from cacheflow.agent import AgentSession, DEFAULT_SYSTEM_PROMPT, fork_agent
-from cacheflow.config import CacheFlowConfig, compute_model_hash, save_config, load_config
+from cacheflow.config import CacheFlowConfig, compute_model_hash, save_config, load_config, register_project
 from cacheflow.store import CacheFlowStore
 from cacheflow.ollama import list_ollama_models, get_ollama_model_path, ollama_is_installed
 
@@ -88,6 +88,12 @@ def ensure_initialized(base_path: Path) -> None:
     store = CacheFlowStore(db_path)
     store.init_db()
 
+    # Register project in global registry
+    try:
+        register_project(base_path.resolve(), db_path.resolve())
+    except Exception:
+        pass  # Non-blocking
+
     click.echo(f"✓ Initialized with {model_name}")
     click.echo(f"  Config: {config_file}")
     click.echo(f"  Model: {model_path}")
@@ -156,6 +162,12 @@ def init(agent_name, model_path, model_name, ctx_size, n_gpu_layers, base_path):
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = CacheFlowStore(db_path)
         store.init_db()
+
+        # Register project in global registry
+        try:
+            register_project(base_path.resolve(), db_path.resolve())
+        except Exception:
+            pass  # Non-blocking
 
         click.echo("✓ Initialized CacheFlow project")
         click.echo(f"  Config: {base_path / '.cacheflow' / 'config.json'}")
@@ -419,14 +431,16 @@ def status(agent_name, base_path):
 @click.option("--agent", "agent_name", default=None, help="Filter by agent name")
 @click.option("--top-k", default=5, type=int, help="Number of results (default: 5)")
 @click.option("--live", is_flag=True, help="Query the best matching snapshot live")
+@click.option("--global", "global_search", is_flag=True, help="Search across all CacheFlow projects")
 @click.option("--base-path", default=".", help="Project root")
-def query(text, agent_name, top_k, live, base_path):
+def query(text, agent_name, top_k, live, global_search, base_path):
     """Search snapshots semantically or query them live.
 
     Examples:
       cf query "What do you know about auth?"
       cf query "database schema" --agent main --top-k 3
       cf query --live "How does token refresh work?"
+      cf query "authentication" --global
     """
     try:
         from cacheflow.snapshot_query import SnapshotQueryEngine
@@ -436,13 +450,21 @@ def query(text, agent_name, top_k, live, base_path):
         base_path = Path(base_path)
         db_path = base_path / ".cacheflow" / "agents.db"
 
-        if not db_path.exists():
+        if not db_path.exists() and not global_search:
             raise click.ClickException("No database found. Run 'cf run' first.")
 
-        store = CacheFlowStore(db_path)
+        store = CacheFlowStore(db_path) if db_path.exists() else None
+
+        # For global search without a local project, create a dummy store for the engine
+        if global_search and not store:
+            # Create a temporary store just for engine initialization
+            import tempfile
+            temp_db = Path(tempfile.gettempdir()) / "cacheflow_temp.db"
+            store = CacheFlowStore(temp_db)
+
         engine = SnapshotQueryEngine(store)
 
-        if live:
+        if live and not global_search:
             # Live query: restore snapshot and ask the model
             config = load_config(base_path)
             server = LlamaServer(
@@ -459,7 +481,7 @@ def query(text, agent_name, top_k, live, base_path):
                 server.stop()
         else:
             # Semantic search
-            matches = engine.query(text, agent_name=agent_name, top_k=top_k)
+            matches = engine.query(text, agent_name=agent_name, top_k=top_k, global_search=global_search)
             if not matches:
                 click.echo("No relevant snapshots found.")
                 return
