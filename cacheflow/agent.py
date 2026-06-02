@@ -319,7 +319,7 @@ class AgentSession:
 
             # Step k: Log session
             prompt_to_log = full_prompt[:1000]  # Truncate for logging
-            self.store.log_session(
+            session_log = self.store.log_session(
                 agent=agent,
                 commit=commit,
                 prompt=prompt_to_log,
@@ -328,6 +328,13 @@ class AgentSession:
                 tokens_out=tokens_out,
                 duration_ms=completion_time_ms,
             )
+
+            # Step k1: Probe KV cache for knowledge facets (non-blocking)
+            try:
+                from cacheflow.knowledge_prober import KnowledgeProber
+                KnowledgeProber(self.store).probe(self.server, self.slot_id, commit, session_log)
+            except Exception:
+                pass  # Non-blocking — indexing failure never breaks the agent
 
             # Step k2: Extract and index codebase on first session
             if is_first_session:
