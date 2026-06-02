@@ -166,6 +166,14 @@ class CacheFlowStore:
         finally:
             session.close()
 
+    def get_agent_by_id(self, agent_id: UUID) -> Agent | None:
+        """Get an agent by ID."""
+        session = self._get_session()
+        try:
+            return session.query(Agent).filter(Agent.id == agent_id).first()
+        finally:
+            session.close()
+
     def list_agents(self) -> list[Agent]:
         """List all agents."""
         session = self._get_session()
