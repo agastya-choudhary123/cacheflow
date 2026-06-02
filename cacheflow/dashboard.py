@@ -1,7 +1,7 @@
 """Web dashboard for CacheFlow using Flask."""
 
 from pathlib import Path
-from flask import Flask, render_template_string, jsonify
+from flask import Flask, render_template_string, jsonify, request
 from sqlalchemy.orm import Session as SQLSession
 from cacheflow.store import CacheFlowStore, Commit, SessionLog
 import json
@@ -243,6 +243,121 @@ HTML_TEMPLATE = """
         .agent-select select:hover {
             background: #3d4860;
         }
+
+        .dag-controls {
+            display: flex;
+            gap: 16px;
+            margin-bottom: 16px;
+            align-items: center;
+        }
+
+        .dag-search {
+            flex: 1;
+        }
+
+        .dag-search input {
+            width: 100%;
+            padding: 8px 12px;
+            background: #2d3748;
+            color: #e0e6ed;
+            border: 1px solid #3d4860;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+
+        .dag-search input::placeholder {
+            color: #718096;
+        }
+
+        .dag-search input:focus {
+            outline: none;
+            border-color: #4299e1;
+            box-shadow: 0 0 0 3px rgba(66, 153, 225, 0.1);
+        }
+
+        .summary-panel {
+            display: none;
+            background: #2d3748;
+            border: 1px solid #3d4860;
+            border-radius: 8px;
+            padding: 16px;
+            margin-top: 16px;
+        }
+
+        .summary-panel.visible {
+            display: block;
+        }
+
+        .summary-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+
+        .summary-header h3 {
+            margin: 0;
+            font-size: 16px;
+            color: #e0e6ed;
+        }
+
+        .summary-close {
+            background: none;
+            border: none;
+            color: #a0aec0;
+            cursor: pointer;
+            font-size: 20px;
+            padding: 0;
+        }
+
+        .summary-close:hover {
+            color: #e0e6ed;
+        }
+
+        .summary-content {
+            color: #cbd5e0;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+
+        .summary-facets {
+            margin-top: 16px;
+            border-top: 1px solid #3d4860;
+            padding-top: 12px;
+        }
+
+        .facet-tab {
+            display: inline-block;
+            padding: 6px 12px;
+            background: #1a202c;
+            border: 1px solid #3d4860;
+            border-radius: 4px;
+            margin-right: 8px;
+            margin-bottom: 8px;
+            cursor: pointer;
+            color: #a0aec0;
+            font-size: 12px;
+        }
+
+        .facet-tab.active {
+            background: #4299e1;
+            color: #fff;
+            border-color: #4299e1;
+        }
+
+        .facet-content {
+            display: none;
+            margin-top: 8px;
+        }
+
+        .facet-content.active {
+            display: block;
+        }
+
+        .facet-item {
+            padding: 6px 0;
+            color: #cbd5e0;
+        }
     </style>
 </head>
 <body>
@@ -260,13 +375,31 @@ HTML_TEMPLATE = """
         <!-- DAG section is kept separate to avoid re-rendering on dashboard refresh -->
         <div id="dag-section" style="display: none; margin-top: 40px;">
             <h2>Commit DAG</h2>
-            <div class="agent-select">
-                <label>Select agent: </label>
-                <select id="agent-select" onchange="loadDAG(this.value)">
-                    <option value="">-- Choose an agent --</option>
-                </select>
+            <div class="dag-controls">
+                <div class="agent-select">
+                    <label>Select agent: </label>
+                    <select id="agent-select" onchange="loadDAG(this.value)">
+                        <option value="">-- Choose an agent --</option>
+                    </select>
+                </div>
+                <div class="dag-search">
+                    <input type="text" id="dag-search-input" placeholder="Search snapshots by knowledge...">
+                </div>
             </div>
             <div id="dag-container"></div>
+            <div id="summary-panel" class="summary-panel">
+                <div class="summary-header">
+                    <h3>Snapshot Summary</h3>
+                    <button class="summary-close" onclick="closeSummary()">✕</button>
+                </div>
+                <div class="summary-content">
+                    <p id="summary-text"></p>
+                    <div class="summary-facets">
+                        <div id="facet-tabs"></div>
+                        <div id="facet-content"></div>
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -541,6 +674,109 @@ HTML_TEMPLATE = """
             };
 
             currentNetwork = new vis.Network(container, { nodes, edges }, options);
+
+            // Add click handler to show summary panel
+            currentNetwork.on('click', function(params) {
+                if (params.nodes && params.nodes.length > 0) {
+                    const nodeId = params.nodes[0];
+                    showSummary(nodeId, selectedAgentName);
+                }
+            });
+
+            // Store node data for later access
+            currentNetwork.nodeData = data.nodes;
+        }
+
+        function showSummary(commitId, agentName) {
+            fetch(`/api/agents/${agentName}/commits/${commitId}/summary`)
+                .then(r => r.json())
+                .then(data => {
+                    const panel = document.getElementById('summary-panel');
+                    document.getElementById('summary-text').textContent = data.short_summary;
+
+                    // Render facet tabs and content
+                    const facets = JSON.parse(data.facets);
+                    const facetNames = Object.keys(facets);
+                    let tabsHtml = '';
+                    let contentHtml = '';
+
+                    facetNames.forEach((name, idx) => {
+                        const items = facets[name];
+                        tabsHtml += `<button class="facet-tab${idx === 0 ? ' active' : ''}" onclick="switchFacet('${name}')">${name}</button>`;
+                        contentHtml += `<div id="facet-${name}" class="facet-content${idx === 0 ? ' active' : ''}">`;
+                        if (items && items.length > 0) {
+                            items.forEach(item => {
+                                contentHtml += `<div class="facet-item">• ${item}</div>`;
+                            });
+                        } else {
+                            contentHtml += `<div class="facet-item">No items</div>`;
+                        }
+                        contentHtml += `</div>`;
+                    });
+
+                    document.getElementById('facet-tabs').innerHTML = tabsHtml;
+                    document.getElementById('facet-content').innerHTML = contentHtml;
+                    panel.classList.add('visible');
+                })
+                .catch(err => {
+                    console.error('Failed to load summary:', err);
+                });
+        }
+
+        function closeSummary() {
+            document.getElementById('summary-panel').classList.remove('visible');
+        }
+
+        function switchFacet(facetName) {
+            // Hide all
+            document.querySelectorAll('.facet-tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.facet-content').forEach(c => c.classList.remove('active'));
+            // Show selected
+            document.querySelector(`[onclick="switchFacet('${facetName}')"]`).classList.add('active');
+            document.getElementById(`facet-${facetName}`).classList.add('active');
+        }
+
+        // Search functionality
+        document.addEventListener('DOMContentLoaded', function() {
+            const searchInput = document.getElementById('dag-search-input');
+            if (searchInput) {
+                searchInput.addEventListener('input', function(e) {
+                    const query = e.target.value;
+                    if (query && selectedAgentName) {
+                        searchSnapshots(query, selectedAgentName);
+                    } else if (!query && currentNetwork) {
+                        // Clear highlighting
+                        currentNetwork.selectNodes([]);
+                    }
+                });
+            }
+        });
+
+        function searchSnapshots(query, agentName) {
+            fetch(`/api/query?q=${encodeURIComponent(query)}&agent=${agentName}`)
+                .then(r => r.json())
+                .then(matches => {
+                    if (currentNetwork && currentNetwork.nodeData) {
+                        // Highlight matching nodes
+                        const matchingIds = matches.map(m => m.commit_id);
+                        currentNetwork.selectNodes(matchingIds);
+
+                        // Dim non-matching nodes
+                        const allNodeIds = currentNetwork.nodeData.map(n => n.id);
+                        const nonMatchingIds = allNodeIds.filter(id => !matchingIds.includes(id));
+
+                        // Update colors
+                        if (currentNetwork.body && currentNetwork.body.nodes) {
+                            nonMatchingIds.forEach(id => {
+                                const node = currentNetwork.body.nodes[id];
+                                if (node) {
+                                    node.setOptions({ opacity: 0.3 });
+                                }
+                            });
+                        }
+                    }
+                })
+                .catch(err => console.error('Search failed:', err));
         }
 
         // Initial render and set up refresh interval
@@ -757,6 +993,119 @@ def run_dashboard(base_path: Path, port: int = 8080) -> None:
     def api_agent_dag(agent_name):
         dag = get_agent_dag(base_path, agent_name)
         return jsonify(dag)
+
+    @app.route("/api/agents/<agent_name>/commits/<commit_id>/summary")
+    def api_snapshot_summary(agent_name, commit_id):
+        """Get summary and facets for a snapshot."""
+        try:
+            db_path = base_path / ".cacheflow" / "agents.db"
+            from cacheflow.store import CacheFlowStore
+            store = CacheFlowStore(db_path)
+
+            # Find commit by prefix
+            commit = store.get_commit_by_id_prefix(commit_id)
+            if not commit:
+                return jsonify({"error": "Commit not found"}), 404
+
+            # Get embedding
+            emb = store.get_snapshot_embedding(commit.id)
+            if not emb:
+                return jsonify({"error": "Snapshot not indexed"}), 404
+
+            return jsonify({
+                "short_summary": emb.short_summary,
+                "facets": emb.facets,
+            })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/agents/<agent_name>/commits/<commit_id>/deep")
+    def api_snapshot_deep(agent_name, commit_id):
+        """Get or generate deep summary for a snapshot."""
+        try:
+            db_path = base_path / ".cacheflow" / "agents.db"
+            from cacheflow.store import CacheFlowStore
+            from cacheflow.config import load_config
+            from cacheflow.server import LlamaServer
+
+            store = CacheFlowStore(db_path)
+
+            # Find commit
+            commit = store.get_commit_by_id_prefix(commit_id)
+            if not commit:
+                return jsonify({"error": "Commit not found"}), 404
+
+            # Get embedding
+            emb = store.get_snapshot_embedding(commit.id)
+            if not emb:
+                return jsonify({"error": "Snapshot not indexed"}), 404
+
+            # If already cached, return it
+            if emb.deep_summary:
+                return jsonify({"deep_summary": emb.deep_summary})
+
+            # Generate on-demand
+            config = load_config(base_path)
+            server = LlamaServer(
+                model_path=config.model_path,
+                ctx_size=config.ctx_size,
+                n_gpu_layers=config.n_gpu_layers,
+            )
+            try:
+                restore_response = server.restore_slot(
+                    path=commit.snapshot_path,
+                    slot_id=1,
+                )
+                if not restore_response.get("success"):
+                    return jsonify({"error": "Failed to restore snapshot"}), 500
+
+                response = server.completion(
+                    prompt="Provide a comprehensive summary of what you learned in this session, including code references and design patterns.",
+                    slot_id=1,
+                    max_tokens=512,
+                )
+                deep_summary = response.get("content", "")
+
+                # Cache it
+                store.update_deep_summary(commit.id, deep_summary)
+
+                return jsonify({"deep_summary": deep_summary})
+            finally:
+                server.stop()
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/query")
+    def api_query():
+        """Search snapshots semantically."""
+        try:
+            query_text = request.args.get("q", "")
+            agent_name = request.args.get("agent")
+
+            if not query_text:
+                return jsonify([])
+
+            db_path = base_path / ".cacheflow" / "agents.db"
+            from cacheflow.store import CacheFlowStore
+            from cacheflow.snapshot_query import SnapshotQueryEngine
+
+            store = CacheFlowStore(db_path)
+            engine = SnapshotQueryEngine(store)
+
+            matches = engine.query(query_text, agent_name=agent_name, top_k=5)
+
+            return jsonify([
+                {
+                    "commit_id": m.commit_id,
+                    "agent_name": m.agent_name,
+                    "task": m.task,
+                    "short_summary": m.short_summary,
+                    "score": m.score,
+                }
+                for m in matches
+            ])
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
     print(f"\n✓ Dashboard running at http://localhost:{port}")
     print(f"  Press Ctrl+C to stop\n")
