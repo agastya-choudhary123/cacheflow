@@ -257,10 +257,23 @@ HTML_TEMPLATE = """
         <div id="content">
             <div class="loading">Loading dashboard data...</div>
         </div>
+        <!-- DAG section is kept separate to avoid re-rendering on dashboard refresh -->
+        <div id="dag-section" style="display: none; margin-top: 40px;">
+            <h2>Commit DAG</h2>
+            <div class="agent-select">
+                <label>Select agent: </label>
+                <select id="agent-select" onchange="loadDAG(this.value)">
+                    <option value="">-- Choose an agent --</option>
+                </select>
+            </div>
+            <div id="dag-container"></div>
+        </div>
     </div>
 
     <script>
         const REFRESH_INTERVAL = 5000;  // 5 seconds
+        let currentNetwork = null;
+        let selectedAgentName = '';
 
         function formatNumber(n) {
             return n.toLocaleString();
@@ -347,19 +360,6 @@ HTML_TEMPLATE = """
                 });
 
                 html += `</tbody></table>`;
-
-                // DAG visualization
-                html += `<h2 style="margin-top: 40px;">Commit DAG</h2>`;
-                html += `<div class="agent-select">`;
-                html += `<label>Select agent: </label>`;
-                html += `<select id="agent-select" onchange="loadDAG(this.value)">`;
-                html += `<option value="">-- Choose an agent --</option>`;
-                agents.forEach(agent => {
-                    html += `<option value="${agent.name}">${agent.name}</option>`;
-                });
-                html += `</select>`;
-                html += `</div>`;
-                html += `<div id="dag-container"></div>`;
             }
 
             // Sessions table
@@ -423,6 +423,25 @@ HTML_TEMPLATE = """
 
             document.getElementById('content').innerHTML = html;
 
+            // Update agent select options (but keep the select element itself intact)
+            if (agents.length > 0) {
+                document.getElementById('dag-section').style.display = 'block';
+                const select = document.getElementById('agent-select');
+                const currentValue = select.value;  // Preserve current selection
+                // Remove old options (keep first placeholder)
+                while (select.options.length > 1) {
+                    select.remove(1);
+                }
+                // Add fresh options
+                agents.forEach(agent => {
+                    const opt = document.createElement('option');
+                    opt.value = agent.name;
+                    opt.textContent = agent.name;
+                    select.appendChild(opt);
+                });
+                select.value = currentValue;  // Restore selection
+            }
+
             // Update refresh time
             const now = new Date();
             document.getElementById('refresh-time').textContent =
@@ -440,10 +459,14 @@ HTML_TEMPLATE = """
         }
 
         function loadDAG(agentName) {
+            selectedAgentName = agentName;
+
             if (!agentName) {
                 document.getElementById('dag-container').innerHTML = '';
                 return;
             }
+
+            document.getElementById('dag-container').innerHTML = '<div class="loading">Loading DAG...</div>';
 
             fetch(`/api/agents/${agentName}/dag`)
                 .then(r => r.json())
@@ -455,55 +478,77 @@ HTML_TEMPLATE = """
         }
 
         function renderDAG(data) {
+            if (!data.nodes || data.nodes.length === 0) {
+                document.getElementById('dag-container').innerHTML = '<div class="loading">No commits yet</div>';
+                return;
+            }
+
+            if (currentNetwork) {
+                currentNetwork.destroy();
+                currentNetwork = null;
+            }
+
             const nodes = new vis.DataSet(data.nodes.map(n => ({
                 id: n.id,
                 label: n.label,
                 title: n.title,
-                color: '#4299e1',
-                font: { color: '#e0e6ed', size: 12 },
+                color: {
+                    background: n.color,
+                    border: n.color,
+                    highlight: { background: n.color, border: '#fff' },
+                },
+                font: { color: '#fff', size: 13, face: 'system-ui' },
+                shadow: { enabled: true, color: 'rgba(0,0,0,0.3)', size: 10, x: 0, y: 0 },
+                borderWidth: 2,
+                margin: 12,
             })));
 
             const edges = new vis.DataSet(data.edges.map(e => ({
                 from: e.from,
                 to: e.to,
-                label: e.label,
-                arrows: 'to',
-                color: { color: '#3d4860', highlight: '#4299e1' },
-                font: { size: 10, color: '#a0aec0' },
-                smooth: { type: 'cubicBezier' },
+                arrows: { to: { enabled: true, scaleFactor: 0.8 } },
+                color: { color: '#4a5568', highlight: '#63b3ed' },
+                width: 2.5,
+                smooth: { type: 'continuous', forceDirection: 'vertical' },
             })));
 
             const container = document.getElementById('dag-container');
             const options = {
-                physics: { enabled: true, barnesHut: { gravitationalConstant: -5000 } },
-                layout: { hierarchical: { direction: 'UD', sortMethod: 'hubsize' } },
+                physics: {
+                    enabled: false,  // Disable physics for cleaner look with hierarchical layout
+                },
+                layout: {
+                    hierarchical: {
+                        direction: 'UD',
+                        sortMethod: 'hubsize',
+                        nodeSpacing: 200,
+                        levelSeparation: 250,
+                    },
+                },
                 nodes: {
                     shape: 'box',
-                    margin: { top: 10, bottom: 10, left: 10, right: 10 },
-                    widthConstraint: { maximum: 150 },
+                    padding: 15,
+                    widthConstraint: { maximum: 180, minimum: 120 },
                 },
                 edges: {
-                    width: 2,
+                    smooth: { type: 'continuous', forceDirection: 'vertical' },
                 },
                 interaction: {
                     navigationButtons: true,
                     keyboard: true,
+                    hover: true,
                 },
             };
 
-            new vis.Network(container, { nodes, edges }, options);
+            currentNetwork = new vis.Network(container, { nodes, edges }, options);
         }
 
         // Initial render and set up refresh interval
         fetchAndRender();
         setInterval(() => {
-            const selectedAgent = document.getElementById('agent-select')?.value;
-            fetchAndRender();
-            if (selectedAgent) {
-                setTimeout(() => {
-                    document.getElementById('agent-select').value = selectedAgent;
-                    loadDAG(selectedAgent);
-                }, 100);
+            // Don't refresh if a DAG is currently displayed (prevents flashing/re-rendering)
+            if (!selectedAgentName) {
+                fetchAndRender();
             }
         }, REFRESH_INTERVAL);
     </script>
@@ -646,7 +691,7 @@ def get_dashboard_data(base_path: Path) -> dict:
 
 
 def get_agent_dag(base_path: Path, agent_name: str) -> dict:
-    """Get commit DAG for an agent."""
+    """Get commit DAG for an agent with rich metadata."""
     base_path = Path(base_path)
     db_path = base_path / ".cacheflow" / "agents.db"
     store = CacheFlowStore(db_path)
@@ -660,21 +705,34 @@ def get_agent_dag(base_path: Path, agent_name: str) -> dict:
     nodes = []
     edges = []
 
-    for commit in commits:
-        task_short = commit.task[:30] + "..." if len(commit.task) > 30 else commit.task
+    for idx, commit in enumerate(commits):
+        task_short = commit.task[:25] + "..." if len(commit.task) > 25 else commit.task
         commit_short = str(commit.id)[:8]
+
+        # Determine node color based on savings
+        savings_ratio = commit.tokens_saved / (commit.tokens_this_session + commit.tokens_saved) if (commit.tokens_this_session + commit.tokens_saved) > 0 else 0
+        if savings_ratio > 0.5:
+            color = '#10b981'  # green for high savings
+        elif savings_ratio > 0.3:
+            color = '#3b82f6'  # blue for medium savings
+        else:
+            color = '#8b5cf6'  # purple for low/no savings
 
         nodes.append({
             "id": str(commit.id),
-            "label": f"{commit_short}\n{task_short}",
-            "title": f"Task: {commit.task}\nTokens: {commit.tokens_this_session}",
+            "label": task_short,
+            "title": f"{commit_short}\nTask: {commit.task}\n\nTokens Used: {commit.tokens_this_session}\nTokens Saved: {commit.tokens_saved}\nSavings: {(savings_ratio*100):.1f}%",
+            "color": color,
+            "tokens_used": commit.tokens_this_session,
+            "tokens_saved": commit.tokens_saved,
+            "index": idx,
         })
 
         if commit.parent_id:
             edges.append({
                 "from": str(commit.parent_id),
                 "to": str(commit.id),
-                "label": f"{commit.tokens_saved}T saved" if commit.tokens_saved > 0 else "",
+                "label": "",  # Remove distracting edge labels
             })
 
     return {"nodes": nodes, "edges": edges}
