@@ -149,7 +149,15 @@ class CacheFlowStore:
             session.close()
 
     def update_agent_baseline(self, agent: Agent, baseline: int) -> None:
-        """Persist baseline_tokens_evaluated on first session completion."""
+        """Persist baseline_tokens_evaluated on first session completion.
+
+        Args:
+            agent: Agent to update
+            baseline: tokens_evaluated from first session (must be > 0)
+        """
+        if baseline <= 0:
+            raise ValueError(f"Baseline tokens must be positive, got {baseline}")
+
         session = self._get_session()
         try:
             agent.baseline_tokens_evaluated = baseline

@@ -197,6 +197,16 @@ class AgentSession:
                     self.config.model_hash,
                     self.config.ctx_size,
                 )
+            else:
+                # Validate model hasn't changed - token baseline is model-specific
+                if agent.model_hash != self.config.model_hash:
+                    raise RuntimeError(
+                        f"Agent '{self.agent_name}' was created with model {agent.model_name} "
+                        f"(hash: {agent.model_hash[:8]}...) but config specifies {self.config.model_name} "
+                        f"(hash: {self.config.model_hash[:8]}...). "
+                        "Token baselines are model-specific and cannot be transferred. "
+                        "Create a new agent or update config to match."
+                    )
 
             # Step b: Acquire file lock
             self._acquire_lock()
@@ -254,14 +264,26 @@ class AgentSession:
             response_text = response_data.get("content", "")
             tokens_in = response_data.get("tokens_evaluated", 0)
             tokens_out = response_data.get("tokens_predicted", 0)
+
+            if tokens_in == 0 and tokens_out == 0:
+                raise RuntimeError("Server returned zero tokens - likely a server error or no response")
+
             tokens_this_session = tokens_in + tokens_out
 
             if is_first_session:
                 tokens_saved = 0
                 self.store.update_agent_baseline(agent, tokens_in)
             else:
-                stored_baseline = agent.baseline_tokens_evaluated or self.config.ctx_size
-                tokens_saved = max(0, stored_baseline - tokens_in)
+                if agent.baseline_tokens_evaluated is None:
+                    raise RuntimeError(
+                        f"Agent '{agent.name}' has no baseline tokens. "
+                        "First session may have failed or completed without persisting. "
+                        "Cannot calculate savings without a baseline."
+                    )
+                # tokens_saved = reduction in prompt tokens from KV cache hits
+                # Note: Baseline is task-agnostic (set per-agent, not per-task)
+                # Savings are only meaningful when comparing same/similar tasks
+                tokens_saved = max(0, agent.baseline_tokens_evaluated - tokens_in)
 
             # Step g: Save slot
             save_start = time.time()

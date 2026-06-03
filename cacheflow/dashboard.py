@@ -820,6 +820,9 @@ def get_dashboard_data(base_path: Path) -> dict:
         session_count = len(commits)
         total_sessions += session_count
 
+        # Sum includes first session (tokens_saved=0) plus all subsequent cache hits
+        # Savings ratio = tokens_saved / (tokens_used + tokens_saved) represents the fraction
+        # of total potential tokens that were avoided through KV cache
         tokens_used = sum(c.tokens_this_session for c in commits)
         tokens_saved = sum(c.tokens_saved for c in commits)
 
