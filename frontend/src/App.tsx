@@ -3,6 +3,7 @@ import { Sidebar } from './components/Sidebar';
 import { Header } from './components/Header';
 import { MetricCard } from './components/MetricCard';
 import { DataTable, TableColumn } from './components/DataTable';
+import { DAGVisualization } from './components/DAGVisualization';
 import { BarChart3, Zap, TrendingUp, Activity } from 'lucide-react';
 import './styles/design-system.css';
 import './styles/app.css';
@@ -228,17 +229,35 @@ export default function App() {
     </div>
   );
 
-  const renderAgents = () => (
-    <div className="main-content">
-      <Header title="Agents Management" subtitle="Manage your CacheFlow agents" />
-      <div className="content-area">
-        <div className="placeholder-section">
-          <h3>Agent Details Coming Soon</h3>
-          <p>Detailed agent management interface will be available here</p>
+  const renderAgents = () => {
+    const selectedAgent = data?.agents?.[0];
+
+    return (
+      <div className="main-content">
+        <Header title="Agents Management" subtitle="Manage your CacheFlow agents" />
+        <div className="content-area">
+          <DataTable
+            columns={agentColumns}
+            data={data?.agents || []}
+            title="All Agents"
+            loading={loading}
+            empty="No agents found"
+          />
+          {selectedAgent && !loading && (
+            <div className="agent-dag-section">
+              <h2 style={{ marginTop: '40px', marginBottom: '20px' }}>
+                Commit History — {selectedAgent.name}
+              </h2>
+              <p style={{ color: '#64748b', marginBottom: '20px', fontSize: '14px' }}>
+                {selectedAgent.session_count} session{selectedAgent.session_count !== 1 ? 's' : ''} • {selectedAgent.total_tokens_saved} tokens saved
+              </p>
+              <DAGVisualization agentName={selectedAgent.name} />
+            </div>
+          )}
         </div>
       </div>
-    </div>
-  );
+    );
+  };
 
   const renderSessions = () => (
     <div className="main-content">
@@ -259,9 +278,57 @@ export default function App() {
     <div className="main-content">
       <Header title="Settings" subtitle="Configure dashboard preferences" />
       <div className="content-area">
-        <div className="placeholder-section">
-          <h3>Settings Coming Soon</h3>
-          <p>Dashboard settings and preferences will be available here</p>
+        <div style={{ maxWidth: '600px' }}>
+          <div className="settings-section">
+            <h3>Dashboard Settings</h3>
+            <div className="settings-item">
+              <label>Auto-refresh interval</label>
+              <select defaultValue="30" style={{ width: '100%', padding: '8px', marginTop: '8px' }}>
+                <option value="10">10 seconds</option>
+                <option value="30">30 seconds</option>
+                <option value="60">1 minute</option>
+                <option value="300">5 minutes</option>
+                <option value="0">Disabled</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="settings-section">
+            <h3>Display Preferences</h3>
+            <div className="settings-item">
+              <label>
+                <input type="checkbox" defaultChecked /> Show tokens saved in overview
+              </label>
+            </div>
+            <div className="settings-item">
+              <label>
+                <input type="checkbox" defaultChecked /> Enable session filtering
+              </label>
+            </div>
+          </div>
+
+          <div className="settings-section">
+            <h3>System Information</h3>
+            <div className="settings-info">
+              <p><strong>Total Agents:</strong> {data?.metrics.agent_count || 0}</p>
+              <p><strong>Total Sessions:</strong> {data?.metrics.total_sessions || 0}</p>
+              <p><strong>Overall Savings:</strong> {(data?.metrics.savings_pct || 0).toFixed(1)}%</p>
+            </div>
+          </div>
+
+          <div style={{ marginTop: '30px' }}>
+            <button style={{
+              padding: '10px 20px',
+              backgroundColor: '#3b82f6',
+              color: 'white',
+              border: 'none',
+              borderRadius: '6px',
+              cursor: 'pointer',
+              fontSize: '14px',
+            }}>
+              Save Settings
+            </button>
+          </div>
         </div>
       </div>
     </div>

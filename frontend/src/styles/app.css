@@ -186,6 +186,80 @@
   outline-offset: 2px;
 }
 
+/* Settings section styles */
+.settings-section {
+  padding: var(--spacing-lg);
+  background: rgba(26, 26, 35, 0.4);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-lg);
+  margin-bottom: var(--spacing-lg);
+}
+
+.settings-section h3 {
+  font-family: var(--font-display);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+  margin: 0 0 var(--spacing-lg) 0;
+}
+
+.settings-item {
+  margin-bottom: var(--spacing-md);
+}
+
+.settings-item label {
+  display: block;
+  color: var(--color-text-primary);
+  font-size: 14px;
+  margin-bottom: var(--spacing-sm);
+  font-weight: 500;
+}
+
+.settings-item input[type="checkbox"] {
+  margin-right: var(--spacing-sm);
+  cursor: pointer;
+}
+
+.settings-item select {
+  background: var(--color-bg-secondary);
+  color: var(--color-text-primary);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-md);
+  font-size: 14px;
+}
+
+.settings-info {
+  background: rgba(59, 130, 246, 0.1);
+  padding: var(--spacing-md);
+  border-radius: var(--radius-md);
+  border-left: 3px solid var(--color-accent-primary);
+}
+
+.settings-info p {
+  margin: var(--spacing-sm) 0;
+  color: var(--color-text-primary);
+  font-size: 14px;
+}
+
+.settings-info strong {
+  color: var(--color-accent-primary);
+}
+
+/* DAG visualization styles */
+.agent-dag-section {
+  margin-top: var(--spacing-2xl);
+}
+
+.dag-error {
+  padding: var(--spacing-lg);
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.5);
+  border-radius: var(--radius-lg);
+  color: var(--color-text-primary);
+  text-align: center;
+  font-size: 14px;
+}
+
 /* Print styles */
 @media print {
   .sidebar,
