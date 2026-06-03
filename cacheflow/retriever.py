@@ -18,7 +18,15 @@ class CodeItem:
     signature: str
     docstring: str
     location: str
-    embedding: list[float]
+    body: str = ""
+    calls: list[str] = None
+    embedding: list[float] = None
+
+    def __post_init__(self):
+        if self.calls is None:
+            self.calls = []
+        if self.embedding is None:
+            self.embedding = []
 
 
 class CodeRetriever:
@@ -48,13 +56,16 @@ class CodeRetriever:
         try:
             with open(self.index_path, "r") as f:
                 index = json.load(f)
-            self.index_data = index  # Store full index for knowledge access
+            self.index_data = index
             self.items = [CodeItem(**item) for item in index.get("items", [])]
+            self._build_graph()
             logger.info(f"Loaded index with {len(self.items)} items")
         except Exception as e:
             logger.error(f"Failed to load index: {e}")
             self.items = []
             self.index_data = {}
+            self._name_index: dict[str, list[CodeItem]] = {}
+            self._called_by: dict[str, list[CodeItem]] = {}
 
     def _init_embedding_model(self) -> None:
         """Initialize embedding model for task encoding."""
@@ -67,6 +78,42 @@ class CodeRetriever:
                 "Run: pip install sentence-transformers"
             )
             self.embedding_model = None
+
+    def _build_graph(self) -> None:
+        """Build name→items and called_by indexes from the loaded items."""
+        self._name_index: dict[str, list[CodeItem]] = {}
+        self._called_by: dict[str, list[CodeItem]] = {}
+        for item in self.items:
+            self._name_index.setdefault(item.name, []).append(item)
+            for called in item.calls:
+                self._called_by.setdefault(called, []).append(item)
+
+    def graph_expand(self, seeds: list[CodeItem], max_neighbors: int = 8) -> list[CodeItem]:
+        """
+        Expand a seed set via call graph edges (one hop).
+        Returns neighbors not already in seeds, up to max_neighbors.
+        Callees (what seeds call) + callers (what calls seeds) are both included.
+        """
+        seed_keys = {(i.location, i.name) for i in seeds}
+        seen = set(seed_keys)
+        neighbors: list[CodeItem] = []
+
+        for item in seeds:
+            # Callees: functions/classes this item calls
+            for called_name in item.calls:
+                for neighbor in self._name_index.get(called_name, []):
+                    key = (neighbor.location, neighbor.name)
+                    if key not in seen:
+                        neighbors.append(neighbor)
+                        seen.add(key)
+            # Callers: functions that call this item
+            for caller in self._called_by.get(item.name, []):
+                key = (caller.location, caller.name)
+                if key not in seen:
+                    neighbors.append(caller)
+                    seen.add(key)
+
+        return neighbors[:max_neighbors]
 
     def retrieve(self, task: str, top_k: int = 5) -> list[CodeItem]:
         """
@@ -193,63 +240,49 @@ class CodeRetriever:
 
         return dot_product / (mag_a * mag_b)
 
-    def format_context(self, items: list[CodeItem], budget_chars: int = 2000, task: str = "") -> str:
+    def format_context(
+        self,
+        items: list[CodeItem],
+        neighbors: list[CodeItem] = None,
+        budget_chars: int = 6000,
+        task: str = "",
+    ) -> str:
         """
-        Format retrieved items as context string.
-
-        For system-level questions, includes knowledge summary.
-        For code-specific questions, includes code snippets.
-
-        Args:
-            items: Code items to format
-            budget_chars: Maximum total characters
-            task: Original task string (to detect system vs. code questions)
-
-        Returns:
-            Formatted context string
+        Format retrieved items + graph neighbors as context.
+        Seeds (items) get full bodies; neighbors get signatures only.
         """
-        if not items and not task:
-            return ""
-
-        parts = []
-
-        # For system-level questions, prioritize knowledge summary
-        if task and self.is_system_question(task):
-            knowledge = self.get_knowledge_context()
-            if knowledge:
-                parts.append(knowledge)
-                used = len(knowledge)
-
-                # Add relevant code snippets if space allows
-                if used < budget_chars * 0.7:
-                    code_budget = budget_chars - used
-                    code_parts = ["Relevant code:"]
-                    for item in items[:3]:  # Limit to top 3 for system questions
-                        snippet = f"\n- {item.name} ({item.location})"
-                        if len(code_parts[-1]) + len(snippet) < code_budget:
-                            code_parts.append(snippet)
-                    if len(code_parts) > 1:
-                        parts.append("\n".join(code_parts))
-
-                return "\n".join(parts)
-
-        # For code-specific questions, use existing logic
         if not items:
             return ""
 
-        parts = ["Relevant code snippets:"]
-        used = 0
+        MAX_BODY = 1200  # chars per seed body to avoid blowing budget
+        parts = ["Relevant code (retrieved by semantic search):"]
+        used = len(parts[0])
 
         for item in items:
-            header = f"\n- {item.type} {item.name} ({item.location})"
-            sig = f"\n  Signature: {item.signature}"
-            doc = f"\n  {item.docstring[:200]}" if item.docstring else ""
+            header = f"\n\n### {item.type} `{item.name}` ({item.location})"
+            body = item.body[:MAX_BODY] + ("..." if len(item.body) > MAX_BODY else "") if item.body else ""
+            if body:
+                chunk = header + f"\n```python\n{body}\n```"
+            else:
+                doc = f"  # {item.docstring[:120]}" if item.docstring else ""
+                chunk = header + f"\n```python\n{item.signature}{doc}\n```"
 
-            chunk = header + sig + doc
             if used + len(chunk) > budget_chars:
                 break
-
             parts.append(chunk)
             used += len(chunk)
+
+        if neighbors:
+            neighbor_header = "\n\nRelated code (via call graph):"
+            if used + len(neighbor_header) < budget_chars:
+                parts.append(neighbor_header)
+                used += len(neighbor_header)
+                for nb in neighbors:
+                    doc = f"  # {nb.docstring[:80]}" if nb.docstring else ""
+                    chunk = f"\n- `{nb.name}` ({nb.location}): `{nb.signature}`{doc}"
+                    if used + len(chunk) > budget_chars:
+                        break
+                    parts.append(chunk)
+                    used += len(chunk)
 
         return "\n".join(parts)

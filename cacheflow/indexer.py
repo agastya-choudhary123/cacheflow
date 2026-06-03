@@ -20,6 +20,8 @@ class CodeItem:
     signature: str  # e.g., "def foo(x: int) -> str:"
     docstring: str
     location: str  # "path.py:line"
+    body: str = ""  # full source of the function/class
+    calls: list[str] = field(default_factory=list)  # names called/referenced by this item
     embedding: list[float] = field(default_factory=list)
 
 
@@ -71,11 +73,11 @@ class CodeIndexer:
 
         for fpath in files:
             if fpath.suffix == ".py":
-                items.extend(self._extract_from_python(fpath))
+                items.extend(self._extract_from_python(fpath, base_path))
 
         return items
 
-    def _extract_from_python(self, fpath: Path) -> list[CodeItem]:
+    def _extract_from_python(self, fpath: Path, base_path: Path) -> list[CodeItem]:
         """Extract functions and classes from a Python file."""
         items = []
 
@@ -86,12 +88,17 @@ class CodeIndexer:
             logger.debug(f"Syntax error in {fpath}, skipping")
             return items
 
-        rel_path = fpath.relative_to(fpath.parents[2])  # Relative to project root
+        try:
+            rel_path = fpath.relative_to(base_path)
+        except ValueError:
+            rel_path = fpath
 
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef):
                 sig = self._function_signature(node)
                 docstring = ast.get_docstring(node) or ""
+                body = ast.get_source_segment(content, node) or ""
+                calls = self._extract_calls(node)
                 items.append(
                     CodeItem(
                         type="function",
@@ -99,10 +106,14 @@ class CodeIndexer:
                         signature=sig,
                         docstring=docstring,
                         location=f"{rel_path}:{node.lineno}",
+                        body=body,
+                        calls=calls,
                     )
                 )
             elif isinstance(node, ast.ClassDef):
                 docstring = ast.get_docstring(node) or ""
+                body = ast.get_source_segment(content, node) or ""
+                calls = self._extract_calls(node)
                 items.append(
                     CodeItem(
                         type="class",
@@ -110,10 +121,32 @@ class CodeIndexer:
                         signature=f"class {node.name}:",
                         docstring=docstring,
                         location=f"{rel_path}:{node.lineno}",
+                        body=body,
+                        calls=calls,
                     )
                 )
 
         return items
+
+    def _extract_calls(self, node) -> list[str]:
+        """Extract names of functions/classes called or inherited by this AST node."""
+        calls: set[str] = set()
+        # Capture base classes for ClassDef
+        if isinstance(node, ast.ClassDef):
+            for base in node.bases:
+                if isinstance(base, ast.Name):
+                    calls.add(base.id)
+                elif isinstance(base, ast.Attribute):
+                    calls.add(base.attr)
+        # Walk body for all Call expressions
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call):
+                if isinstance(child.func, ast.Name):
+                    calls.add(child.func.id)
+                elif isinstance(child.func, ast.Attribute):
+                    calls.add(child.func.attr)
+        calls.discard(getattr(node, "name", None))  # remove self-reference
+        return sorted(calls)
 
     def _function_signature(self, node: ast.FunctionDef) -> str:
         """Extract function signature from AST node."""
@@ -138,14 +171,16 @@ class CodeIndexer:
             logger.warning("Embedding model not available, skipping embeddings")
             return items
 
-        # Embed each item's text representation
-        for item in items:
-            text = f"{item.name} {item.signature} {item.docstring}"
-            try:
-                embedding = self.embedding_model.encode(text, normalize_embeddings=True)
-                item.embedding = embedding.tolist()
-            except Exception as e:
-                logger.warning(f"Failed to embed {item.name}: {e}")
+        texts = [f"{item.name} {item.signature} {item.docstring}" for item in items]
+        try:
+            embeddings = self.embedding_model.encode(
+                texts, normalize_embeddings=True, batch_size=64, show_progress_bar=False
+            )
+            for item, emb in zip(items, embeddings):
+                item.embedding = emb.tolist()
+        except Exception as e:
+            logger.warning(f"Batch embedding failed: {e}")
+            for item in items:
                 item.embedding = []
 
         return items

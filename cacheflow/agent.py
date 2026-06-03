@@ -1,5 +1,6 @@
 """Agent loop: completion, save, commit."""
 
+import logging
 import shutil
 import subprocess
 import time
@@ -7,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID, uuid4
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from cacheflow.config import load_config, CacheFlowConfig
 from cacheflow.store import CacheFlowStore, Agent
@@ -92,17 +95,8 @@ class AgentSession:
             self.slot_lease = None
             self.slot_id = None
 
-    def _collect_codebase_context(self, task: str, budget_chars: int) -> str:
-        """
-        Walk the project and build a codebase context string for the first session.
-
-        Args:
-            task: The task text, used to prioritize relevant files
-            budget_chars: Maximum total characters to inject
-
-        Returns:
-            Formatted codebase context string, or empty string if nothing useful found
-        """
+    def _collect_source_files(self) -> list[Path]:
+        """Return all source files in the project, skipping generated/vendor dirs."""
         SOURCE_EXTS = {
             ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs",
             ".c", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php", ".swift",
@@ -126,47 +120,96 @@ class AgentSession:
                     p = self.base_path / rel
                     if p.suffix in SOURCE_EXTS and p.is_file():
                         files.append(p)
-            else:
-                raise RuntimeError("git ls-files failed")
+                return files
         except Exception:
-            for p in self.base_path.rglob("*"):
-                if any(part in SKIP_DIRS for part in p.parts):
-                    continue
-                if p.is_file() and p.suffix in SOURCE_EXTS:
-                    files.append(p)
+            pass
 
-        if not files:
-            return ""
+        for p in self.base_path.rglob("*"):
+            if any(part in SKIP_DIRS for part in p.parts):
+                continue
+            if p.is_file() and p.suffix in SOURCE_EXTS:
+                files.append(p)
+        return files
 
-        task_words = set(task.lower().split())
-        def score(p: Path) -> int:
-            name_words = set(p.stem.lower().replace("_", " ").replace("-", " ").split())
-            return len(name_words & task_words)
+    def _chunk_files_for_ingestion(self, files: list[Path]) -> list[str]:
+        """
+        Pack files into chunks that each fit within the context window.
+        Files larger than the budget are split across multiple chunks.
+        """
+        # Use 60% of context for content, leave room for prompt overhead + response
+        chunk_budget = int(self.config.ctx_size * 0.6) * 4  # chars
 
-        files.sort(key=lambda p: (-score(p), str(p)))
+        # Only include source files, skip large generated/lock files
+        SKIP_SUFFIXES = {".lock", ".sum", ".mod"}
+        SKIP_NAMES = {"package-lock.json", "yarn.lock", "poetry.lock"}
+        MAX_FILE_CHARS = chunk_budget  # single file won't exceed one chunk
 
-        parts = []
-        used = 0
+        blocks: list[tuple[str, str]] = []  # (rel_path_label, content_slice)
         for f in files:
+            if f.suffix in SKIP_SUFFIXES or f.name in SKIP_NAMES:
+                continue
             try:
                 content = f.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            rel_path = f.relative_to(self.base_path)
-            header = f"\n--- {rel_path} ---\n"
-            available = budget_chars - used - len(header)
-            if available <= 0:
-                break
-            chunk = content[:available]
-            parts.append(header + chunk)
-            used += len(header) + len(chunk)
-            if used >= budget_chars:
-                break
+            rel = str(f.relative_to(self.base_path))
+            # Split oversized files into sub-chunks
+            for start in range(0, len(content), MAX_FILE_CHARS):
+                slice_ = content[start:start + MAX_FILE_CHARS]
+                label = rel if start == 0 else f"{rel} (cont.)"
+                blocks.append((label, slice_))
 
-        if not parts:
-            return ""
+        chunks: list[str] = []
+        current_parts: list[str] = []
+        current_size = 0
 
-        return "Codebase:\n" + "".join(parts)
+        for label, content in blocks:
+            block = f"\n--- {label} ---\n{content}\n"
+            if current_size + len(block) > chunk_budget and current_parts:
+                chunks.append("Codebase (continued):\n" + "".join(current_parts))
+                current_parts = []
+                current_size = 0
+            current_parts.append(block)
+            current_size += len(block)
+
+        if current_parts:
+            chunks.append("Codebase (continued):\n" + "".join(current_parts))
+
+        if chunks:
+            chunks[0] = chunks[0].replace("Codebase (continued):", "Codebase:", 1)
+        return chunks
+
+    def _ingest_codebase_progressively(self, system_prompt: str) -> None:
+        """
+        Feed the entire codebase into the model across multiple passes,
+        accumulating knowledge in the KV cache between each pass.
+        Each pass restores the previous KV state so all files get full attention.
+        """
+        files = self._collect_source_files()
+        if not files:
+            return
+
+        chunks = self._chunk_files_for_ingestion(files)
+        if not chunks:
+            return
+
+        total = len(chunks)
+        for i, chunk in enumerate(chunks):
+            is_last = i == total - 1
+            if i == 0:
+                prompt = f"{system_prompt}\n\n{chunk}\n\nAcknowledge that you have read this code. Do not summarize yet."
+            else:
+                prompt = f"{chunk}\n\nYou now have read {i + 1} of {total} chunks. Acknowledge receipt."
+
+            self.server.completion(
+                prompt=prompt,
+                slot_id=self.slot_id,
+                max_tokens=64,  # just an ack, not a real answer
+            )
+
+            # Save KV cache after each chunk so the next pass builds on it
+            if not is_last:
+                self.server.save_slot(slot_id=self.slot_id)
 
     def run(
         self,
@@ -233,24 +276,22 @@ class AgentSession:
                     self.server.restore_slot(snapshot_filename, slot_id=self.slot_id)
                     restore_time_ms = int((time.time() - restore_start) * 1000)
 
-            # Step e: Build prompt
-            if is_first_session:
-                budget_chars = (self.config.ctx_size // 2) * 4
-                codebase_ctx = self._collect_codebase_context(task, budget_chars)
-                if codebase_ctx:
-                    full_prompt = f"{system_prompt}\n\n{codebase_ctx}\n\nTask: {task}"
-                else:
-                    full_prompt = f"{system_prompt}\n\nTask: {task}"
-            else:
-                # Use semantic retrieval on follow-up sessions
-                retriever = CodeRetriever(self.config.index_path)
-                retrieved_items = retriever.retrieve(task, top_k=5)
-                context = retriever.format_context(retrieved_items, budget_chars=2000, task=task)
+            # Step e: Ensure index exists, then build prompt via RAG
+            if not self.config.index_path.exists():
+                try:
+                    indexer = CodeIndexer()
+                    items = indexer.extract_from_codebase(self.base_path)
+                    items = indexer.embed_items(items)
+                    indexer.save_index(items, self.config.index_path)
+                except Exception as e:
+                    import traceback
+                    logger.warning(f"Failed to index codebase: {e}\n{traceback.format_exc()}")
 
-                if context:
-                    full_prompt = f"{context}\n\nTask: {task}"
-                else:
-                    full_prompt = f"Task: {task}"
+            retriever = CodeRetriever(self.config.index_path)
+            retrieved_items = retriever.retrieve(task, top_k=5)
+            neighbors = retriever.graph_expand(retrieved_items)
+            context = retriever.format_context(retrieved_items, neighbors=neighbors, budget_chars=6000, task=task)
+            full_prompt = f"{system_prompt}\n\n{context}\n\nTask: {task}" if context else f"{system_prompt}\n\nTask: {task}"
 
             # Step f: Run completion
             completion_start = time.time()
@@ -357,18 +398,6 @@ class AgentSession:
                 KnowledgeProber(self.store).probe(self.server, self.slot_id, commit, session_log)
             except Exception:
                 pass  # Non-blocking — indexing failure never breaks the agent
-
-            # Step k2: Extract and index codebase on first session
-            if is_first_session:
-                try:
-                    indexer = CodeIndexer()
-                    items = indexer.extract_from_codebase(self.base_path)
-                    items = indexer.embed_items(items)
-                    indexer.save_index(items, self.config.index_path)
-                except Exception as e:
-                    # Log but don't fail the session
-                    import traceback
-                    logger.warning(f"Failed to index codebase: {e}\n{traceback.format_exc()}")
 
             # Calculate total duration
             total_duration_ms = int((time.time() - start_time) * 1000)
