@@ -4,6 +4,7 @@ Run CacheFlow against its own source code and stream Q&A into session_log.md.
 Progressive chunk ingestion happens automatically inside session.run() on first call.
 """
 
+import json
 import sys
 import time
 from pathlib import Path
@@ -62,7 +63,7 @@ def run():
                 result = session.run(
                     task=question,
                     system_prompt=DEFAULT_SYSTEM_PROMPT,
-                    max_tokens=700,
+                    max_tokens=800,
                 )
                 elapsed = int(time.time() - t0)
 
@@ -72,6 +73,7 @@ def run():
                 if result.is_first_session:
                     write(f, " &nbsp;|&nbsp; *first session — full codebase ingested across chunks*")
                 write(f, "\n\n")
+
                 write(f, result.response.strip())
                 write(f, "\n\n---\n\n")
 

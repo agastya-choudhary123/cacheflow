@@ -240,6 +240,33 @@ class CodeRetriever:
 
         return dot_product / (mag_a * mag_b)
 
+    def generate_schema(self, items: list[CodeItem]) -> dict[str, str]:
+        """
+        Build a JSON answer schema keyed on the retrieved code items.
+        Each key is snake_cased from the item name, value is an empty string
+        the model must fill in. Forces the model to answer about specific
+        retrieved code rather than generating generic text.
+        """
+        schema: dict[str, str] = {}
+        seen: set[str] = set()
+        for item in items[:5]:
+            # snake_case the name and suffix with role hint
+            key = item.name.lower()
+            if item.type == "function":
+                key = f"{key}_behavior"
+            elif item.type == "class":
+                key = f"{key}_role"
+            # deduplicate
+            base = key
+            i = 2
+            while key in seen:
+                key = f"{base}_{i}"
+                i += 1
+            seen.add(key)
+            schema[key] = ""
+        schema["summary"] = ""
+        return schema
+
     def format_context(
         self,
         items: list[CodeItem],

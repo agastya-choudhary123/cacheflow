@@ -1,5 +1,6 @@
 """Agent loop: completion, save, commit."""
 
+import json
 import logging
 import shutil
 import subprocess
@@ -288,10 +289,23 @@ class AgentSession:
                     logger.warning(f"Failed to index codebase: {e}\n{traceback.format_exc()}")
 
             retriever = CodeRetriever(self.config.index_path)
-            retrieved_items = retriever.retrieve(task, top_k=5)
+            is_system_q = retriever.is_system_question(task)
+            top_k = 10 if is_system_q else 5
+            retrieved_items = retriever.retrieve(task, top_k=top_k)
             neighbors = retriever.graph_expand(retrieved_items)
             context = retriever.format_context(retrieved_items, neighbors=neighbors, budget_chars=6000, task=task)
-            full_prompt = f"{system_prompt}\n\n{context}\n\nTask: {task}" if context else f"{system_prompt}\n\nTask: {task}"
+
+            user_content = f"{context}\n\nTask: {task}" if context else f"Task: {task}"
+
+            # Wrap in ChatML for models that require it (Qwen, etc.)
+            if "qwen" in self.config.model_name.lower():
+                full_prompt = (
+                    f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+                    f"<|im_start|>user\n{user_content}<|im_end|>\n"
+                    f"<|im_start|>assistant\n"
+                )
+            else:
+                full_prompt = f"{system_prompt}\n\n{user_content}"
 
             # Step f: Run completion
             completion_start = time.time()
