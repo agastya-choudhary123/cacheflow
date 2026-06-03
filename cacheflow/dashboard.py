@@ -536,11 +536,25 @@ HTML_TEMPLATE = """
 
                 if (snapshots.files && snapshots.files.length > 0) {
                     html += `<div class="snapshot-files">`;
-                    html += `<div style="font-weight: 600; margin-bottom: 8px; color: #cbd5e0;">Recent files:</div>`;
+                    html += `<div style="display:grid; grid-template-columns: 60px 90px 1fr 80px 80px; gap: 8px; padding: 6px 0; font-size: 11px; font-weight: 600; color: #718096; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid #3d4860; margin-bottom: 4px;">`;
+                    html += `<span>ID</span><span>Agent</span><span>Task</span><span>Size</span><span>Tokens</span>`;
+                    html += `</div>`;
                     snapshots.files.slice(0, 10).forEach(file => {
-                        html += `<div class="snapshot-file">`;
-                        html += `<span>${file.name}</span>`;
+                        const taskLabel = file.is_fork
+                            ? `<span style="color:#f59e0b;">⑂ fork from ${file.agent}</span>`
+                            : `<span style="color:#e0e6ed;">${(file.task || '—').substring(0, 50)}</span>`;
+                        const agentBadge = file.agent
+                            ? `<span style="background:#2d3748; border:1px solid #3d4860; border-radius:4px; padding:1px 6px; font-family:monospace; font-size:11px;">${file.agent}</span>`
+                            : `<span style="color:#718096;">—</span>`;
+                        const savedBadge = file.saved > 0
+                            ? `<span style="color:#48bb78; font-size:10px;">↓${file.saved}</span>`
+                            : '';
+                        html += `<div class="snapshot-file" style="display:grid; grid-template-columns: 60px 90px 1fr 80px 80px; gap: 8px; align-items: center;">`;
+                        html += `<span style="font-family:monospace; font-size:11px; color:#a0aec0;">${file.commit_id || file.name.substring(0, 8)}</span>`;
+                        html += `${agentBadge}`;
+                        html += `${taskLabel}`;
                         html += `<span class="text-dim">${file.size_mb.toFixed(1)} MB</span>`;
+                        html += `<span class="text-dim">${file.tokens > 0 ? file.tokens.toLocaleString() : '—'} ${savedBadge}</span>`;
                         html += `</div>`;
                     });
                     if (snapshots.files.length > 10) {
@@ -565,14 +579,23 @@ HTML_TEMPLATE = """
                 while (select.options.length > 1) {
                     select.remove(1);
                 }
-                // Add fresh options
+                // Add fresh options with stats
                 agents.forEach(agent => {
                     const opt = document.createElement('option');
                     opt.value = agent.name;
-                    opt.textContent = agent.name;
+                    const savings = agent.savings_pct > 0 ? ` · ${agent.savings_pct.toFixed(0)}% saved` : '';
+                    const sessions = `${agent.session_count} session${agent.session_count !== 1 ? 's' : ''}`;
+                    opt.textContent = `${agent.name}  (${sessions}${savings})`;
                     select.appendChild(opt);
                 });
-                select.value = currentValue;  // Restore selection
+                // Restore selection only if it still exists, otherwise keep current
+                if (currentValue && agents.find(a => a.name === currentValue)) {
+                    select.value = currentValue;
+                } else if (!selectedAgentName && agents.length > 0) {
+                    select.value = agents[0].name;
+                } else {
+                    select.value = selectedAgentName || '';
+                }
             }
 
             // Update refresh time
@@ -591,6 +614,36 @@ HTML_TEMPLATE = """
                 });
         }
 
+        function updateMetricsForAgent(agentName, allData) {
+            // Update metrics card to show selected agent's stats
+            const agent = allData.agents.find(a => a.name === agentName);
+
+            if (!agent) return;
+
+            const metricsHtml = `
+                <div class="metric-card">
+                    <div class="metric-label">Agent</div>
+                    <div class="metric-value">${agent.name}</div>
+                    <div class="metric-subtext">${agent.session_count} session${agent.session_count !== 1 ? 's' : ''}</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Tokens Used</div>
+                    <div class="metric-value">${formatNumber(agent.total_tokens_used || 0)}</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Tokens Saved</div>
+                    <div class="metric-value text-success">${formatNumber(agent.total_tokens_saved || 0)}</div>
+                    <div class="metric-subtext">${(agent.savings_pct || 0).toFixed(1)}% reduction</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Head Commit</div>
+                    <div class="metric-value" style="font-size: 18px; font-family: monospace;">${(agent.head_commit || 'none').substring(0, 8)}</div>
+                </div>
+            `;
+
+            document.querySelector('.metrics-bar').innerHTML = metricsHtml;
+        }
+
         function loadDAG(agentName) {
             selectedAgentName = agentName;
 
@@ -598,6 +651,12 @@ HTML_TEMPLATE = """
                 document.getElementById('dag-container').innerHTML = '';
                 return;
             }
+
+            // Update metrics immediately while loading DAG
+            fetch('/api/data')
+                .then(r => r.json())
+                .then(data => updateMetricsForAgent(agentName, data))
+                .catch(err => console.error('Failed to update metrics:', err));
 
             document.getElementById('dag-container').innerHTML = '<div class="loading">Loading DAG...</div>';
 
@@ -781,6 +840,17 @@ HTML_TEMPLATE = """
 
         // Initial render and set up refresh interval
         fetchAndRender();
+
+        // Auto-load first agent's DAG after initial render
+        setTimeout(() => {
+            const select = document.getElementById('agent-select');
+            if (select && select.options.length > 1) {
+                const firstAgent = select.options[1].value;  // Skip placeholder
+                select.value = firstAgent;
+                loadDAG(firstAgent);
+            }
+        }, 500);
+
         setInterval(() => {
             // Don't refresh if a DAG is currently displayed (prevents flashing/re-rendering)
             if (!selectedAgentName) {
@@ -898,17 +968,54 @@ def get_dashboard_data(base_path: Path) -> dict:
             "created_at": created_at_str,
         })
 
-    # Fetch snapshot stats
+    # Fetch snapshot stats — enrich with agent/task metadata from DB
     snapshots_dir = base_path / ".cacheflow" / "snapshots"
     snapshot_files = []
     total_snapshot_size = 0
 
+    # Build lookup: snapshot filename → commit metadata
+    from cacheflow.store import Agent as AgentModel
+    commit_meta = {}
+    agent_names = {}
+    with SQLSession(store.engine) as session:
+        for a in session.query(AgentModel).all():
+            agent_names[str(a.id)] = a.name
+        for row in session.query(Commit).all():
+            fname = str(row.id) + ".bin"
+            commit_meta[fname] = {
+                "agent": str(row.agent_id),
+                "task": row.task,
+                "created_at": str(row.created_at)[:16] if row.created_at else "",
+                "tokens": row.tokens_this_session,
+                "saved": row.tokens_saved,
+            }
+
     if snapshots_dir.exists():
         for f in snapshots_dir.glob("*.bin"):
             size_bytes = f.stat().st_size
+            meta = commit_meta.get(f.name, {})
+            agent_id = str(meta.get("agent", ""))
+            agent_name = agent_names.get(agent_id, "")
+
+            # Detect fork snapshots by name pattern
+            is_fork = f.name.startswith("fork_")
+            if is_fork:
+                parts = f.name.replace("fork_", "").replace(".bin", "").rsplit("_", 1)
+                agent_name = parts[0] if parts else ""
+                task = "fork"
+            else:
+                task = meta.get("task", "")
+
             snapshot_files.append({
                 "name": f.name,
+                "commit_id": f.name.replace(".bin", "")[:8],
                 "size_mb": size_bytes / (1024 * 1024),
+                "agent": agent_name,
+                "task": task,
+                "created_at": meta.get("created_at", ""),
+                "tokens": meta.get("tokens", 0),
+                "saved": meta.get("saved", 0),
+                "is_fork": is_fork,
             })
             total_snapshot_size += size_bytes
 
