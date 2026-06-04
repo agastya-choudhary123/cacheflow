@@ -77,7 +77,6 @@ class CustomLlamaServer:
             prompt = data.get("prompt", "")
             slot_id = data.get("slot_id", 0)
             max_tokens = data.get("n_predict", 512)
-            cache_prompt = data.get("cache_prompt", True)
 
             try:
                 start = time.time()
@@ -89,8 +88,14 @@ class CustomLlamaServer:
                     slot = self.slots[slot_id]
                     slot.is_processing = True
 
-                # Run completion with caching
-                # If slot has saved state, we'd need to restore it first
+                # Capture how many tokens are already in the KV cache before
+                # create_completion runs. After load_state this equals the saved
+                # n_tokens; on a fresh model it is 0.  create_completion will
+                # prefix-match the new prompt against these cached tokens and only
+                # evaluate the suffix — so "newly evaluated" = total_prompt_tokens
+                # minus the matched prefix length.
+                n_cached_before = self.model.n_tokens
+
                 result = self.model.create_completion(
                     prompt=prompt,
                     max_tokens=max_tokens,
@@ -102,12 +107,18 @@ class CustomLlamaServer:
                 with self.slot_lock:
                     slot.is_processing = False
 
-                # Map response to llama-server format
+                total_prompt_tokens = result["usage"]["prompt_tokens"]
+                completion_tokens = result["usage"]["completion_tokens"]
+
+                # Tokens actually evaluated = prompt tokens beyond the cached prefix.
+                # Clamped to [0, total_prompt_tokens] to guard against edge cases.
+                tokens_evaluated = max(0, total_prompt_tokens - n_cached_before)
+
                 return jsonify({
                     "content": result["choices"][0]["text"],
                     "prompt": prompt,
-                    "tokens_evaluated": result["usage"]["prompt_tokens"],
-                    "tokens_predicted": result["usage"]["completion_tokens"],
+                    "tokens_evaluated": tokens_evaluated,
+                    "tokens_predicted": completion_tokens,
                     "generation_settings": {
                         "n_ctx": self.ctx_size,
                         "n_predict": max_tokens,
@@ -119,8 +130,8 @@ class CustomLlamaServer:
                     "stop": result["choices"][0].get("finish_reason") == "stop",
                     "stop_type": result["choices"][0].get("finish_reason", "length"),
                     "usage": {
-                        "prompt_tokens": result["usage"]["prompt_tokens"],
-                        "completion_tokens": result["usage"]["completion_tokens"],
+                        "prompt_tokens": total_prompt_tokens,
+                        "completion_tokens": completion_tokens,
                     },
                 })
 
@@ -138,6 +149,35 @@ class CustomLlamaServer:
                     }
                     for slot in self.slots.values()
                 ])
+
+        @self.app.route("/slots/<int:slot_id>/prime", methods=["POST"])
+        def prime_slot(slot_id):
+            """Reset the model and eval a stable prefix, establishing the KV baseline."""
+            data = request.json or {}
+            prefix = data.get("prefix", "")
+
+            if not prefix:
+                return jsonify({"error": {"message": "prefix required", "code": 400}}), 400
+
+            try:
+                start = time.time()
+
+                with self.slot_lock:
+                    if slot_id not in self.slots:
+                        return jsonify({"error": {"message": f"Slot {slot_id} not found", "code": 404}}), 404
+
+                self.model.reset()
+                tokens = self.model.tokenize(prefix.encode())
+                self.model.eval(tokens)
+
+                elapsed = time.time() - start
+                return jsonify({
+                    "n_tokens": self.model.n_tokens,
+                    "prime_time_ms": int(elapsed * 1000),
+                })
+
+            except Exception as e:
+                return jsonify({"error": {"message": str(e), "code": 500}}), 500
 
         @self.app.route("/slots/<int:slot_id>/save", methods=["POST"])
         def save_slot(slot_id):

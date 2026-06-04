@@ -214,6 +214,41 @@ class AgentSession:
             return ""
         return "Codebase:\n" + "".join(parts)
 
+    def _build_stable_prefix(self, system_prompt: str) -> str:
+        """
+        Build the stable KV prefix: system prompt + codebase, WITHOUT the task.
+
+        This is saved as the KV snapshot so every session restores to the same
+        N-token state. Session 2+ only evaluates the task_suffix tokens.
+        The prefix ends on a clean message boundary to avoid tokenization splits.
+        """
+        context = self._build_stable_context(
+            budget_chars=int(self.config.ctx_size * 0.6) * 4
+        )
+        is_qwen = "qwen" in self.config.model_name.lower()
+
+        if is_qwen:
+            if context:
+                return (
+                    f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+                    f"<|im_start|>user\n{context}<|im_end|>\n"
+                )
+            else:
+                return f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        else:
+            if context:
+                return f"{system_prompt}\n\n{context}\n\n"
+            else:
+                return f"{system_prompt}\n\n"
+
+    def _build_task_suffix(self, task: str) -> str:
+        """Build the task-specific suffix that appends to the stable prefix."""
+        is_qwen = "qwen" in self.config.model_name.lower()
+        if is_qwen:
+            return f"<|im_start|>user\nTask: {task}<|im_end|>\n<|im_start|>assistant\n"
+        else:
+            return f"Task: {task}"
+
     def _ingest_codebase_progressively(self, system_prompt: str) -> None:
         """
         Feed the entire codebase into the model across multiple passes,
@@ -298,12 +333,27 @@ class AgentSession:
                 n_gpu_layers=self.config.n_gpu_layers,
             )
 
-            # Step d: Restore snapshot
+            # Step d: Establish KV baseline.
+            # Build the stable prefix (system + codebase, no task). This is saved
+            # as the snapshot so every session restores to the same N-token state.
+            # If the codebase changed since the last run, we re-prime from scratch.
             restore_time_ms = 0
+            prime_time_ms = 0
             is_first_session = agent.head_commit_id is None
 
-            if not is_first_session:
-                # Restore from head commit
+            stable_prefix = self._build_stable_prefix(system_prompt)
+            task_suffix = self._build_task_suffix(task)
+            full_prompt = stable_prefix + task_suffix
+
+            context_changed = (agent.stable_context != stable_prefix)
+
+            if is_first_session or context_changed:
+                # Eval stable prefix from scratch (reset + eval).
+                prime_start = time.time()
+                self.server.prime_slot(stable_prefix, slot_id=self.slot_id)
+                prime_time_ms = int((time.time() - prime_start) * 1000)
+            else:
+                # Restore saved state (stable prefix already in KV cache).
                 head_commit = self.store.get_commit(agent.head_commit_id)
                 if head_commit:
                     restore_start = time.time()
@@ -311,41 +361,17 @@ class AgentSession:
                     self.server.restore_slot(snapshot_filename, slot_id=self.slot_id)
                     restore_time_ms = int((time.time() - restore_start) * 1000)
 
-            # Step e: Build prompt.
-            # Session 1: full codebase context + task → establishes KV baseline.
-            # Session 2+: only the new task turn appended to the restored KV state.
-            #   llama.cpp evaluates only these new tokens; the codebase stays in cache.
-            #   tokens_evaluated ≈ len(task) << baseline → real measured savings.
-            is_qwen = "qwen" in self.config.model_name.lower()
+            # Step e: Save snapshot NOW (stable prefix only, before task evaluation).
+            # This ensures every restored snapshot ends at exactly the same token
+            # position, so session N+1's prefix always matches the saved state.
+            save_start = time.time()
+            save_result = self.server.save_slot(slot_id=self.slot_id)
+            save_time_ms = int((time.time() - save_start) * 1000)
 
-            if is_first_session:
-                context = self._build_stable_context(
-                    budget_chars=int(self.config.ctx_size * 0.6) * 4
-                )
-                if is_qwen:
-                    full_prompt = (
-                        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-                        f"<|im_start|>user\n{context}\n\nTask: {task}<|im_end|>\n"
-                        f"<|im_start|>assistant\n"
-                    ) if context else (
-                        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-                        f"<|im_start|>user\nTask: {task}<|im_end|>\n"
-                        f"<|im_start|>assistant\n"
-                    )
-                else:
-                    full_prompt = (
-                        f"{system_prompt}\n\n{context}\n\nTask: {task}"
-                        if context else
-                        f"{system_prompt}\n\nTask: {task}"
-                    )
-            else:
-                # Continuation turn only — KV already has the codebase context.
-                if is_qwen:
-                    full_prompt = f"<|im_start|>user\nTask: {task}<|im_end|>\n<|im_start|>assistant\n"
-                else:
-                    full_prompt = f"\n\nTask: {task}"
-
-            # Step f: Run completion
+            # Step f: Run completion (stable_prefix + task_suffix).
+            # llama-cpp-python prefix-matches the stable_prefix portion against the
+            # just-saved KV state (n_tokens = N). Only task_suffix tokens are newly
+            # evaluated. tokens_evaluated ≈ len(task_suffix) << N → real savings.
             completion_start = time.time()
             response_data = self.server.completion(
                 prompt=full_prompt,
@@ -355,33 +381,28 @@ class AgentSession:
             completion_time_ms = int((time.time() - completion_start) * 1000)
 
             response_text = response_data.get("content", "")
-            tokens_in = response_data.get("tokens_evaluated", 0)
+            tokens_in = response_data.get("tokens_evaluated", 0)   # task tokens only
             tokens_out = response_data.get("tokens_predicted", 0)
+            total_prompt_tokens = response_data.get("usage", {}).get("prompt_tokens", 0)
 
-            if tokens_in == 0 and tokens_out == 0:
+            if tokens_out == 0:
                 raise RuntimeError("Server returned zero tokens - likely a server error or no response")
 
             tokens_this_session = tokens_in + tokens_out
 
-            if is_first_session:
-                tokens_saved = 0
-                self.store.update_agent_baseline(agent, tokens_in)
-            else:
-                if agent.baseline_tokens_evaluated is None:
-                    raise RuntimeError(
-                        f"Agent '{agent.name}' has no baseline tokens. "
-                        "First session may have failed or completed without persisting. "
-                        "Cannot calculate savings without a baseline."
-                    )
-                # tokens_saved = reduction in prompt tokens from KV cache hits
-                # Note: Baseline is task-agnostic (set per-agent, not per-task)
-                # Savings are only meaningful when comparing same/similar tasks
-                tokens_saved = max(0, agent.baseline_tokens_evaluated - tokens_in)
+            # Persist stable_context on agent whenever it changes.
+            if context_changed or is_first_session:
+                self.store.update_agent_stable_context(agent, stable_prefix)
+                agent.stable_context = stable_prefix
 
-            # Step g: Save slot
-            save_start = time.time()
-            save_result = self.server.save_slot(slot_id=self.slot_id)
-            save_time_ms = int((time.time() - save_start) * 1000)
+            if is_first_session or agent.baseline_tokens_evaluated is None:
+                tokens_saved = 0
+                # Baseline = full prompt size (N + task tokens) — what a cold start costs.
+                baseline = total_prompt_tokens if total_prompt_tokens > 0 else tokens_in
+                self.store.update_agent_baseline(agent, baseline)
+            else:
+                # tokens_saved = codebase tokens not re-evaluated = baseline - task tokens
+                tokens_saved = max(0, agent.baseline_tokens_evaluated - tokens_in)
 
             # Validate save succeeded
             saved_filename = save_result.get("filename", "")

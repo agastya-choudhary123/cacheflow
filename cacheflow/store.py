@@ -24,7 +24,8 @@ class Agent(Base):
     model_hash = Column(String, nullable=False)  # sha256 of model file
     model_name = Column(String, nullable=False)  # e.g. "qwen2.5-coder:7b"
     ctx_size = Column(Integer, nullable=False)
-    baseline_tokens_evaluated = Column(Integer, nullable=True)  # tokens from first session, used to compute real savings
+    baseline_tokens_evaluated = Column(Integer, nullable=True)  # total prompt tokens on first session (N + task1), used to compute savings
+    stable_context = Column(String, nullable=True)  # exact stable prefix text used for current HEAD snapshot
     head_commit_id = Column(
         Uuid, ForeignKey("commits.id"), nullable=True
     )  # current HEAD
@@ -120,6 +121,9 @@ class CacheFlowStore:
             if "baseline_tokens_evaluated" not in cols:
                 conn.execute(text("ALTER TABLE agents ADD COLUMN baseline_tokens_evaluated INTEGER"))
                 conn.commit()
+            if "stable_context" not in cols:
+                conn.execute(text("ALTER TABLE agents ADD COLUMN stable_context TEXT"))
+                conn.commit()
 
     def _get_session(self) -> SQLSession:
         """Get a new database session."""
@@ -146,6 +150,16 @@ class CacheFlowStore:
             if "UNIQUE constraint failed" in str(e):
                 raise ValueError(f"Agent '{name}' already exists")
             raise
+        finally:
+            session.close()
+
+    def update_agent_stable_context(self, agent: Agent, stable_context: str) -> None:
+        """Persist the stable prefix text used for the current HEAD snapshot."""
+        session = self._get_session()
+        try:
+            agent.stable_context = stable_context
+            session.merge(agent)
+            session.commit()
         finally:
             session.close()
 

@@ -160,6 +160,27 @@ class LlamaServer:
         response.raise_for_status()
         return response.json()
 
+    def prime_slot(self, prefix: str, slot_id: int = 0) -> Dict[str, Any]:
+        """Reset the model and eval a stable prefix, establishing the KV baseline.
+
+        Args:
+            prefix: Stable prefix text (system prompt + codebase)
+            slot_id: Slot ID to prime
+
+        Returns:
+            Dict with keys: n_tokens, prime_time_ms
+        """
+        if not self.http_client:
+            raise RuntimeError("Server not started")
+
+        response = self.http_client.post(
+            f"{self.base_url}/slots/{slot_id}/prime",
+            json={"prefix": prefix},
+            timeout=600.0,
+        )
+        response.raise_for_status()
+        return response.json()
+
     def save_slot(self, slot_id: int = 0) -> Dict[str, Any]:
         """
         Save KV cache for a slot to disk.
