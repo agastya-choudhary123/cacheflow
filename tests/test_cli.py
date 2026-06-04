@@ -60,69 +60,63 @@ class TestInitCommand:
     """Test the init command."""
 
     def test_init_command_creates_config(self, runner, temp_dir, model_file):
-        """Test that init command creates config and database."""
-        result = runner.invoke(
-            cli,
-            ["init", "test-agent", str(model_file), "--base-path", str(temp_dir)],
-        )
+        """Test that init command discovers models and creates config."""
+        with patch("cacheflow.cli._discover_models", return_value=[
+            (model_file.name, model_file.stem, str(model_file)),
+        ]):
+            result = runner.invoke(
+                cli,
+                ["init", "--base-path", str(temp_dir)],
+                input="1\n",
+            )
 
-        assert result.exit_code == 0
-        assert "✓ Initialized CacheFlow project" in result.output
+        assert result.exit_code == 0, result.output
+        assert "✓ Initialized with" in result.output
         assert "Config:" in result.output
 
-        # Check config file exists
         config_file = temp_dir / ".cacheflow" / "config.json"
         assert config_file.exists()
 
-        # Check database exists
         db_file = temp_dir / ".cacheflow" / "agents.db"
         assert db_file.exists()
 
-    def test_init_command_with_model_name(self, runner, temp_dir, model_file):
-        """Test init command with explicit model name."""
-        result = runner.invoke(
-            cli,
-            [
-                "init",
-                "test-agent",
-                str(model_file),
-                "--model-name",
-                "custom-model",
-                "--base-path",
-                str(temp_dir),
-            ],
-        )
+    def test_init_command_auto_selects_single_model(self, runner, temp_dir, model_file):
+        """Test that a single discovered model is auto-selected."""
+        with patch("cacheflow.cli._discover_models", return_value=[
+            (model_file.name, model_file.stem, str(model_file)),
+        ]):
+            result = runner.invoke(
+                cli,
+                ["init", "--base-path", str(temp_dir)],
+            )
 
-        assert result.exit_code == 0
-        assert "custom-model" in result.output
+        assert result.exit_code == 0, result.output
+        assert model_file.stem in result.output
 
     def test_init_command_with_custom_ctx_size(self, runner, temp_dir, model_file):
         """Test init command with custom context size."""
-        result = runner.invoke(
-            cli,
-            [
-                "init",
-                "test-agent",
-                str(model_file),
-                "--ctx-size",
-                "16384",
-                "--base-path",
-                str(temp_dir),
-            ],
-        )
+        with patch("cacheflow.cli._discover_models", return_value=[
+            (model_file.name, model_file.stem, str(model_file)),
+        ]):
+            result = runner.invoke(
+                cli,
+                ["init", "--ctx-size", "16384", "--base-path", str(temp_dir)],
+                input="1\n",
+            )
 
-        assert result.exit_code == 0
+        assert result.exit_code == 0, result.output
         assert "16384" in result.output
 
     def test_init_command_missing_model_file(self, runner, temp_dir):
-        """Test init command with non-existent model file."""
-        result = runner.invoke(
-            cli,
-            ["init", "test-agent", "/nonexistent/model.gguf", "--base-path", str(temp_dir)],
-        )
+        """Test init command when no models are found."""
+        with patch("cacheflow.cli._discover_models", return_value=[]):
+            result = runner.invoke(
+                cli,
+                ["init", "--base-path", str(temp_dir)],
+            )
 
         assert result.exit_code != 0
-        assert "not found" in result.output.lower() or "error" in result.output.lower()
+        assert "no models found" in result.output.lower() or "error" in result.output.lower()
 
 
 class TestRunCommand:

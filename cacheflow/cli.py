@@ -10,93 +10,114 @@ from cacheflow.store import CacheFlowStore
 from cacheflow.ollama import list_ollama_models, get_ollama_model_path, ollama_is_installed
 
 
-def ensure_initialized(base_path: Path) -> None:
+def _discover_models() -> list[tuple[str, str, str]]:
     """
-    Ensure project is initialized. Auto-init if needed.
+    Discover all available models: ollama installs + raw GGUF files on disk.
 
-    Args:
-        base_path: Project root path
-
-    Raises:
-        click.ClickException: If auto-init fails
+    Returns:
+        List of (display_label, model_name, model_path) tuples.
     """
+    found: list[tuple[str, str, str]] = []
+
+    # 1. Ollama models
+    if ollama_is_installed():
+        for name in list_ollama_models():
+            path = get_ollama_model_path(name)
+            if path:
+                found.append((f"{name}  [ollama]", name, str(path)))
+
+    # 2. Raw GGUF files in common locations
+    gguf_search_paths = [
+        Path.home() / ".cache" / "lm-studio" / "models",
+        Path.home() / "Library" / "Caches" / "llama.cpp",
+        Path.home() / ".ollama" / "models" / "blobs",
+        Path.home() / "models",
+        Path.cwd(),
+    ]
+    seen_paths = {p for _, _, p in found}
+    for search_dir in gguf_search_paths:
+        if not search_dir.exists():
+            continue
+        for gguf in sorted(search_dir.rglob("*.gguf")):
+            path_str = str(gguf)
+            if path_str in seen_paths:
+                continue
+            seen_paths.add(path_str)
+            size_gb = gguf.stat().st_size / (1024 ** 3)
+            label = f"{gguf.name}  [{size_gb:.1f} GB, {gguf.parent}]"
+            found.append((label, gguf.stem, path_str))
+
+    return found
+
+
+def ensure_initialized(
+    base_path: Path,
+    ctx_size: int = 8192,
+    n_gpu_layers: int = 99,
+) -> None:
+    """Ensure project is initialized, prompting user to pick a model if needed."""
     config_file = base_path / ".cacheflow" / "config.json"
 
-    # Already initialized
     if config_file.exists():
         return
 
-    # Not initialized, try auto-init
-    click.echo("No CacheFlow config found. Auto-initializing...")
+    click.echo("No CacheFlow config found. Searching for models...\n")
 
-    # Check if ollama is available
-    if not ollama_is_installed():
-        raise click.ClickException(
-            "CacheFlow not initialized and ollama not found.\n\n"
-            "To get started:\n"
-            "  1. Install ollama: https://ollama.ai\n"
-            "  2. Pull a model: ollama pull qwen2.5-coder:7b\n"
-            "  3. Then run: cacheflow run <task>"
-        )
-
-    # List available models
-    models = list_ollama_models()
+    models = _discover_models()
 
     if not models:
         raise click.ClickException(
-            "No ollama models found.\n\n"
+            "No models found.\n\n"
             "To get started:\n"
-            "  1. Pull a model: ollama pull qwen2.5-coder:7b\n"
-            "  2. Then run: cacheflow run <task>"
+            "  1. Install ollama: https://ollama.ai\n"
+            "  2. Pull a model: ollama pull qwen2.5-coder:7b\n"
+            "  3. Then run: cf run <task>"
         )
 
-    # Pick model
+    # Present numbered list
+    click.echo("Available models:\n")
+    for i, (label, _, _) in enumerate(models, 1):
+        click.echo(f"  {i}. {label}")
+    click.echo()
+
     if len(models) == 1:
-        model_name = models[0]
-        click.echo(f"Found model: {model_name}")
+        choice = 1
+        click.echo(f"Auto-selecting: {models[0][0]}")
     else:
-        click.echo(f"Found models: {', '.join(models)}")
-        model_name = click.prompt(
-            "Select model",
-            type=click.Choice(models),
-            default=models[0],
+        choice = click.prompt(
+            "Select a model",
+            type=click.IntRange(1, len(models)),
+            default=1,
         )
 
-    # Get model path
-    model_path = get_ollama_model_path(model_name)
-    if not model_path:
-        raise click.ClickException(
-            f"Model {model_name} installed in ollama but .gguf file not found.\n"
-            "Try reinstalling: ollama pull {model_name}"
-        )
+    _, model_name, model_path = models[choice - 1]
 
-    # Create config
-    model_hash = compute_model_hash(str(model_path))
+    click.echo(f"\nHashing model (first 10 MB)...")
+    model_hash = compute_model_hash(model_path)
     config = CacheFlowConfig(
         base_path=base_path,
-        model_path=str(model_path),
+        model_path=model_path,
         model_name=model_name,
         model_hash=model_hash,
-        ctx_size=8192,
-        n_gpu_layers=99,
+        ctx_size=ctx_size,
+        n_gpu_layers=n_gpu_layers,
         slot_save_path=base_path / ".cacheflow" / "snapshots",
     )
     save_config(config)
 
-    # Initialize database
     db_path = base_path / ".cacheflow" / "agents.db"
     store = CacheFlowStore(db_path)
     store.init_db()
 
-    # Register project in global registry
     try:
         register_project(base_path.resolve(), db_path.resolve())
     except Exception:
-        pass  # Non-blocking
+        pass
 
     click.echo(f"✓ Initialized with {model_name}")
     click.echo(f"  Config: {config_file}")
-    click.echo(f"  Model: {model_path}")
+    click.echo(f"  Model:  {model_path}")
+    click.echo(f"  Context size: {ctx_size}")
 
 
 @click.group()
@@ -106,74 +127,14 @@ def cli():
 
 
 @cli.command()
-@click.argument("agent_name", required=False, default=None)
-@click.argument("model_path", required=False, default=None, type=click.Path(exists=True))
-@click.option("--model-name", default=None, help="Model name (e.g., qwen2.5-coder:7b)")
 @click.option("--ctx-size", default=8192, help="Context size")
 @click.option("--n-gpu-layers", default=99, help="GPU layers")
 @click.option("--base-path", default=".", help="Project root")
-def init(agent_name, model_path, model_name, ctx_size, n_gpu_layers, base_path):
-    """Initialize a new project with config.
-
-    Usage:
-      cacheflow init [AGENT_NAME] [MODEL_PATH]     # Explicit init with model
-      cacheflow init                               # Auto-init from ollama
-    """
+def init(ctx_size, n_gpu_layers, base_path):
+    """Initialize a new project. Discovers all models and prompts you to pick one."""
     try:
         base_path = Path(base_path)
-
-        # If neither agent_name nor model_path provided, use auto-init
-        if not agent_name and not model_path:
-            ensure_initialized(base_path)
-            return
-
-        # Old-style explicit init: agent_name and model_path both required
-        if not agent_name or not model_path:
-            raise click.ClickException(
-                "Must provide both AGENT_NAME and MODEL_PATH, or neither (for auto-init)"
-            )
-
-        model_path_abs = Path(model_path).resolve()
-
-        if not model_path_abs.exists():
-            raise click.ClickException(f"Model file not found: {model_path}")
-
-        # Compute model hash
-        model_hash = compute_model_hash(str(model_path_abs))
-
-        # Use provided model name or derive from path
-        if not model_name:
-            model_name = model_path_abs.stem
-
-        # Create config
-        config = CacheFlowConfig(
-            base_path=base_path,
-            model_path=str(model_path_abs),
-            model_name=model_name,
-            model_hash=model_hash,
-            ctx_size=ctx_size,
-            n_gpu_layers=n_gpu_layers,
-            slot_save_path=base_path / ".cacheflow" / "snapshots",
-        )
-        save_config(config)
-
-        # Initialize database
-        db_path = base_path / ".cacheflow" / "agents.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = CacheFlowStore(db_path)
-        store.init_db()
-
-        # Register project in global registry
-        try:
-            register_project(base_path.resolve(), db_path.resolve())
-        except Exception:
-            pass  # Non-blocking
-
-        click.echo("✓ Initialized CacheFlow project")
-        click.echo(f"  Config: {base_path / '.cacheflow' / 'config.json'}")
-        click.echo(f"  Database: {db_path}")
-        click.echo(f"  Model: {model_name}")
-        click.echo(f"  Context size: {ctx_size}")
+        ensure_initialized(base_path, ctx_size=ctx_size, n_gpu_layers=n_gpu_layers)
     except Exception as e:
         raise click.ClickException(str(e))
 
