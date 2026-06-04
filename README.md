@@ -1,6 +1,6 @@
 # CacheFlow
 
-**Persistent KV cache for AI agents with multi-agent concurrency. Same model, same quality. Agents remember everything and run in parallel.**
+**Persistent KV cache for AI agents with multi-agent concurrency. Powered by Qwen2.5-Coder. Agents remember everything and run in parallel.**
 
 ## The Problem
 
@@ -8,7 +8,7 @@ Coding agents re-analyze your codebase from scratch in every session, burning to
 
 ## How It Works
 
-agentgit wraps llama.cpp's KV cache slot save/restore API and adds git-style versioning on top. Each agent run persists the model's KV cache as a snapshot. The next run restores it instead of re-ingesting.
+CacheFlow wraps llama.cpp's KV cache slot save/restore API and adds git-style versioning on top. Each agent run persists the model's KV cache as a snapshot. The next run restores it instead of re-ingesting. Prompts are formatted in ChatML (required by Qwen) and automatically applied for any `qwen` model name.
 
 **Token cost across 5 sessions:**
 
@@ -31,7 +31,7 @@ pip install cacheflow
 
 # 2. Install and run ollama (auto-detected by CacheFlow)
 brew install ollama
-ollama pull llama3.1:8b
+ollama pull qwen2.5-coder:7b
 ollama serve
 
 # 3. Run your first task (auto-initializes project)
@@ -294,7 +294,7 @@ cacheflow/
 
 - Python 3.10+
 - llama.cpp (via `brew install llama.cpp`)
-- A GGUF model (via `ollama pull llama3.1:8b` or equivalent)
+- Qwen2.5-Coder:7b (via `ollama pull qwen2.5-coder:7b`); any llama.cpp-compatible GGUF works, Qwen models get automatic ChatML formatting
 
 ## License
 
