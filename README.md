@@ -340,6 +340,9 @@ cacheflow/
 
 **Coming soon:**
 
+**Integrations:**
+- **Claude Code, Codex, and other agentic tools**: CLI integration enabling CacheFlow snapshots to be restored and queried from Claude Code, GitHub Copilot, and other AI coding assistants
+
 **Multi-agent enhancements:**
 - **Slot pinning**: Prevent eviction of critical agents
 - **Priority scheduling**: Higher-priority agents get preference for slots
