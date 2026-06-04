@@ -140,7 +140,7 @@ def find_gguf_for_model(model_name: str) -> Optional[str]:
     - Current directory
 
     Args:
-        model_name: Model name (e.g., "llama3.1:8b")
+        model_name: Model name (e.g., "qwen2.5-coder:7b")
 
     Returns:
         Path to GGUF file or None if not found

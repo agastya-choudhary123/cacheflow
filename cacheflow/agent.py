@@ -4,6 +4,7 @@ import json
 import logging
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +26,9 @@ DEFAULT_SYSTEM_PROMPT = """You are an expert software engineer with deep knowled
 
 # Global slot pool for managing concurrent agent execution
 _SLOT_POOL = SlotPool(max_slots=8)
+
+# Serializes concurrent init_db calls to prevent SQLite locking races
+_DB_INIT_LOCK = threading.Lock()
 
 
 @dataclass
@@ -67,7 +71,8 @@ class AgentSession:
         self.config = load_config(self.base_path)
         db_path = self.base_path / ".cacheflow" / "agents.db"
         self.store = CacheFlowStore(db_path)
-        self.store.init_db()
+        with _DB_INIT_LOCK:
+            self.store.init_db()
 
     def _acquire_lock(self) -> None:
         """Acquire a KV cache slot for this agent.

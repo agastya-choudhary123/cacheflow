@@ -34,7 +34,7 @@ def config(temp_dir):
     config = CacheFlowConfig(
         base_path=temp_dir,
         model_path="/path/to/model.gguf",
-        model_name="llama3.1:8b",
+        model_name="qwen2.5-coder:7b",
         model_hash="abc123def456",
         ctx_size=8192,
         n_gpu_layers=99,
@@ -210,7 +210,7 @@ class TestLogCommand:
         store = CacheFlowStore(db_path)
 
         # Create an agent with no commits
-        store.create_agent("test-agent", "llama3.1:8b", "abc123", 8192)
+        store.create_agent("test-agent", "qwen2.5-coder:7b", "abc123", 8192)
 
         result = runner.invoke(cli, ["log", "test-agent", "--base-path", str(temp_dir)])
 
@@ -224,7 +224,7 @@ class TestLogCommand:
         store = CacheFlowStore(db_path)
 
         # Create agent and commits
-        agent = store.create_agent("test-agent", "llama3.1:8b", "abc123", 8192)
+        agent = store.create_agent("test-agent", "qwen2.5-coder:7b", "abc123", 8192)
 
         snapshot_path = temp_dir / ".cacheflow" / "snapshots" / "snapshot1.bin"
         snapshot_path.parent.mkdir(parents=True, exist_ok=True)
@@ -257,7 +257,7 @@ class TestLogCommand:
         db_path = temp_dir / ".cacheflow" / "agents.db"
         store = CacheFlowStore(db_path)
 
-        agent = store.create_agent("test-agent", "llama3.1:8b", "abc123", 8192)
+        agent = store.create_agent("test-agent", "qwen2.5-coder:7b", "abc123", 8192)
 
         # Create multiple commits
         for i in range(3):
@@ -330,7 +330,7 @@ class TestAgentsCommand:
         store = CacheFlowStore(db_path)
 
         # Create multiple agents
-        store.create_agent("agent1", "llama3.1:8b", "hash1", 8192)
+        store.create_agent("agent1", "qwen2.5-coder:7b", "hash1", 8192)
         store.create_agent("agent2", "llama2:7b", "hash2", 4096)
 
         result = runner.invoke(cli, ["agents", "--base-path", str(temp_dir)])
@@ -339,7 +339,7 @@ class TestAgentsCommand:
         assert f"Agents in {temp_dir}:" in result.output
         assert "agent1" in result.output
         assert "agent2" in result.output
-        assert "llama3.1:8b" in result.output
+        assert "qwen2.5-coder:7b" in result.output
         assert "llama2:7b" in result.output
 
     def test_agents_command_with_commits(self, runner, temp_dir, config):
@@ -347,7 +347,7 @@ class TestAgentsCommand:
         db_path = temp_dir / ".cacheflow" / "agents.db"
         store = CacheFlowStore(db_path)
 
-        agent = store.create_agent("test-agent", "llama3.1:8b", "abc123", 8192)
+        agent = store.create_agent("test-agent", "qwen2.5-coder:7b", "abc123", 8192)
 
         snapshot_path = temp_dir / ".cacheflow" / "snapshots" / "snapshot.bin"
         snapshot_path.parent.mkdir(parents=True, exist_ok=True)
@@ -431,7 +431,7 @@ class TestForkCommand:
         store = CacheFlowStore(db_path)
 
         # Create parent agent with a commit
-        parent = store.create_agent("main", "llama3.1:8b", "abc123", 8192)
+        parent = store.create_agent("main", "qwen2.5-coder:7b", "abc123", 8192)
 
         snapshot_path = temp_dir / ".cacheflow" / "snapshots" / "snapshot.bin"
         snapshot_path.parent.mkdir(parents=True, exist_ok=True)
@@ -493,7 +493,7 @@ class TestDiffCommand:
         db_path = temp_dir / ".cacheflow" / "agents.db"
         store = CacheFlowStore(db_path)
 
-        agent = store.create_agent("main", "llama3.1:8b", "abc123", 8192)
+        agent = store.create_agent("main", "qwen2.5-coder:7b", "abc123", 8192)
 
         # Create two commits
         for i in range(2):
@@ -556,7 +556,7 @@ class TestStatusCommand:
         db_path = temp_dir / ".cacheflow" / "agents.db"
         store = CacheFlowStore(db_path)
 
-        store.create_agent("main", "llama3.1:8b", "abc123", 8192)
+        store.create_agent("main", "qwen2.5-coder:7b", "abc123", 8192)
 
         result = runner.invoke(cli, ["status", "--base-path", str(temp_dir)])
 
@@ -569,7 +569,7 @@ class TestStatusCommand:
         db_path = temp_dir / ".cacheflow" / "agents.db"
         store = CacheFlowStore(db_path)
 
-        agent = store.create_agent("main", "llama3.1:8b", "abc123", 8192)
+        agent = store.create_agent("main", "qwen2.5-coder:7b", "abc123", 8192)
 
         snapshot_path = temp_dir / ".cacheflow" / "snapshots" / "snapshot.bin"
         snapshot_path.parent.mkdir(parents=True, exist_ok=True)
@@ -602,7 +602,7 @@ class TestStatusCommand:
         db_path = temp_dir / ".cacheflow" / "agents.db"
         store = CacheFlowStore(db_path)
 
-        store.create_agent("custom", "llama3.1:8b", "abc123", 8192)
+        store.create_agent("custom", "qwen2.5-coder:7b", "abc123", 8192)
 
         result = runner.invoke(
             cli, ["status", "--agent", "custom", "--base-path", str(temp_dir)]

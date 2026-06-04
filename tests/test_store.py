@@ -39,13 +39,13 @@ def test_create_agent(store):
     """Test creating and retrieving an agent."""
     agent = store.create_agent(
         name="test-agent",
-        model_name="llama3.1:8b",
+        model_name="qwen2.5-coder:7b",
         model_hash="abc123def456",
         ctx_size=2048,
     )
 
     assert agent.name == "test-agent"
-    assert agent.model_name == "llama3.1:8b"
+    assert agent.model_name == "qwen2.5-coder:7b"
     assert agent.ctx_size == 2048
 
     # Test retrieval
@@ -65,7 +65,7 @@ def test_create_commit(store, temp_dir):
     # Create agent
     agent = store.create_agent(
         name="test-agent",
-        model_name="llama3.1:8b",
+        model_name="qwen2.5-coder:7b",
         model_hash="abc123def456",
         ctx_size=2048,
     )
@@ -97,7 +97,7 @@ def test_commit_history(store, temp_dir):
     """Test that commit history is tracked correctly."""
     agent = store.create_agent(
         name="test-agent",
-        model_name="llama3.1:8b",
+        model_name="qwen2.5-coder:7b",
         model_hash="abc123def456",
         ctx_size=2048,
     )
@@ -141,7 +141,7 @@ def test_fork_tracking(store, temp_dir):
     """Test that forked commits are tracked correctly."""
     agent = store.create_agent(
         name="main-agent",
-        model_name="llama3.1:8b",
+        model_name="qwen2.5-coder:7b",
         model_hash="abc123def456",
         ctx_size=2048,
     )
@@ -191,7 +191,7 @@ def test_update_agent_baseline(store):
     """Test updating agent baseline tokens."""
     agent = store.create_agent(
         name="test-agent",
-        model_name="llama3.1:8b",
+        model_name="qwen2.5-coder:7b",
         model_hash="abc123def456",
         ctx_size=8192,
     )
@@ -217,7 +217,7 @@ def test_migrate_schema_idempotent(temp_dir):
     # Verify the column exists and works
     agent = store.create_agent(
         name="test-agent",
-        model_name="llama3.1:8b",
+        model_name="qwen2.5-coder:7b",
         model_hash="abc123def456",
         ctx_size=8192,
     )

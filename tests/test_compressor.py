@@ -27,7 +27,7 @@ def config(temp_dir):
     config = CacheFlowConfig(
         base_path=temp_dir,
         model_path="/path/to/model.gguf",
-        model_name="llama3.1:8b",
+        model_name="qwen2.5-coder:7b",
         model_hash="abc123def456",
         ctx_size=8192,
         n_gpu_layers=99,
@@ -57,7 +57,7 @@ def test_consolidation_triggers_at_threshold(store, config, compressor, temp_dir
     # Create agent
     agent = store.create_agent(
         "test-agent",
-        "llama3.1:8b",
+        "qwen2.5-coder:7b",
         "abc123def456",
         8192,
     )
@@ -113,7 +113,7 @@ def test_consolidation_not_triggered_below_threshold(store, config, compressor, 
     # Create agent
     agent = store.create_agent(
         "test-agent",
-        "llama3.1:8b",
+        "qwen2.5-coder:7b",
         "abc123def456",
         8192,
     )
@@ -151,7 +151,7 @@ def test_consolidation_compact_returns_none_if_not_needed(
     # Create agent with low tokens
     agent = store.create_agent(
         "test-agent",
-        "llama3.1:8b",
+        "qwen2.5-coder:7b",
         "abc123def456",
         8192,
     )
@@ -187,7 +187,7 @@ def test_consolidation_logs_result(store, config, compressor, temp_dir):
     # Create agent
     agent = store.create_agent(
         "test-agent",
-        "llama3.1:8b",
+        "qwen2.5-coder:7b",
         "abc123def456",
         8192,
     )
@@ -341,7 +341,7 @@ def test_consolidation_async_execution(store, config, temp_dir):
     # Create agent with low tokens (no consolidation needed)
     agent = store.create_agent(
         "test-agent",
-        "llama3.1:8b",
+        "qwen2.5-coder:7b",
         "abc123def456",
         8192,
     )

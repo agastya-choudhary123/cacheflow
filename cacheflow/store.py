@@ -22,7 +22,7 @@ class Agent(Base):
     name = Column(String, unique=True, nullable=False)
     created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
     model_hash = Column(String, nullable=False)  # sha256 of model file
-    model_name = Column(String, nullable=False)  # e.g. "llama3.1:8b"
+    model_name = Column(String, nullable=False)  # e.g. "qwen2.5-coder:7b"
     ctx_size = Column(Integer, nullable=False)
     baseline_tokens_evaluated = Column(Integer, nullable=True)  # tokens from first session, used to compute real savings
     head_commit_id = Column(
@@ -103,12 +103,13 @@ class CacheFlowStore:
         @event.listens_for(self.engine, "connect")
         def set_sqlite_pragma(dbapi_conn, connection_record):
             cursor = dbapi_conn.cursor()
+            cursor.execute("PRAGMA busy_timeout=5000")
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.close()
 
     def init_db(self) -> None:
         """Create all tables, running any needed schema migrations."""
-        Base.metadata.create_all(self.engine)
+        Base.metadata.create_all(self.engine, checkfirst=True)
         self._migrate_schema()
 
     def _migrate_schema(self) -> None:

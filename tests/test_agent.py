@@ -26,7 +26,7 @@ def config(temp_dir):
     config = CacheFlowConfig(
         base_path=temp_dir,
         model_path="/path/to/model.gguf",
-        model_name="llama3.1:8b",
+        model_name="qwen2.5-coder:7b",
         model_hash="abc123def456",
         ctx_size=8192,
         n_gpu_layers=99,
@@ -48,7 +48,7 @@ def test_agent_session_init(agent_session, config):
     assert agent_session.agent_name == "test-agent"
     assert agent_session.config is not None
     assert agent_session.store is not None
-    assert agent_session.config.model_name == "llama3.1:8b"
+    assert agent_session.config.model_name == "qwen2.5-coder:7b"
 
 
 def test_agent_first_session(agent_session, temp_dir):
@@ -95,7 +95,7 @@ def test_agent_consecutive_session(agent_session, temp_dir):
     # Create initial agent and commit
     agent = store.create_agent(
         "test-agent",
-        "llama3.1:8b",
+        "qwen2.5-coder:7b",
         "abc123def456",
         8192,
     )
@@ -211,7 +211,7 @@ def test_fork_agent(temp_dir, config):
     store.init_db()
 
     # Create parent agent with a commit
-    parent = store.create_agent("main", "llama3.1:8b", "abc123", 8192)
+    parent = store.create_agent("main", "qwen2.5-coder:7b", "abc123", 8192)
 
     snapshot_path = temp_dir / ".cacheflow" / "snapshots" / "parent_snapshot.bin"
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
@@ -273,7 +273,7 @@ def test_fork_agent_no_head_commit(temp_dir, config):
     store.init_db()
 
     # Create parent with no commits
-    store.create_agent("main", "llama3.1:8b", "abc123", 8192)
+    store.create_agent("main", "qwen2.5-coder:7b", "abc123", 8192)
 
     with pytest.raises(ValueError, match="no HEAD commit"):
         fork_agent("main", "child", temp_dir)
@@ -342,7 +342,10 @@ def test_codebase_injection_first_session(agent_session, temp_dir):
             max_tokens=512,
         )
 
-    # Check that codebase context was included in the prompt
-    completion_call_args = mock_server.completion.call_args
-    prompt_arg = completion_call_args[1]["prompt"]
-    assert "Codebase:" in prompt_arg or "main.py" in prompt_arg or "utils.py" in prompt_arg
+    # Check that codebase context was included in any completion call
+    # (KnowledgeProber makes the final call, so we check all calls)
+    all_prompts = [call[1]["prompt"] for call in mock_server.completion.call_args_list]
+    assert any(
+        "Codebase:" in p or "main.py" in p or "utils.py" in p or "Analyze this codebase" in p
+        for p in all_prompts
+    )

@@ -29,7 +29,7 @@ def config(temp_dir):
     config = CacheFlowConfig(
         base_path=temp_dir,
         model_path="/path/to/model.gguf",
-        model_name="llama3.1:8b",
+        model_name="qwen2.5-coder:7b",
         model_hash="abc123def456",
         ctx_size=8192,
         n_gpu_layers=99,

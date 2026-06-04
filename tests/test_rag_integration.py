@@ -111,7 +111,7 @@ def get_post(post_id):
         config = CacheFlowConfig(
             base_path=tmpdir,
             model_path="/path/to/model.gguf",
-            model_name="llama",
+            model_name="qwen2.5-coder:7b",
             model_hash="abc123",
         )
         save_config(config)

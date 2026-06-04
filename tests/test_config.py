@@ -36,13 +36,13 @@ def test_agentgit_config_creation():
     config = CacheFlowConfig(
         base_path=Path("/tmp/test"),
         model_path="/path/to/model.gguf",
-        model_name="llama3.1:8b",
+        model_name="qwen2.5-coder:7b",
         model_hash="abc123",
         ctx_size=8192,
         n_gpu_layers=99,
     )
     assert config.base_path == Path("/tmp/test")
-    assert config.model_name == "llama3.1:8b"
+    assert config.model_name == "qwen2.5-coder:7b"
     assert config.ctx_size == 8192
     assert config.n_gpu_layers == 99
 
@@ -57,7 +57,7 @@ def test_config_save_and_load():
         config = CacheFlowConfig(
             base_path=base_path,
             model_path="/path/to/model.gguf",
-            model_name="llama3.1:8b",
+            model_name="qwen2.5-coder:7b",
             model_hash="abc123def456",
             ctx_size=4096,
             n_gpu_layers=50,
@@ -72,7 +72,7 @@ def test_config_save_and_load():
         # Load and verify
         loaded = load_config(base_path)
         assert loaded.model_path == "/path/to/model.gguf"
-        assert loaded.model_name == "llama3.1:8b"
+        assert loaded.model_name == "qwen2.5-coder:7b"
         assert loaded.model_hash == "abc123def456"
         assert loaded.ctx_size == 4096
         assert loaded.n_gpu_layers == 50

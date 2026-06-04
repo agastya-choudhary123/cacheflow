@@ -15,7 +15,7 @@ def list_ollama_models() -> List[str]:
     List all installed ollama models.
 
     Returns:
-        List of model names (e.g., ['llama3.1:8b', 'mistral:7b'])
+        List of model names (e.g., ['qwen2.5-coder:7b', 'mistral:7b'])
     """
     models_dir = get_ollama_models_dir()
 
@@ -42,7 +42,7 @@ def get_ollama_model_path(model_name: str) -> Optional[Path]:
     Get the .gguf file path for an installed ollama model.
 
     Args:
-        model_name: Model name (e.g., 'llama3.1:8b')
+        model_name: Model name (e.g., 'qwen2.5-coder:7b')
 
     Returns:
         Path to .gguf file, or None if not found

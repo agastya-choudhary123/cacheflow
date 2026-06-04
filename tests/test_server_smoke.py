@@ -27,7 +27,7 @@ def find_model():
     if not ggufs:
         print("❌ No GGUF model found!")
         print(f"   Searched: {', '.join(str(p) for p in search_paths)}")
-        print(f"   Run: ollama pull llama3.1:8b")
+        print(f"   Run: ollama pull qwen2.5-coder:7b")
         sys.exit(1)
 
     # Find smallest

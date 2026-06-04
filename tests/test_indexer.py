@@ -29,7 +29,7 @@ class MyClass:
 """)
 
         indexer = CodeIndexer()
-        items = indexer._extract_from_python(py_file)
+        items = indexer._extract_from_python(py_file, tmp_path)
 
         assert len(items) >= 2
         names = [item.name for item in items]

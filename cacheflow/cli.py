@@ -35,7 +35,7 @@ def ensure_initialized(base_path: Path) -> None:
             "CacheFlow not initialized and ollama not found.\n\n"
             "To get started:\n"
             "  1. Install ollama: https://ollama.ai\n"
-            "  2. Pull a model: ollama pull llama3.1:8b\n"
+            "  2. Pull a model: ollama pull qwen2.5-coder:7b\n"
             "  3. Then run: cacheflow run <task>"
         )
 
@@ -46,7 +46,7 @@ def ensure_initialized(base_path: Path) -> None:
         raise click.ClickException(
             "No ollama models found.\n\n"
             "To get started:\n"
-            "  1. Pull a model: ollama pull llama3.1:8b\n"
+            "  1. Pull a model: ollama pull qwen2.5-coder:7b\n"
             "  2. Then run: cacheflow run <task>"
         )
 
@@ -108,7 +108,7 @@ def cli():
 @cli.command()
 @click.argument("agent_name", required=False, default=None)
 @click.argument("model_path", required=False, default=None, type=click.Path(exists=True))
-@click.option("--model-name", default=None, help="Model name (e.g., llama3.1:8b)")
+@click.option("--model-name", default=None, help="Model name (e.g., qwen2.5-coder:7b)")
 @click.option("--ctx-size", default=8192, help="Context size")
 @click.option("--n-gpu-layers", default=99, help="GPU layers")
 @click.option("--base-path", default=".", help="Project root")
