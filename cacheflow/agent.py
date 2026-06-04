@@ -185,6 +185,35 @@ class AgentSession:
             chunks[0] = chunks[0].replace("Codebase (continued):", "Codebase:", 1)
         return chunks
 
+    def _build_stable_context(self, budget_chars: int) -> str:
+        """
+        Build codebase context that is byte-for-byte identical every session.
+        Stable prefix = llama.cpp reuses KV cache hits → only task tokens need evaluation.
+        """
+        SKIP_SUFFIXES = {".lock", ".sum", ".mod"}
+        SKIP_NAMES = {"package-lock.json", "yarn.lock", "poetry.lock"}
+
+        files = self._collect_source_files()
+        parts: list[str] = []
+        total = 0
+        for f in files:
+            if f.suffix in SKIP_SUFFIXES or f.name in SKIP_NAMES:
+                continue
+            try:
+                content = f.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            rel = str(f.relative_to(self.base_path))
+            block = f"\n--- {rel} ---\n{content}\n"
+            if total + len(block) > budget_chars:
+                break
+            parts.append(block)
+            total += len(block)
+
+        if not parts:
+            return ""
+        return "Codebase:\n" + "".join(parts)
+
     def _ingest_codebase_progressively(self, system_prompt: str) -> None:
         """
         Feed the entire codebase into the model across multiple passes,
@@ -282,35 +311,39 @@ class AgentSession:
                     self.server.restore_slot(snapshot_filename, slot_id=self.slot_id)
                     restore_time_ms = int((time.time() - restore_start) * 1000)
 
-            # Step e: Ensure index exists, then build prompt via RAG
-            if not self.config.index_path.exists():
-                try:
-                    indexer = CodeIndexer()
-                    items = indexer.extract_from_codebase(self.base_path)
-                    items = indexer.embed_items(items)
-                    indexer.save_index(items, self.config.index_path)
-                except Exception as e:
-                    import traceback
-                    logger.warning(f"Failed to index codebase: {e}\n{traceback.format_exc()}")
+            # Step e: Build prompt.
+            # Session 1: full codebase context + task → establishes KV baseline.
+            # Session 2+: only the new task turn appended to the restored KV state.
+            #   llama.cpp evaluates only these new tokens; the codebase stays in cache.
+            #   tokens_evaluated ≈ len(task) << baseline → real measured savings.
+            is_qwen = "qwen" in self.config.model_name.lower()
 
-            retriever = CodeRetriever(self.config.index_path)
-            is_system_q = retriever.is_system_question(task)
-            top_k = 10 if is_system_q else 5
-            retrieved_items = retriever.retrieve(task, top_k=top_k)
-            neighbors = retriever.graph_expand(retrieved_items)
-            context = retriever.format_context(retrieved_items, neighbors=neighbors, budget_chars=6000, task=task)
-
-            user_content = f"{context}\n\nTask: {task}" if context else f"Task: {task}"
-
-            # Wrap in ChatML for models that require it (Qwen, etc.)
-            if "qwen" in self.config.model_name.lower():
-                full_prompt = (
-                    f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-                    f"<|im_start|>user\n{user_content}<|im_end|>\n"
-                    f"<|im_start|>assistant\n"
+            if is_first_session:
+                context = self._build_stable_context(
+                    budget_chars=int(self.config.ctx_size * 0.6) * 4
                 )
+                if is_qwen:
+                    full_prompt = (
+                        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+                        f"<|im_start|>user\n{context}\n\nTask: {task}<|im_end|>\n"
+                        f"<|im_start|>assistant\n"
+                    ) if context else (
+                        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+                        f"<|im_start|>user\nTask: {task}<|im_end|>\n"
+                        f"<|im_start|>assistant\n"
+                    )
+                else:
+                    full_prompt = (
+                        f"{system_prompt}\n\n{context}\n\nTask: {task}"
+                        if context else
+                        f"{system_prompt}\n\nTask: {task}"
+                    )
             else:
-                full_prompt = f"{system_prompt}\n\n{user_content}"
+                # Continuation turn only — KV already has the codebase context.
+                if is_qwen:
+                    full_prompt = f"<|im_start|>user\nTask: {task}<|im_end|>\n<|im_start|>assistant\n"
+                else:
+                    full_prompt = f"\n\nTask: {task}"
 
             # Step f: Run completion
             completion_start = time.time()
