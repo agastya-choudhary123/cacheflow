@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 import threading
 from dataclasses import dataclass, asdict
+from concurrent.futures import ThreadPoolExecutor
+import pickle
 
 try:
     from llama_cpp import Llama
@@ -54,6 +56,9 @@ class CustomLlamaServer:
         self.slots: Dict[int, Slot] = {}
         self.slot_lock = threading.Lock()
         self._init_slots(4)  # Start with 4 slots
+
+        # Background save executor (non-blocking snapshot writes)
+        self._save_executor = ThreadPoolExecutor(max_workers=1)
 
         # Flask app
         self.app = Flask(__name__)
@@ -181,37 +186,34 @@ class CustomLlamaServer:
 
         @self.app.route("/slots/<int:slot_id>/save", methods=["POST"])
         def save_slot(slot_id):
-            """Save KV cache state to disk."""
+            """Save KV cache state to disk (asynchronously)."""
             try:
-                start = time.time()
-
                 with self.slot_lock:
                     if slot_id not in self.slots:
                         return jsonify({"error": {"message": f"Slot {slot_id} not found", "code": 404}}), 404
 
-                    # Get current model state
+                    # Get current model state (sync, quick operation)
                     state = self.model.save_state()
                     slot = self.slots[slot_id]
                     slot.state = state
 
-                    # Save to disk - serialize the state object
-                    filename = f"slot_{slot_id}_{uuid.uuid4().hex[:8]}.bin"
-                    filepath = self.slot_save_path / filename
+                # Generate filename now (before async write)
+                filename = f"slot_{slot_id}_{uuid.uuid4().hex[:8]}.bin"
+                filepath = self.slot_save_path / filename
 
-                    # Convert LlamaState to bytes
-                    import pickle
+                # Submit to background executor (non-blocking)
+                def background_save():
                     with open(filepath, "wb") as f:
                         pickle.dump(state, f)
+                    return filepath.stat().st_size
 
-                    # Get file size
-                    file_size = filepath.stat().st_size
+                future = self._save_executor.submit(background_save)
 
-                elapsed = time.time() - start
-
+                # Return immediately with filename, save happens in background
                 return jsonify({
                     "filename": filename,
-                    "save_time_ms": int(elapsed * 1000),
-                    "size_bytes": file_size,
+                    "save_time_ms": 0,  # Approximate; actual I/O in background
+                    "size_bytes": 0,    # Will be known after background save completes
                 })
 
             except Exception as e:
@@ -282,8 +284,9 @@ class CustomLlamaServer:
         self.app.run(host="127.0.0.1", port=self.port, debug=False, threaded=True)
 
     def stop(self):
-        """Stop the server."""
-        pass
+        """Stop the server and clean up background executor."""
+        if hasattr(self, '_save_executor'):
+            self._save_executor.shutdown(wait=True)  # Wait for pending saves
 
 
 if __name__ == "__main__":

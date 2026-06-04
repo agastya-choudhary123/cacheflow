@@ -1,13 +1,18 @@
 """Command-line interface for CacheFlow."""
 
 from pathlib import Path
+import atexit
 
 import click
 
 from cacheflow.agent import AgentSession, DEFAULT_SYSTEM_PROMPT, fork_agent
 from cacheflow.config import CacheFlowConfig, compute_model_hash, save_config, load_config, register_project
+from cacheflow.server import stop_global_server
 from cacheflow.store import CacheFlowStore
 from cacheflow.ollama import list_ollama_models, get_ollama_model_path, ollama_is_installed
+
+# Register cleanup on exit
+atexit.register(stop_global_server)
 
 
 def _discover_models() -> list[tuple[str, str, str]]:
@@ -276,6 +281,125 @@ def fork(parent_agent, child_agent, scope, base_path):
         click.echo(f"✓ Forked '{parent_agent}' → '{child_agent}'")
         click.echo(f"  Child agent starts from commit {str(new_agent.head_commit_id)[:8]}")
         click.echo(f"  Snapshot copied: {snapshot_size / (1024*1024):.1f} MB")
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+
+@cli.command()
+@click.option("--base-path", default=".", help="Project root")
+def repl(base_path):
+    """Interactive REPL: Run multiple tasks with a hot server (no reload per task).
+
+    Keeps the model in memory between tasks for near-instant follow-ups.
+    Type 'exit' or 'quit' to exit, 'help' for available commands.
+
+    Example:
+      cf repl
+      > run main "Analyze the architecture"
+      > run main "What are the main classes?"
+      > fork main qa
+      > run qa "Write tests for this"
+      > exit
+    """
+    try:
+        from cacheflow.store import CacheFlowStore
+
+        base_path = Path(base_path)
+        ensure_initialized(base_path)
+
+        click.echo("╭─ CacheFlow Interactive REPL ─────────────────╮")
+        click.echo("│ Model loaded once, reused across all tasks    │")
+        click.echo("│ Type 'help' for commands, 'exit' to quit      │")
+        click.echo("╰───────────────────────────────────────────────╯\n")
+
+        db_path = base_path / ".cacheflow" / "agents.db"
+        store = CacheFlowStore(db_path)
+
+        while True:
+            try:
+                user_input = click.prompt("> ").strip()
+
+                if not user_input:
+                    continue
+
+                if user_input in ("exit", "quit"):
+                    click.echo("Shutting down server...")
+                    break
+
+                if user_input == "help":
+                    click.echo("Commands:")
+                    click.echo("  run AGENT TASK              Run a task with an agent")
+                    click.echo("  log AGENT [--limit N]       Show agent commit history")
+                    click.echo("  status [--agent AGENT]      Show agent status")
+                    click.echo("  agents                      List all agents")
+                    click.echo("  fork PARENT CHILD [--scope] Fork an agent")
+                    click.echo("  exit/quit                   Exit REPL")
+                    click.echo()
+                    continue
+
+                # Parse command
+                parts = user_input.split(None, 2)
+                if not parts:
+                    continue
+
+                cmd = parts[0]
+
+                if cmd == "run" and len(parts) >= 3:
+                    agent_name = parts[1]
+                    task = parts[2]
+                    session = AgentSession(agent_name, base_path)
+                    result = session.run(task, max_tokens=1024)
+                    click.echo(f"\n✓ Task complete (tokens: {result.tokens_this_session}, saved: {result.tokens_saved})")
+                    click.echo(f"Response preview: {result.response[:200]}...\n")
+
+                elif cmd == "log" and len(parts) >= 2:
+                    agent_name = parts[1]
+                    agent = store.get_agent(agent_name)
+                    if agent:
+                        commits = store.get_commit_history(agent)
+                        click.echo(f"\nCommit history for {agent_name}:")
+                        for commit in commits[-10:]:  # Last 10
+                            click.echo(f"  {str(commit.id)[:8]} | {commit.task[:40]} | tokens: {commit.tokens_this_session}")
+                    else:
+                        click.echo(f"Agent '{agent_name}' not found")
+                    click.echo()
+
+                elif cmd == "status":
+                    agent_name = parts[1] if len(parts) > 1 else "main"
+                    agent = store.get_agent(agent_name)
+                    if agent:
+                        commits = store.get_commit_history(agent)
+                        total_tokens = sum(c.tokens_this_session for c in commits)
+                        click.echo(f"\nStatus: {agent_name}")
+                        click.echo(f"  Sessions: {len(commits)}")
+                        click.echo(f"  Total tokens: {total_tokens:,}")
+                    else:
+                        click.echo(f"Agent '{agent_name}' not found")
+                    click.echo()
+
+                elif cmd == "agents":
+                    agents = store.list_agents()
+                    click.echo(f"\nAgents:")
+                    for agent in agents:
+                        click.echo(f"  {agent.name}")
+                    click.echo()
+
+                elif cmd == "fork" and len(parts) >= 3:
+                    parent = parts[1]
+                    child = parts[2]
+                    from cacheflow.agent import fork_agent
+                    new_agent = fork_agent(parent, child, base_path)
+                    click.echo(f"✓ Forked '{parent}' → '{child}'\n")
+
+                else:
+                    click.echo(f"Unknown command: {cmd}\n")
+
+            except KeyboardInterrupt:
+                click.echo("\nShutting down...")
+                break
+            except Exception as e:
+                click.echo(f"Error: {e}\n")
+
     except Exception as e:
         raise click.ClickException(str(e))
 

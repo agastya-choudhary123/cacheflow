@@ -8,6 +8,36 @@ import httpx
 import shutil
 from pathlib import Path
 from typing import Optional, Dict, Any
+from threading import Lock
+
+
+# Global singleton server instance
+_GLOBAL_SERVER: Optional["LlamaServer"] = None
+_SERVER_LOCK = Lock()
+
+
+def get_global_server(
+    model_path: str,
+    slot_save_path: str,
+    ctx_size: int = 8192,
+    n_gpu_layers: int = 99,
+) -> "LlamaServer":
+    """Get or create the global persistent server instance."""
+    global _GLOBAL_SERVER
+    with _SERVER_LOCK:
+        if _GLOBAL_SERVER is None or not _GLOBAL_SERVER.is_running():
+            _GLOBAL_SERVER = LlamaServer()
+            _GLOBAL_SERVER.start(model_path, slot_save_path, ctx_size, n_gpu_layers)
+        return _GLOBAL_SERVER
+
+
+def stop_global_server() -> None:
+    """Stop and clean up the global server instance."""
+    global _GLOBAL_SERVER
+    with _SERVER_LOCK:
+        if _GLOBAL_SERVER is not None:
+            _GLOBAL_SERVER.stop()
+            _GLOBAL_SERVER = None
 
 
 class LlamaServer:
@@ -29,7 +59,7 @@ class LlamaServer:
         n_gpu_layers: int = 99,
     ) -> None:
         """
-        Start llama server as a subprocess.
+        Start llama server as a subprocess (idempotent — safe to call multiple times).
 
         Args:
             model_path: Path to GGUF model file
@@ -37,6 +67,10 @@ class LlamaServer:
             ctx_size: Context size (IMMUTABLE once set)
             n_gpu_layers: Number of GPU layers to use (-1 = CPU only)
         """
+        # If already running, return early
+        if self.is_running():
+            return
+
         # Find custom server script
         custom_server = Path(__file__).parent / "llama_server_custom.py"
         if not custom_server.exists():

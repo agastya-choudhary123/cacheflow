@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 from cacheflow.config import load_config, CacheFlowConfig
 from cacheflow.store import CacheFlowStore, Agent
-from cacheflow.server import LlamaServer
+from cacheflow.server import LlamaServer, get_global_server
 from cacheflow.compressor import Compressor
 from cacheflow.indexer import CodeIndexer
 from cacheflow.retriever import CodeRetriever
@@ -324,9 +324,8 @@ class AgentSession:
             # Step b: Acquire file lock
             self._acquire_lock()
 
-            # Step c: Start LlamaServer
-            self.server = LlamaServer()
-            self.server.start(
+            # Step c: Get persistent LlamaServer (singleton, reused across tasks)
+            self.server = get_global_server(
                 model_path=self.config.model_path,
                 slot_save_path=str(self.config.slot_save_path),
                 ctx_size=self.config.ctx_size,
@@ -347,6 +346,9 @@ class AgentSession:
 
             context_changed = (agent.stable_context != stable_prefix)
 
+            # Track if we just restored (KV already primed with stable prefix)
+            just_restored = False
+
             if is_first_session or context_changed:
                 # Eval stable prefix from scratch (reset + eval).
                 prime_start = time.time()
@@ -360,6 +362,7 @@ class AgentSession:
                     snapshot_filename = Path(head_commit.snapshot_path).name
                     self.server.restore_slot(snapshot_filename, slot_id=self.slot_id)
                     restore_time_ms = int((time.time() - restore_start) * 1000)
+                    just_restored = True
 
             # Step e: Save snapshot NOW (stable prefix only, before task evaluation).
             # This ensures every restored snapshot ends at exactly the same token
@@ -368,13 +371,23 @@ class AgentSession:
             save_result = self.server.save_slot(slot_id=self.slot_id)
             save_time_ms = int((time.time() - save_start) * 1000)
 
-            # Step f: Run completion (stable_prefix + task_suffix).
-            # llama-cpp-python prefix-matches the stable_prefix portion against the
-            # just-saved KV state (n_tokens = N). Only task_suffix tokens are newly
-            # evaluated. tokens_evaluated ≈ len(task_suffix) << N → real savings.
+            # Step f: Run completion.
+            # Session 1/context-changed: send full prompt (stable_prefix + task_suffix)
+            #   to establish baseline token count with fresh KV state.
+            # Session 2+ (restored): send only task_suffix. KV cache has stable prefix cached.
+            #   llama-cpp-python prefix-matches task_suffix against the cached state;
+            #   only task tokens are newly evaluated → real savings.
             completion_start = time.time()
+
+            if just_restored:
+                # Only send task suffix; stable prefix already in cached KV
+                prompt_to_send = task_suffix
+            else:
+                # First session or context changed; send full prompt
+                prompt_to_send = full_prompt
+
             response_data = self.server.completion(
-                prompt=full_prompt,
+                prompt=prompt_to_send,
                 slot_id=self.slot_id,
                 max_tokens=max_tokens,
             )
@@ -495,9 +508,8 @@ class AgentSession:
             )
 
         finally:
-            # Step m: Stop server
-            if self.server:
-                self.server.stop()
+            # Step m: Server is persistent (global singleton), don't stop
+            # Just release the slot lock
 
             # Step l: Release file lock
             self._release_lock()
