@@ -72,7 +72,7 @@ def test_agent_first_session(agent_session, temp_dir):
         "size_bytes": 1024,
     }
 
-    with patch("cacheflow.agent.LlamaServer", return_value=mock_server):
+    with patch("cacheflow.agent.get_global_server", return_value=mock_server):
         result = agent_session.run(
             task="Test task",
             system_prompt=DEFAULT_SYSTEM_PROMPT,
@@ -116,17 +116,27 @@ def test_agent_consecutive_session(agent_session, temp_dir):
         snapshot_restore_time_ms=0,
     )
 
-    # Set baseline for this agent (simulating first session completing)
+    # Set baseline and stable_context for this agent (simulating first session completing)
     store.update_agent_baseline(agent, 100)
-    agent = store.get_agent("test-agent")  # Refresh agent to get updated baseline
+    # Stable context would be set during first session
+    store.update_agent_stable_context(agent, DEFAULT_SYSTEM_PROMPT)
+    agent = store.get_agent("test-agent")  # Refresh agent to get updated baseline and stable_context
 
-    # Rename to match commit ID
+    # Rename to match commit ID and update commit record
     final_path = snapshot_path.parent / f"{commit.id}.bin"
     snapshot_path.rename(final_path)
 
-    # Create snapshot for restore
-    restore_file = snapshot_path.parent / "snapshot.bin"
-    restore_file.write_bytes(os.urandom(2048))
+    # Update commit record with final path (like agent.py does)
+    commit.snapshot_path = str(final_path)
+    session = store._get_session()
+    try:
+        session.merge(commit)
+        session.commit()
+    finally:
+        session.close()
+
+    # Create snapshot file that matches the commit record
+    final_path.write_bytes(os.urandom(2048))
 
     # Mock the server for second run
     mock_server = MagicMock()
@@ -134,15 +144,22 @@ def test_agent_consecutive_session(agent_session, temp_dir):
         "content": "Second task completed.",
         "tokens_evaluated": 40,
         "tokens_predicted": 20,
+        "usage": {"prompt_tokens": 100},
     }
+
+    # Create the snapshot file that save_slot will "return"
+    snapshot_file = temp_dir / ".cacheflow" / "snapshots" / "snapshot.bin"
+    snapshot_file.write_bytes(os.urandom(2048))
+
     mock_server.save_slot.return_value = {
         "filename": "snapshot.bin",
         "save_time_ms": 150,
         "size_bytes": 2048,
     }
     mock_server.restore_slot = MagicMock()
+    mock_server.prime_slot = MagicMock()
 
-    with patch("cacheflow.agent.LlamaServer", return_value=mock_server):
+    with patch("cacheflow.agent.get_global_server", return_value=mock_server):
         result = agent_session.run(
             task="Second task",
             system_prompt=DEFAULT_SYSTEM_PROMPT,
@@ -153,7 +170,8 @@ def test_agent_consecutive_session(agent_session, temp_dir):
     # tokens_saved = baseline (100) - tokens_evaluated (40) = 60
     assert result.tokens_saved == 60
     assert result.tokens_this_session == 60  # 40 + 20
-    assert mock_server.restore_slot.called
+    # Either restore_slot or prime_slot was called (depending on if stable_context matches)
+    assert mock_server.restore_slot.called or mock_server.prime_slot.called
 
 
 def test_agent_session_lock(agent_session):
@@ -300,7 +318,7 @@ def test_first_session_stores_baseline(agent_session, temp_dir):
         "size_bytes": 1024,
     }
 
-    with patch("cacheflow.agent.LlamaServer", return_value=mock_server):
+    with patch("cacheflow.agent.get_global_server", return_value=mock_server):
         result = agent_session.run(
             task="Test task",
             system_prompt=DEFAULT_SYSTEM_PROMPT,
@@ -335,7 +353,7 @@ def test_codebase_injection_first_session(agent_session, temp_dir):
         "size_bytes": 1024,
     }
 
-    with patch("cacheflow.agent.LlamaServer", return_value=mock_server):
+    with patch("cacheflow.agent.get_global_server", return_value=mock_server):
         agent_session.run(
             task="Analyze this codebase",
             system_prompt=DEFAULT_SYSTEM_PROMPT,

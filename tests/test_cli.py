@@ -143,7 +143,7 @@ class TestRunCommand:
             "size_bytes": 1024,
         }
 
-        with patch("cacheflow.agent.LlamaServer", return_value=mock_server):
+        with patch("cacheflow.agent.get_global_server", return_value=mock_server):
             result = runner.invoke(
                 cli,
                 ["run", "Test task", "--agent", "test-agent", "--base-path", str(temp_dir)],
@@ -175,7 +175,7 @@ class TestRunCommand:
             "size_bytes": 1024,
         }
 
-        with patch("cacheflow.agent.LlamaServer", return_value=mock_server):
+        with patch("cacheflow.agent.get_global_server", return_value=mock_server):
             result = runner.invoke(
                 cli,
                 [
@@ -399,7 +399,7 @@ class TestRunCommandWithAgent:
             "size_bytes": 1024,
         }
 
-        with patch("cacheflow.agent.LlamaServer", return_value=mock_server):
+        with patch("cacheflow.agent.get_global_server", return_value=mock_server):
             result = runner.invoke(
                 cli,
                 [
