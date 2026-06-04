@@ -1,9 +1,9 @@
 Loading model: /path/to/model.gguf
 Traceback (most recent call last):
-  File "/Users/agastya/Desktop/agentgit/cacheflow/llama_server_custom.py", line 276, in <module>
+  File "/Users/agastya/Desktop/agentgit/cacheflow/llama_server_custom.py", line 319, in <module>
     server = CustomLlamaServer(model_path, ctx_size, slot_save_path=slot_save_path, port=port)
              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/agastya/Desktop/agentgit/cacheflow/llama_server_custom.py", line 46, in __init__
+  File "/Users/agastya/Desktop/agentgit/cacheflow/llama_server_custom.py", line 48, in __init__
     self.model = Llama(
                  ^^^^^^
   File "/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/site-packages/llama_cpp/llama.py", line 377, in __init__

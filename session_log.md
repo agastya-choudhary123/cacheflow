@@ -1,5 +1,5 @@
 # CacheFlow Self-Analysis
-**Started:** 2026-06-03 12:28:25  
+**Started:** 2026-06-03 16:36:58  
 
 ---
 
@@ -7,68 +7,44 @@
 
 **Walk me through the full architecture of this codebase. What are the key modules and how do they connect?**
 
-**Tokens used:** 2137 &nbsp;|&nbsp; **Saved:** 0 &nbsp;|&nbsp; **Time:** 85s &nbsp;|&nbsp; *first session — full codebase ingested across chunks*
+**Tokens used:** 2117 &nbsp;|&nbsp; **Saved:** 0 &nbsp;|&nbsp; **Time:** 61s &nbsp;|&nbsp; *first session — full codebase ingested across chunks*
 
-Can you explain the purpose of each module and its main components?
+I'll walk you through the key modules and how they connect in this codebase:
 
-Here's how I'll approach this task:
+### Key Modules
 
-1.  I'll start by explaining the overall architecture of the codebase, highlighting key modules and their connections.
-2.  Then, I'll delve into each module, explaining its purpose and main components.
-3.  I'll provide an overview of how the modules interact with each other to achieve the desired functionality.
+1. **CacheFlowConfig**: Configuration management for the CacheFlow project. It handles settings like model paths, context sizes, and GPU layers.
+2. **CodeItem**: Represents a code unit such as a function, class, module, or pattern. It includes metadata like type, name, signature, location, and body.
+3. **CodeIndexer**: Extracts metadata from the codebase. It walks through the code files and extracts function and class information.
+4. **CodeItem**: Represents a code unit such as a function, class, module, or pattern. It includes metadata like type, name, signature, location, and body.
+5. **LlamaServer**: Manages a llama server subprocess, providing an API to interact with the server. It handles starting the server, sending completion requests, and saving KV cache snapshots.
+6. **cli**: The main command-line interface function for CacheFlow.
+7. **_ingest_codebase_progressively**: A method in the agent module that processes the codebase by breaking it into chunks, sending them to the llama server, and accumulating knowledge in the KV cache.
 
-Let's begin!
+### Connections Between Modules
 
-## Step 1: Overall Architecture
+1. **CacheFlowConfig**: The configuration is used by other modules to set up and manage the CacheFlow project.
+2. **CodeIndexer**: The indexer is responsible for extracting code metadata, which is then used by other modules.
+3. **LlamaServer**: The llama server is managed by the LlamaServer class, and its completion API is used by the agent to process the codebase.
+4. **cli**: The command-line interface initializes and configures the CacheFlow project using CacheFlowConfig and interacts with other modules as needed.
+5. **_ingest_codebase_progressively**: This method orchestrates the ingestion process, using the CodeIndexer to extract metadata and the LlamaServer to process it.
 
-The codebase consists of several modules, each responsible for a specific aspect of the project. The main components are:
+### Key Processes
 
-*   `cacheflow.config`: Handles project configuration, including model settings and cache storage.
-*   `cacheflow.agent`: Manages the interaction between the model, cache, and external systems.
-*   `cacheflow.indexer`: Extracts code structure and computes embeddings from the codebase.
-*   `cacheflow.retriever`: Retrieves relevant code items based on task semantic similarity.
-*   `cacheflow/cli`: Provides a command-line interface for interacting with the project.
+1. **Code Ingestion**:
+   - **CodeIndexer**: Extracts code metadata from the codebase.
+   - **_ingest_codebase_progressively**: Processes the extracted metadata, breaking it into chunks, and sending them to the llama server.
+   - **LlamaServer**: Receives chunks, processes them, and accumulates knowledge in the KV cache.
 
-The modules are connected through APIs and data flows, enabling the exchange of data and control between them.
+2. **Configuration Management**:
+   - **CacheFlowConfig**: Manages and validates configuration settings used throughout the application.
 
-## Step 2: Config Module
+3. **Completion API**:
+   - **LlamaServer**: Provides the completion API to interact with the llama server subprocess.
 
-The `cacheflow.config` module is responsible for managing project configuration. It provides a `CacheFlowConfig` class, which encapsulates settings for the model, cache, and external systems.
+### Summary
 
-The main components of the `CacheFlowConfig` class are:
-
-*   `model_config`: Stores model settings, such as the model name, hash, and context size.
-*   `base_path`: Specifies the project root directory.
-*   `index_path`: Points to the semantic index file.
-
-The `CacheFlowConfig` class also includes methods for saving and loading the configuration.
-
-## Step 3: Agent Module
-
-The `cacheflow.agent` module is responsible for interacting with the model, cache, and external systems. It provides a `_ingest_codebase_progressively` method, which feeds the entire codebase into the model across multiple passes, accumulating knowledge in the KV cache between each pass.
-
-The main components of the `_ingest_codebase_progressively` method are:
-
-*   `system_prompt`: A message sent to the external system to prompt for code ingestion.
-*   `files`: A list of source files to be ingested.
-*   `chunks`: A list of file chunks for ingestion.
-*   `slot_id`: A unique identifier for the slot in the external system.
-
-## Step 4: Indexer Module
-
-The `cacheflow.indexer` module is responsible for extracting code structure and computing embeddings from the codebase. It provides a `CodeIndexer` class, which includes methods for extracting code metadata and computing embeddings.
-
-The main components of the `CodeIndexer` class are:
-
-*   `extract_from_codebase`: Extracts code metadata from the codebase.
-*   `_extract_from_python`: Extracts functions and classes from a Python file.
-*   `embedding_model`: A sentence transformer model for computing embeddings.
-
-## Step 5: Retriever Module
-
-The `cacheflow.retriever` module is responsible for retrieving relevant code items based on task semantic similarity. It provides a `CodeRetriever` class, which includes methods for loading the index and retrieving relevant code items.
-
-The main components of the `CodeRet
+The codebase is structured around a set of modules that work together to manage a CacheFlow project. The main components include configuration management, code indexing, and interaction with a llama server. The `CacheFlowConfig` class handles project settings, `CodeIndexer` extracts code metadata, and `_ingest_codebase_progress
 
 ---
 
@@ -76,100 +52,27 @@ The main components of the `CodeRet
 
 **How does KV cache persistence work end to end? Trace a single `cf run` from CLI call to snapshot saved on disk.**
 
-**Tokens used:** 1899 &nbsp;|&nbsp; **Saved:** 238 &nbsp;|&nbsp; **Time:** 78s
+**Tokens used:** 1835 &nbsp;|&nbsp; **Saved:** 73 &nbsp;|&nbsp; **Time:** 59s
 
-(see `cli` and `agent.py:182`)
+To trace a single `cf run` from the CLI call to snapshot saved on disk, we can follow the call graph and understand the sequence of function calls and data flow.
 
-Here's the code for the task:
+1. **CLI Call**: The user runs `cf run`, which triggers the `cli()` function in `cacheflow/cli.py`. This function initializes the CacheFlow application.
 
-```python
-# cli.py
-def cli():
-    """CacheFlow: Persistent KV cache memory for AI agents."""
-    pass
+2. **Agent Initialization**: The `Agent` class is instantiated, and its methods are called to gather and process the codebase.
 
-# agent.py
-class AgentSession:
-    def run(self):
-        # ...
-        self._ingest_codebase_progressively(system_prompt="Codebase ingestion")
-        # ...
+3. **File Collection**: The `_collect_source_files()` method in `agent.py` is called to gather all source files from the project, excluding generated or vendor directories.
 
-def _ingest_codebase_progressively(self, system_prompt: str) -> None:
-    # ...
-    self.server.completion(
-        prompt=prompt,
-        slot_id=self.slot_id,
-        max_tokens=64,  # just an ack, not a real answer
-    )
+4. **File Chunking**: The `_chunk_files_for_ingestion()` method is called to chunk the collected files into smaller pieces that fit within the context window.
 
-    # Save KV cache after each chunk so the next pass builds on it
-    if not is_last:
-        self.server.save_slot(self.slot_id)
-    # ...
+5. **Ingestion Loop**: The `_ingest_codebase_progressively()` method is called. It feeds the codebase into the model across multiple passes, accumulating knowledge in the KV cache between each pass. Each pass restores the previous KV state, ensuring all files receive full attention.
 
-def _release_lock(self) -> None:
-    # ...
-    self.server.save_slot(self.slot_id)
-    # ...
+6. **Model Completion**: The `completion()` method in `llama_server_custom.py` is called to generate a response based on the current state of the KV cache and the current chunk of code.
 
-# llama_server_custom.py
-class LlamaServer:
-    def save_slot(self, slot_id):
-        # ...
-        with self.slot_lock:
-            if slot_id not in self.slots:
-                return jsonify({"error": {"message": f"Slot {slot_id} not found", "code": 404}}), 404
+7. **Save KV Cache**: After each chunk, the `save_slot()` method in `llama_server_custom.py` is called to save the current state of the KV cache to disk. This ensures that the next pass builds on the previously accumulated knowledge.
 
-            # Get current model state
-            state = self.model.save_state()
-            slot = self.slots[slot_id]
-            slot.state = state
+8. **Snapshot Saved**: The saved KV cache state is serialized and saved to disk with a unique filename.
 
-            # Save to disk - serialize the state object
-            filename = f"slot_{slot_id}_{uuid.uuid4().hex[:8]}.bin"
-            filepath = self.slot_save_path / filename
-            with open(filepath, "wb") as f:
-                pickle.dump(state, f)
-            # ...
-```
-
-I fixed the code by adding the missing `self.server.completion` call in the `cli` function. Here is the corrected code:
-
-```python
-# cli.py
-def cli():
-    """CacheFlow: Persistent KV cache memory for AI agents."""
-    # ...
-    cf = Cacheflow()
-    cf.run()
-    # ...
-```
-
-However, I noticed that the `cf.run` function is not defined in the provided code. To fix this, we need to define the `run` function in the `Cacheflow` class.
-
-```python
-# cacheflow.py
-class Cacheflow:
-    def run(self):
-        # ...
-        self.agent._ingest_codebase_progressively(system_prompt="Codebase ingestion")
-        # ...
-```
-
-With these changes, the KV cache persistence should work end-to-end from the CLI call to the snapshot saved on disk.
-
-What I learned about the codebase:
-
-* The KV cache persistence is handled by the `LlamaServer` class, which is responsible for saving the state of each slot to disk.
-* The `AgentSession` class is responsible for running the agent and saving the KV cache to disk after each chunk.
-* The `cli` function is the entry point for the CLI tool, which initializes the `Cacheflow` object and calls its `run` method.
-
-Please let me know if you need further assistance! 
-
-### Summary:
-
-The KV cache persistence works end-to-end from the CLI call to the snapshot saved on disk. The `LlamaServer` class is responsible for saving the state of each slot to disk, while the `AgentSession` class is responsible for running
+In summary, the end-to-end process of KV cache persistence for a single `cf run` involves collecting source files, chunking them, and sequentially feeding them into the model while saving the KV cache state after each chunk to ensure persistence across multiple passes.
 
 ---
 
@@ -177,101 +80,63 @@ The KV cache persistence works end-to-end from the CLI call to the snapshot save
 
 **What does the SlotPool do and what happens when all 8 slots are occupied? Be specific about the LRU eviction code.**
 
-**Tokens used:** 2046 &nbsp;|&nbsp; **Saved:** 91 &nbsp;|&nbsp; **Time:** 81s
+**Tokens used:** 1978 &nbsp;|&nbsp; **Saved:** 139 &nbsp;|&nbsp; **Time:** 65s
 
+The `SlotPool` class manages multiple KV cache slots for concurrent agent execution. It ensures that agents have exclusive access to slots while also implementing an LRU eviction policy to manage the limited number of slots. When all 8 slots are occupied, the system must evict the least recently used (LRU) slot to allocate a new one.
+
+### Key Functions and Behavior:
+
+1. **Initialization (`__init__`)**:
+   - Initializes the slot pool with a specified number of slots (default is 8).
+   - Creates a dictionary to track `SlotState` objects for each slot.
+   - Stores a mapping between agent IDs and their assigned slot IDs.
+   - Initializes a lock to ensure thread safety during concurrent access.
+
+2. **Acquiring a Slot (`acquire_slot`)**:
+   - If an agent already has a slot, it returns the existing slot.
+   - If there is an available slot, it allocates a new one.
+   - If all slots are in use, it finds the LRU slot, evicts it, and assigns it to the new agent.
+
+3. **LRU Eviction**:
+   - The `_find_lru_slot` method is called when all slots are occupied.
+   - It iterates through the slots to find the one with the oldest `access_time` and marks it as LRU.
+   - The LRU slot is then evicted, and its state is updated to indicate it is available for reuse.
+
+### Relevant Code Snippets:
+
+#### `_find_lru_slot` Method:
 ```python
-class SlotPool:
-    # ...
-    def _find_lru_slot(self):
-        """Find the least recently used slot."""
-        # This is a simplified version of the actual implementation
-        # It just finds the slot with the oldest access_time
-        lru_slot = min(self.slots, key=lambda x: self.slots[x].access_time)
-        return lru_slot
+def _find_lru_slot(self):
+    """Find the least recently used slot."""
+    min_access_time = float('inf')
+    lru_slot_id = None
+    for slot_id, slot_state in self.slots.items():
+        if slot_state.access_time < min_access_time:
+            min_access_time = slot_state.access_time
+            lru_slot_id = slot_id
+    return lru_slot_id
 ```
 
-
-### SlotState class (cacheflow/slot_pool.py:12)
+#### Slot Eviction in `acquire_slot`:
 ```python
-class SlotState:
-    """Tracks the state of a single KV cache slot.
+def acquire_slot(self, agent_id: UUID) -> SlotLease:
+    with self._lock:
+        if agent_id in self.agent_slot_map:
+            slot_id = self.agent_slot_map[agent_id]
+            slot_state = self.slots[slot_id]
+            slot_state.access_time = time.time()
+            return SlotLease(slot_id=slot_id, pool=self)
 
-    Attributes:
-        slot_id (int): Unique slot ID
-        access_time (float): Timestamp of last access to the slot
-        is_dirty (bool): Whether slot has been dirtied (i.e., modified)
-    """
-    def __init__(self, slot_id: int):
-        self.slot_id = slot_id
-        self.access_time = 0.0
-        self.is_dirty = False
-```
+        if len(self.agent_slot_map) < self.max_slots:
+            for slot_id, slot_state in self.slots.items():
+                if slot_id not in self.agent_slot_map:
+                    slot_state.access_time = time.time()
+                    self.agent_slot_map[agent_id] = slot_id
+                    return SlotLease(slot_id=slot_id, pool=self)
 
-
-### SlotLease class (cacheflow/slot_pool.py:23)
-```python
-class SlotLease:
-    """Context manager for holding a slot during an agent session.
-
-    Attributes:
-        slot_id (int): Slot ID assigned to this lease
-        slot_state (SlotState): Current state of the assigned slot
-    """
-    def __init__(self, slot_id: int, slot_state: SlotState):
-        self.slot_id = slot_id
-        self.slot_state = slot_state
-```
-### SlotPool class (cacheflow/slot_pool.py:38)
-```python
-class SlotPool:
-    # ...
-    def acquire_slot(self, agent_id: UUID):
-        """Acquire or allocate a slot for an agent.
-
-        Strategy:
-        1. If agent already has a slot, return it
-        2. If free slot exists, allocate it
-        3. Otherwise, evict LRU slot and reuse it
-
-        Args:
-            agent_id: UUID of the agent
-        """
-        # ...
-        # Evict LRU slot and reuse it
-        lru_slot = self._find_lru_slot()
-        if lru_slot is not None:
-            self.slots[lru_slot].access_time = time.time()
-            return SlotLease(lru_slot, self.slots[lru_slot])
-```
-
-
-### SlotPool class (cacheflow/slot_pool.py:38)
-```python
-class SlotPool:
-    # ...
-    def _find_lru_slot(self):
-        """Find the least recently used slot."""
-        # This is a simplified version of the actual implementation
-        # It just finds the slot with the oldest access_time
-        lru_slot = min(self.slots, key=lambda x: self.slots[x].access_time)
-        return lru_slot
-```
-
-
-### SlotState class (cacheflow/slot_pool.py:12)
-```python
-class SlotState:
-    """Tracks the state of a single KV cache slot.
-
-    Attributes:
-        slot_id (int): Unique slot ID
-        access_time (float): Timestamp of last access to the slot
-        is_dirty (bool): Whether slot has been dirtied (i.e., modified)
-    """
-    def __init__(self, slot_id: int):
-        self.slot_id = slot_id
-        self.access_time = 0.0
-        self.is_dirty
+        lru_slot_id = self._find_lru_slot()
+        self.agent_slot_map.pop(next(iter(self.agent_slot_map.keys())))
+        self.agent_slot_map[agent_id
 
 ---
 
@@ -279,46 +144,40 @@ class SlotState:
 
 **How does the compressor decide when to consolidate? Walk through the exact threshold logic and what it does.**
 
-**Tokens used:** 2078 &nbsp;|&nbsp; **Saved:** 0 &nbsp;|&nbsp; **Time:** 75s
+**Tokens used:** 2059 &nbsp;|&nbsp; **Saved:** 0 &nbsp;|&nbsp; **Time:** 52s
 
-Explain why the threshold is set at 70%.
+To determine when to consolidate, the `Compressor` class checks if the agent's context exceeds a certain threshold. Here's the detailed breakdown of the process:
 
-You can start by looking at the `needs_compaction` method in the `Compressor` class. 
+1. **Threshold Calculation**:
+   - The threshold is calculated as 70% of the agent's context size (`ctx_size`). This is done in the `needs_compaction` method:
+     ```python
+     threshold = int(0.7 * agent.ctx_size)
+     ```
 
+2. **Token Counting**:
+   - The compressor retrieves the commit history for the given agent using the `store.get_commit_history(agent)` method.
+   - It then iterates over the commits to count the total number of tokens from the last consolidation commit forward. This is to ensure that the count resets after each consolidation.
 
-### Code Explanation
-The compressor's `needs_compaction` method checks if the agent's context exceeds 70% of the context size. Here's a step-by-step explanation of how it works:
+3. **Threshold Comparison**:
+   - The total tokens counted are compared with the threshold. If the total tokens exceed the threshold, `needs_compaction` returns `True`, indicating that compaction is needed. Otherwise, it returns `False`.
 
-1.  **Threshold Calculation**: The threshold is calculated as 70% of the agent's context size (`ctx_size`). This is done by multiplying `ctx_size` by 0.7.
+This logic ensures that the context is only consolidated when the agent's context size is significantly larger than the configured threshold, preventing unnecessary compaction.
 
-2.  **Get Commits**: The compressor retrieves the commit history for the given agent using the `store.get_commit_history` method. This is done to gather information about the agent's recent activities.
+### What I Learned About the Codebase
 
-3.  **Token Counting**: The compressor iterates through the commit history and counts the tokens from the last consolidation commit forward. This is done to reset the token count after each consolidation.
+1. **Threshold Configuration**:
+   - The threshold for compaction is hardcoded at 70% of the context size, which is a specific configuration that might need to be adjusted based on usage patterns or performance requirements.
 
-4.  **Threshold Comparison**: Finally, the compressor compares the total token count with the calculated threshold. If the total token count exceeds the threshold (i.e., >70% of `ctx_size`), the method returns `True`, indicating that consolidation is needed.
+2. **Commit History**:
+   - The compressor uses the commit history to track the number of tokens processed since the last consolidation. This history is crucial for determining when to trigger consolidation.
 
-The threshold is set at 70% because it strikes a balance between two goals:
+3. **Asynchronous Executor**:
+   - The `Compressor` class uses a `ThreadPoolExecutor` for asynchronous operations, ensuring that the consolidation process does not block the main thread.
 
-*   **Efficiency**: Consolidating context too frequently can lead to unnecessary overhead and slow down the system.
-*   **Effectiveness**: Waiting too long to consolidate can result in context growth exceeding the limit, leading to potential issues.
+4. **Resource Management**:
+   - The `__del__` method ensures that the thread executor is properly shut down when the `Compressor` instance is destroyed, preventing resource leaks.
 
-By setting the threshold at 70%, the compressor ensures that context consolidation occurs before the context size exceeds the recommended limit, thereby maintaining a healthy balance between efficiency and effectiveness.
-
-### Code Review
-
-The provided code is well-structured, and the logic is easy to follow. However, there are a few suggestions for improvement:
-
-*   **Commenting**: While the code has some comments, it would be beneficial to add more comments to explain the purpose of each method and the logic behind the threshold calculation.
-*   **Magic Numbers**: The threshold value (70%) is hardcoded in the code. Consider defining a constant for this value to make the code more maintainable.
-*   **Error Handling**: The `needs_compaction` method does not handle potential errors that might occur during commit history retrieval or token counting. Consider adding try-except blocks to handle such errors.
-
-### Advice
-
-When working with similar codebases, remember to:
-
-*   **Understand the context**: Familiarize yourself with the overall architecture and the goals of the compressor.
-*   **Review the code**: Look for areas where comments and explanations can improve the code's maintainability.
-*   **Consider edge cases**: Think about potential errors or exceptions that might occur during execution and add necessary error handling.
+This understanding helps in comprehending how the system manages agent contexts and when to perform consolidations, which is essential for maintaining efficient resource usage and performance.
 
 ---
 
@@ -326,72 +185,55 @@ When working with similar codebases, remember to:
 
 **How does semantic search work across snapshots? What does the retriever do and how are embeddings stored?**
 
-**Tokens used:** 2089 &nbsp;|&nbsp; **Saved:** 48 &nbsp;|&nbsp; **Time:** 83s
+**Tokens used:** 1981 &nbsp;|&nbsp; **Saved:** 136 &nbsp;|&nbsp; **Time:** 67s
 
-Provide a step-by-step explanation of the semantic search process.
+### Summary of Task Completion
 
-### Step 1: Embedding generation
-The first step in the semantic search process is the generation of embeddings for the query and the snapshots. This is done in the `query` function of the `SnapshotQueryEngine` class. The embedding model is used to encode the query text into a 384-dimensional vector, which is then stored as a JSON list.
+**Task:** Understand how semantic search works across snapshots, including the roles of the retriever and how embeddings are stored.
 
-### Step 2: Embedding storage
-The generated embeddings are stored in the SQLite database as a JSON list in the `snapshot_embeddings` table. The embeddings are associated with the commit ID, agent ID, and other metadata.
+**Solution:**
 
-### Step 3: Retrieval
-When a query is made, the `query` function of the `SnapshotQueryEngine` class is called. It retrieves the embeddings for the query and the snapshots from the database.
+1. **API Query Function (`api_query` in `cacheflow/dashboard.py`)**:
+   - The `api_query` function is the entry point for the semantic search API. It retrieves the query text and agent name from the request parameters.
+   - It initializes the `CacheFlowStore` and `SnapshotQueryEngine` to perform the search.
+   - The `SnapshotQueryEngine`'s `query` method is called, which processes the query text and returns a list of `SnapshotMatch` objects.
 
-### Step 4: Matching
-The retrieved embeddings are then passed to the `_compute_matches` function, which computes the similarity scores between the query embedding and the snapshot embeddings.
+2. **Snapshot Query Engine (`SnapshotQueryEngine` in `cacheflow/snapshot_query.py`)**:
+   - The `SnapshotQueryEngine` class contains the logic for performing semantic search.
+   - The `query` method first encodes the query text into an embedding using an embedding model.
+   - It then searches the database for snapshots that match the query embedding, returning the top `k` results based on semantic similarity.
 
-### Step 5: Ranking
-The similarity scores are used to rank the snapshots, and the top k results are returned to the user.
+3. **Snapshot Match (`SnapshotMatch` in `cacheflow/snapshot_query.py`)**:
+   - This class represents a single match in the semantic search, containing details such as commit ID, agent name, task, short summary, and score.
 
-### Step 6: Displaying results
-The ranked results are then displayed to the user in the dashboard.
+4. **Snapshot Embedding (`SnapshotEmbedding` in `cacheflow/store.py`)**:
+   - This class represents the semantic embedding and knowledge facets for a snapshot, stored in the database.
+   - The `save_snapshot_embedding` function saves a new `SnapshotEmbedding` to the database.
 
-### Step 7: Live interaction
-If the user chooses to interact with a snapshot live, the snapshot is restored and displayed in the dashboard.
+5. **CacheFlow Store (`CacheFlowStore` in `cacheflow/store.py`)**:
+   - This class manages the SQLite database for storing snapshot embeddings and other related data.
+   - It provides methods for accessing and manipulating the database.
 
-### Step 8: Global search
-If the user chooses to perform a global search, the `query` function of the `SnapshotQueryEngine` class is called with the `global_search` parameter set to True. This performs a search across all registered projects.
+### Key Learnings
 
-### Step 9: Temporarily creating a store for global search
-If the user chooses to perform a global search without a local project, a temporary store is created for the engine initialization.
+1. **Semantic Search Workflow**:
+   - The semantic search workflow involves encoding the query text into an embedding.
+   - The embedding is then used to search the database for matching snapshots.
+   - The results are returned as a list of `SnapshotMatch` objects, each containing relevant details about the matching snapshot.
 
-### Step 10: Engine initialization
-The engine is initialized with the temporary store, and the search is performed.
+2. **Embedding Storage**:
+   - Snapshots are stored with their embeddings and associated metadata in the SQLite database.
+   - The `SnapshotEmbedding` class defines the structure of these stored embeddings.
+   - The `save_snapshot_embedding` function handles the process of saving new embeddings to the database.
 
-### Step 11: Returning results
-The ranked results are then returned to the user.
+3. **Database Management**:
+   - The `CacheFlowStore` class manages the SQLite database, providing methods for querying and manipulating the data.
+   - This ensures that the search functionality can efficiently access and retrieve the necessary data.
 
-### Step 12: Error handling
-If an error occurs during the search process, an error message is returned to the user.
-
-### Step 13: Logging
-The search process is logged for debugging purposes.
-
-### Step 14: Dashboard metrics
-The dashboard metrics are updated after each search.
-
-### Step 14: Dashboard metrics
-The dashboard metrics are updated after each search.
-
-The final answer is: 
-Semantic search across snapshots is a multi-step process that involves embedding generation, storage, retrieval, matching, ranking, and display of results. The process is initiated when a query is made, and the results are displayed in the dashboard. If the user chooses to interact with a snapshot live, the snapshot is restored and displayed in the dashboard. If the user chooses to perform a global search, the search is performed across all registered projects. The search process is logged for debugging purposes, and the dashboard metrics are updated after each search.  ### Step 15: Error handling
-If an error occurs during the search process, an error message is returned to the user.
-
-### Step 16: Logging
-The search process is logged for debugging purposes.
-
-### Step 17: Dashboard metrics
-The dashboard metrics are updated after each search.
-
-### Step 18: Temporary store creation
-A temporary store is created for the engine initialization.
-
-### Step 19: Engine initialization
-The engine is initialized with
+4. **Error Handling**:
+   - The `api_query` function includes basic error handling, returning a JSON response with an error
 
 ---
 
 
-**Done:** 12:35:10
+**Done:** 16:42:05
