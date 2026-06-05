@@ -8,9 +8,9 @@ Coding agents re-analyze your codebase from scratch in every session, burning to
 
 ## How It Works
 
-CacheFlow wraps llama.cpp's KV cache slot save/restore API and adds git-style versioning on top. Each agent run persists the model's KV cache as a snapshot. The next run restores it instead of re-ingesting.
+CacheFlow uses llama-cpp-python's native KV cache state serialization to save and restore the model's learned knowledge across sessions. Each agent run persists the KV cache state as a snapshot. The next run restores it instead of re-ingesting the codebase.
 
-**Real-world token cost (16384 context window):**
+**Real-world token cost (8192 context window):**
 
 | Session | Tokens Used | Tokens Saved | Savings |
 |---------|-------------|--------------|---------|
@@ -174,7 +174,7 @@ cf dashboard [--port PORT]
 
 ### KV Cache Persistence Architecture
 
-CacheFlow's core innovation is **prefix-matching KV cache reuse**. The stable codebase prefix is computed once, saved to the KV cache, and restored for every subsequent session. Only the new task tokens are evaluated.
+CacheFlow's core innovation is **prefix-matching KV cache reuse**. The stable codebase prefix is computed once, serialized to disk via llama-cpp-python's state save mechanism, and restored for every subsequent session. Only the new task tokens are evaluated.
 
 **Session 1 flow:**
 1. Prime slot: Evaluate `system_prompt + codebase` (N tokens), populating the KV cache
@@ -191,21 +191,34 @@ CacheFlow's core innovation is **prefix-matching KV cache reuse**. The stable co
 
 The stable prefix is stored on the agent as `stable_context` — if the codebase changes, a new prefix is computed and the KV cache is re-primed from scratch. This prevents silent breakage where stale bytes don't match the snapshot.
 
+### Stable Context & Change Detection
+
+**`stable_context`** = system prompt + codebase (chunked by `CodeRetriever` semantic RAG)
+
+When an agent runs:
+
+1. **Compute hash** of stable_context
+2. **Load agent's HEAD snapshot metadata** (stores previous hash)
+3. **If hash changed** → codebase was modified → erase old KV, re-prime from scratch
+4. **Else** → prefix-match cached stable_context, only eval new task tokens
+
+This automatic detection prevents silent breakage where stale cached knowledge doesn't match updated code.
+
 ### Multi-Slot KV Cache Management
 
-CacheFlow uses llama.cpp's multi-slot API to enable concurrent agent execution:
+CacheFlow manages multiple KV cache slots within a single model instance to enable concurrent agent execution:
 
 - Each agent gets an independent KV cache slot
-- Up to 8 concurrent agents (typical llama.cpp limit)
+- Up to 8 concurrent agents (limited by llama-cpp-python architecture)
 - Least-recently-used slot evicted when pool is full
 - All agents share a single model instance in memory
-- Context size: 16384 tokens per slot
+- Default context size: 8192 tokens per slot (configurable at init time)
 
 ### DAG + Consolidation
 
 A SQLite database tracks commits as a DAG (Directed Acyclic Graph). Each commit points to its parent; forks create branches.
 
-When an agent's accumulated token count exceeds **70% of context_size (11,468 tokens)**, background consolidation triggers:
+When an agent's accumulated token count exceeds **70% of context_size** (e.g., ~5,734 tokens for 8192 default), background consolidation triggers:
 
 1. Restore agent's HEAD snapshot
 2. Ask model to produce a dense knowledge summary (500 tokens)
@@ -216,17 +229,17 @@ When an agent's accumulated token count exceeds **70% of context_size (11,468 to
 
 This resets the accumulator without losing learned information. Consolidation runs asynchronously in a background thread, never blocking the agent.
 
-### Snapshot Immutability
+### Snapshot Immutability & Naming
 
-Each snapshot is named by SHA256 hash of its binary contents (content-addressing). A commit stores:
+Each snapshot is named by its commit UUID (e.g., `{commit-id}.bin`). A commit record stores:
 - Snapshot file path (named by commit ID)
 - Token usage (prompt tokens, completion tokens)
 - Tokens saved (vs. re-ingestion baseline)
 - Model hash (prevents cross-model snapshots)
-- llama.cpp version
+- llama-cpp-python version
 - Save/restore timings
 
-Snapshots are saved to disk only after the DB transaction succeeds (atomic commit). If the process crashes mid-save, recovery is possible because the temp file is renamed post-transaction.
+Snapshots are saved to disk asynchronously via a thread pool. The database transaction is committed only after the snapshot is written to avoid corruption. If the process crashes mid-save, the incomplete snapshot file is left on disk (temp file naming convention: `.tmp_{uuid}.bin`) and can be cleaned up safely.
 
 ## Architecture Diagram
 
@@ -267,13 +280,13 @@ Snapshots are saved to disk only after the DB transaction succeeds (atomic commi
 1. CLI → AgentSession.run() [multiple agents in parallel via threads]
 2. SlotPool allocates or reuses a slot for the agent (or evicts LRU)
 3. AgentSession computes stable prefix (system + codebase)
-4. Prime slot: LlamaServer evaluates stable prefix in agent's slot
-5. Save snapshot: KV cache persisted to disk
-6. Complete: LlamaServer runs task completion; llama-cpp-python prefix-matches stable prefix (cached), evaluates task suffix only
-7. CacheFlowStore creates commit record (SHA256 of snapshot) per agent
+4. Prime slot: Model evaluates stable prefix in agent's slot
+5. Save snapshot: KV cache state serialized to disk (async via thread pool)
+6. Complete: Task completion via prefix-matching; llama-cpp-python detects cached prefix, evaluates task suffix only
+7. CacheFlowStore creates immutable commit record (UUID-based) per agent
 8. Knowledge probing indexes what model learned in this session
 9. Background compressor monitors token accumulation per agent
-10. At 70% threshold (11,468 tokens), consolidation triggers asynchronously
+10. At 70% threshold of context_size, consolidation triggers asynchronously
 
 ## Project Structure
 
@@ -297,12 +310,67 @@ cacheflow/
 ├── MULTI_AGENT_DESIGN.md      # Multi-agent architecture details
 ├── IMPLEMENTATION_SUMMARY.md  # Implementation specifics
 └── .cacheflow/         # Created at runtime per project
-    ├── config.json     # Model hash, ctx_size (16384), GPU layers
+    ├── config.json     # Model hash, ctx_size (default 8192), GPU layers
     ├── agents.db       # SQLite: agents, commits, sessions (WAL mode)
-    ├── snapshots/      # KV cache .bin files (named by commit ID)
+    ├── snapshots/      # KV cache state .bin files (named by commit ID UUID)
     ├── index.json      # Semantic index of codebase
-    └── server.log      # llama-server output
+    └── server.log      # llama-cpp-python server output
 ```
+
+## MCP Server Integration
+
+CacheFlow provides an **MCP (Model Context Protocol) server** that wraps its REST API as tools, enabling Claude Code, Cursor, Copilot, and other AI tools to query snapshots and access cached knowledge without leaving your IDE.
+
+### Available MCP Tools
+
+- `run_agent_task` — Run a task with a CacheFlow agent, using cached KV state if available
+- `query_snapshots` — Semantically search snapshots across an agent's knowledge base
+- `get_snapshot_summary` — Get short summary and faceted knowledge for a snapshot
+- `get_dashboard_data` — Get overall metrics, agent stats, session history, and snapshots
+- `get_agent_dag` — Get the commit DAG showing an agent's evolution
+- `list_agents` — List all agents and their stats
+
+### Starting the MCP Server
+
+```bash
+cf dashboard                    # Start dashboard (optional, default port 8080)
+cf mcp-server                   # Start MCP server (default dashboard: http://127.0.0.1:8080)
+cf mcp-server --dashboard-url http://custom.url:9000  # Custom dashboard URL
+```
+
+The MCP server listens on stdin/stdout for the stdio transport protocol, making it easy to integrate with IDEs and AI tools via configuration files (e.g., `cline_mcp_config.json` for Cline, `claude_config.json` for Claude Code).
+
+## Design Patterns & Key Decisions
+
+### Immutable Snapshots (UUID-Named)
+- Snapshots named by commit UUID (e.g., `{commit-id}.bin`)
+- Commit records store snapshot file path + metadata (tokens, timings, model hash)
+- Prevents accidental overwrites; unique identity per commit ensures no collisions
+
+### No Slot Eviction During Session
+- Agent acquires slot with `SlotLease` context manager (`__enter__/__exit__`)
+- Even if LRU eviction runs in background, active agent's slot is not evicted
+- LRU only evicts slots whose agents are not currently running
+
+### Atomic Commit & Rename
+- Snapshot is saved to temp file (e.g., `.tmp_{uuid}.bin`)
+- Commit record created in DB transaction with temp file path
+- After transaction succeeds, temp file is atomically renamed to final name (`{commit-id}.bin`)
+- If process crashes mid-save, orphaned temp files can be safely cleaned up
+
+### Context Size Immutability
+- Context size locked in config at init time (`config.json`)
+- Prevents silent snapshot/restore mismatches from context reconfigurations
+
+### Global Server Singleton + Per-Agent Slots
+- `get_global_server()` returns persistent LlamaServer instance (started on first use)
+- Multiple agents don't spawn multiple model processes
+- Each agent gets exclusive slot during its session; no contention
+
+### No Agent Rewrites Another Agent's History
+- `agent_slot_map` only used for LRU tracking
+- Each agent has independent commit DAG; commits are immutable
+- Forking is explicit: child points to parent, not the other way around
 
 ## Requirements
 
@@ -310,11 +378,117 @@ cacheflow/
 - llama.cpp (via `brew install llama.cpp`)
 - Qwen2.5-Coder:7b (via `ollama pull qwen2.5-coder:7b`); any llama.cpp-compatible GGUF works, Qwen models get automatic ChatML formatting
 
+## Installation & Development
+
+### From Source
+
+```bash
+# Clone the repository
+git clone https://github.com/anthropics/cacheflow
+cd cacheflow
+
+# Install in development mode with all dependencies
+pip install -e ".[dev]"
+```
+
+### Building the Frontend Dashboard
+
+```bash
+cd frontend
+npm install
+npm run dev      # Dev server at localhost:5173
+npm run build    # Production build
+cd ..
+```
+
+## Testing
+
+CacheFlow has a comprehensive pytest suite covering all core functionality.
+
+### Running Tests
+
+```bash
+pytest tests/                           # Run all tests
+pytest tests/test_agent.py              # Run specific test file
+pytest tests/test_agent.py::test_name   # Run specific test
+pytest -v                               # Verbose output
+pytest -xvs                             # Stop on first failure, verbose, no capture
+```
+
+### Test Structure
+
+- **test_agent.py** — Core session flow, prefix-matching, consolidation
+- **test_cli.py** — CLI commands, initialization, agent management
+- **test_store.py** — SQLite DAG operations, commit records
+- **test_slot_pool.py** — Multi-agent concurrency, LRU eviction
+- **test_compressor.py** — Background consolidation logic
+- **test_rag_integration.py** — Semantic retrieval, indexing
+- **test_multi_agent.py** — Concurrent agents, forking
+- **test_server_smoke.py** — Server subprocess health
+
+### Mocking Patterns
+
+Tests use the following conventions to avoid expensive operations:
+
+- **Mock `get_global_server()`**: Prevents spawning real llama-cpp processes
+- **Mock `CodeRetriever`**: Avoids semantic embeddings during unit tests
+- **`temp_cacheflow_dir` fixture**: Provides isolated project directories
+
+Example:
+```python
+from unittest.mock import patch
+
+@patch('cacheflow.agent.get_global_server')
+def test_something(mock_server):
+    # Your test here
+    pass
+```
+
+## Development Notes
+
+### Thread Safety
+
+- Always import `_DB_INIT_LOCK` when calling `store.init_db()` in new threads
+- SQLite requires explicit locking due to its threading model
+- `SlotLease` is a context manager; always use `with` to ensure cleanup
+
+```python
+from cacheflow.store import _DB_INIT_LOCK, init_db
+
+with _DB_INIT_LOCK:
+    init_db()
+```
+
+### Key Implementation Details
+
+- **Snapshots are large**: Mock them in tests to avoid disk I/O overhead
+- **Prefix-matching is transparent**: llama-cpp-python handles it automatically when prompt prefix matches cached KV
+- **Token counts come from llama-cpp-python**: Never compute manually; use the response metadata
+- **Stable context hash**: Changes trigger automatic re-priming; prevents silent inconsistency
+
+### Key Files to Know
+
+| File | Purpose |
+|------|---------|
+| `cacheflow/cli.py` | Entry point; command registration, model discovery, initialization |
+| `cacheflow/agent.py` | Core `AgentSession.run()` loop (prime → save → complete → commit) |
+| `cacheflow/store.py` | SQLite schema and DAG operations |
+| `cacheflow/server.py` | Singleton llama-server lifecycle management |
+| `cacheflow/slot_pool.py` | Multi-agent slot allocation and LRU eviction |
+| `cacheflow/dashboard.py` | Flask app with REST API and React frontend routes |
+| `cacheflow/mcp_server.py` | MCP server wrapping REST API as stdio transport tools |
+| `cacheflow/compressor.py` | Background consolidation thread |
+| `cacheflow/knowledge_prober.py` | Knowledge facet extraction and indexing |
+| `cacheflow/indexer.py` | Codebase semantic indexing |
+| `cacheflow/retriever.py` | Semantic RAG for follow-up sessions |
+| `frontend/src/App.tsx` | React dashboard UI, DAG visualization, search |
+| `pyproject.toml` | Package metadata, dependencies, CLI entrypoint |
+
 ## Performance Characteristics
 
 **Memory:**
 - Model: ~8 GB (7B Qwen)
-- KV cache per slot: ~2-3 GB (16384 context)
+- KV cache per slot: ~1-2 GB (8192 context, default)
 - SQLite database: ~100 MB per 100 sessions
 
 **Speed:**
