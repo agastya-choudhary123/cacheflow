@@ -17,6 +17,7 @@ dependencies = [
     "llama-cpp-python >= 0.2.0",
     "flask >= 2.3",
     "sentence-transformers >= 2.2",
+    "mcp >= 0.1",
 ]
 
 [project.optional-dependencies]

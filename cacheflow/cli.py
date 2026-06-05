@@ -753,5 +753,22 @@ def dashboard(port, base_path):
         raise click.ClickException(str(e))
 
 
+@cli.command()
+@click.option(
+    "--dashboard-url",
+    default="http://127.0.0.1:8080",
+    help="URL of the dashboard server (default: http://127.0.0.1:8080)",
+)
+@click.option("--base-path", default=".", help="Project root")
+def mcp_server(dashboard_url, base_path):
+    """Launch MCP (Model Context Protocol) server for Claude Code integration."""
+    try:
+        from cacheflow.mcp_server import run_mcp_server
+        base_path = Path(base_path)
+        run_mcp_server(base_path, dashboard_url)
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+
 if __name__ == "__main__":
     cli()
