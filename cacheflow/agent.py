@@ -330,8 +330,6 @@ class AgentSession:
             current_hash = _hash_context(stable_prefix)
             context_changed = (agent.stable_context_hash != current_hash)
 
-            just_restored = False
-
             if is_first_session or context_changed:
                 prime_start = time.time()
                 self.server.prime_slot(stable_prefix, slot_id=self.slot_id)
@@ -343,7 +341,6 @@ class AgentSession:
                     snapshot_filename = Path(head_commit.snapshot_path).name
                     self.server.restore_slot(snapshot_filename, slot_id=self.slot_id)
                     restore_time_ms = int((time.time() - restore_start) * 1000)
-                    just_restored = True
 
             # Step e: Save snapshot (stable prefix only, before task evaluation)
             save_start = time.time()
@@ -353,13 +350,11 @@ class AgentSession:
             # Step f: Run completion
             completion_start = time.time()
 
-            if just_restored:
-                prompt_to_send = task_suffix
-            else:
-                prompt_to_send = full_prompt
-
+            # Always send the full prompt so llama-cpp-python's prefix matching can
+            # find the stable prefix in the KV cache (whether from prime or restore)
+            # and only evaluate the task suffix tokens.
             response_data = self.server.completion(
-                prompt=prompt_to_send,
+                prompt=full_prompt,
                 slot_id=self.slot_id,
                 max_tokens=max_tokens,
             )

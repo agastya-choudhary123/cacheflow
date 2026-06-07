@@ -12,8 +12,10 @@ from typing import Optional, Dict, Any
 import threading
 from dataclasses import dataclass, asdict
 
+import numpy as np
+
 try:
-    from llama_cpp import Llama
+    from llama_cpp import Llama, LlamaState
 except ImportError:
     raise ImportError("llama-cpp-python not installed. Run: pip install llama-cpp-python")
 
@@ -21,36 +23,85 @@ from flask import Flask, request, jsonify
 
 
 # ── Binary snapshot format ────────────────────────────────────────────────────
-# Layout: 4-byte magic | 4-byte version (LE uint32) | 8-byte length (LE uint64) | payload
+# Version 2 layout (no pickle — pure struct + raw arrays):
+#
+#   4 bytes  magic = b"CFKV"
+#   4 bytes  version = 2 (LE uint32)
+#   8 bytes  n_tokens (LE uint64)
+#   8 bytes  seed (LE uint64)
+#   8 bytes  llama_state_size (LE uint64)
+#   <llama_state_size bytes>  raw KV cache bytes
+#   8 bytes  input_ids_len (LE uint64)  — number of int32 elements
+#   <input_ids_len * 4 bytes>  int32 LE array
+#   8 bytes  scores_rows (LE uint64)
+#   8 bytes  scores_cols (LE uint64)
+#   <scores_rows * scores_cols * 4 bytes>  float32 LE array
+#
 _SNAPSHOT_MAGIC = b"CFKV"
-_SNAPSHOT_VERSION = 1
+_SNAPSHOT_VERSION = 2
 
 
-def _write_snapshot(filepath: Path, state: bytes) -> None:
-    """Serialize KV state to disk using a versioned binary format (no pickle)."""
+def _write_snapshot(filepath: Path, state: "LlamaState") -> None:
+    """Serialize a LlamaState to disk using a versioned binary format (no pickle)."""
+    llama_state_bytes = bytes(state.llama_state)
+    input_ids_bytes = state.input_ids.astype("<i4").tobytes()
+    scores_bytes = state.scores.astype("<f4").tobytes()
+    scores_rows, scores_cols = state.scores.shape
+
     with open(filepath, "wb") as f:
         f.write(_SNAPSHOT_MAGIC)
         f.write(struct.pack("<I", _SNAPSHOT_VERSION))
-        f.write(struct.pack("<Q", len(state)))
-        f.write(state)
+        f.write(struct.pack("<Q", state.n_tokens))
+        f.write(struct.pack("<Q", state.seed))
+        f.write(struct.pack("<Q", len(llama_state_bytes)))
+        f.write(llama_state_bytes)
+        f.write(struct.pack("<Q", len(state.input_ids)))
+        f.write(input_ids_bytes)
+        f.write(struct.pack("<QQ", scores_rows, scores_cols))
+        f.write(scores_bytes)
 
 
-def _read_snapshot(filepath: Path) -> bytes:
-    """Deserialize KV state from disk. Validates magic header — no code execution."""
+def _read_snapshot(filepath: Path) -> "LlamaState":
+    """Deserialize a LlamaState from disk. No code execution — pure binary reads."""
     with open(filepath, "rb") as f:
         magic = f.read(4)
         if magic != _SNAPSHOT_MAGIC:
-            raise ValueError(f"Not a CacheFlow snapshot (magic={magic!r}). "
-                             "File may be corrupted or from an older version.")
+            raise ValueError(f"Not a CacheFlow snapshot (magic={magic!r}).")
         version = struct.unpack("<I", f.read(4))[0]
         if version != _SNAPSHOT_VERSION:
-            raise ValueError(f"Unsupported snapshot version {version}. "
-                             f"Expected {_SNAPSHOT_VERSION}.")
-        length = struct.unpack("<Q", f.read(8))[0]
-        payload = f.read(length)
-        if len(payload) != length:
-            raise ValueError(f"Truncated snapshot: expected {length} bytes, got {len(payload)}")
-        return payload
+            raise ValueError(
+                f"Unsupported snapshot version {version} (expected {_SNAPSHOT_VERSION}). "
+                "Re-prime the agent to generate a new snapshot."
+            )
+
+        n_tokens = struct.unpack("<Q", f.read(8))[0]
+        seed = struct.unpack("<Q", f.read(8))[0]
+
+        llama_state_size = struct.unpack("<Q", f.read(8))[0]
+        llama_state_bytes = f.read(llama_state_size)
+        if len(llama_state_bytes) != llama_state_size:
+            raise ValueError(f"Truncated llama_state: expected {llama_state_size}, got {len(llama_state_bytes)}")
+
+        input_ids_len = struct.unpack("<Q", f.read(8))[0]
+        input_ids_bytes = f.read(input_ids_len * 4)
+        if len(input_ids_bytes) != input_ids_len * 4:
+            raise ValueError("Truncated input_ids")
+        input_ids = np.frombuffer(input_ids_bytes, dtype="<i4").copy()
+
+        scores_rows, scores_cols = struct.unpack("<QQ", f.read(16))
+        scores_bytes = f.read(scores_rows * scores_cols * 4)
+        if len(scores_bytes) != scores_rows * scores_cols * 4:
+            raise ValueError("Truncated scores")
+        scores = np.frombuffer(scores_bytes, dtype="<f4").reshape(scores_rows, scores_cols).copy()
+
+    return LlamaState(
+        input_ids=input_ids,
+        scores=scores,
+        n_tokens=int(n_tokens),
+        llama_state=llama_state_bytes,
+        llama_state_size=llama_state_size,
+        seed=int(seed),
+    )
 
 
 # ── Cooperative slot manager ──────────────────────────────────────────────────
@@ -67,7 +118,7 @@ class CooperativeSlotManager:
     def __init__(self, model: "Llama"):
         self.model = model
         self._active_slot: Optional[int] = None
-        self._slot_states: Dict[int, Optional[bytes]] = {}
+        self._slot_states: Dict[int, Optional["LlamaState"]] = {}
         self._lock = threading.Lock()
 
     def switch_to(self, slot_id: int) -> None:
@@ -75,10 +126,8 @@ class CooperativeSlotManager:
         with self._lock:
             if self._active_slot == slot_id:
                 return
-            # Save the slot that is currently active
             if self._active_slot is not None:
-                self._slot_states[self._active_slot] = bytes(self.model.save_state())
-            # Restore the requested slot
+                self._slot_states[self._active_slot] = self.model.save_state()
             target = self._slot_states.get(slot_id)
             if target is not None:
                 self.model.load_state(target)
@@ -93,14 +142,14 @@ class CooperativeSlotManager:
             if self._active_slot == slot_id:
                 self._active_slot = None
 
-    def snapshot_state(self, slot_id: int) -> bytes:
-        """Return the current in-memory state bytes for a slot (calls save_state)."""
+    def snapshot_state(self, slot_id: int) -> Optional["LlamaState"]:
+        """Return the current in-memory LlamaState for a slot."""
         with self._lock:
             if self._active_slot == slot_id:
-                state = bytes(self.model.save_state())
+                state = self.model.save_state()
                 self._slot_states[slot_id] = state
                 return state
-            return self._slot_states.get(slot_id) or b""
+            return self._slot_states.get(slot_id)
 
 
 @dataclass
@@ -275,11 +324,8 @@ class CustomLlamaServer:
                     if slot_id not in self.slots:
                         return jsonify({"error": {"message": f"Slot {slot_id} not found", "code": 404}}), 404
 
-                # Switch to slot so save_state captures the right KV
                 self.slot_manager.switch_to(slot_id)
-                state = bytes(self.model.save_state())
-
-                # Update in-memory state cache
+                state = self.model.save_state()
                 self.slot_manager._slot_states[slot_id] = state
 
                 filename = f"slot_{slot_id}_{uuid.uuid4().hex[:8]}.bin"
@@ -319,10 +365,8 @@ class CustomLlamaServer:
                     if slot_id not in self.slots:
                         return jsonify({"error": {"message": f"Slot {slot_id} not found", "code": 404}}), 404
 
-                # Deserialize without pickle — pure binary read, no code execution
                 state = _read_snapshot(filepath)
 
-                # Store in manager and make it the active slot
                 self.slot_manager._slot_states[slot_id] = state
                 self.slot_manager._active_slot = None  # force switch_to to restore
                 self.slot_manager.switch_to(slot_id)

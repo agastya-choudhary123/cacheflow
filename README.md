@@ -10,15 +10,15 @@ Coding agents re-analyze your codebase from scratch in every session, burning to
 
 CacheFlow uses llama-cpp-python's native KV cache state serialization to save and restore the model's learned knowledge across sessions. Each agent run persists the KV cache state as a snapshot. The next run restores it instead of re-ingesting the codebase.
 
-**Real-world token cost (8192 context window):**
+**Measured token cost (16384 context window, qwen2.5-coder:7b, this repo):**
 
-| Session | Tokens Used | Tokens Saved | Savings |
-|---------|-------------|--------------|---------|
-| 1 (baseline) | 9,064 | — | — |
-| 2 | 328 | 8,182 | **93%** |
-| 3+ | ~300-400 | ~8,600+ | **95%+** |
+| | Without cache | With cache |
+|--|--------------|------------|
+| Prompt tokens evaluated | 7,630 | ~5 |
+| Prompt cost reduction | — | **~99%** |
+| Total session cost | 7,630 + output | ~5 + output |
 
-The first session ingests your entire codebase (9,064 tokens). Every subsequent session only evaluates the new task tokens (~300-400), while the model's cached knowledge of the codebase stays in memory. No re-ingestion.
+The baseline prompt for this codebase is 7,630 tokens (system prompt + codebase). Every session after the first restores the KV snapshot and evaluates only the task suffix (~5-50 tokens). Output tokens are the same either way — caching eliminates prompt re-evaluation, not generation. Savings scale with codebase size.
 
 ## Quick Start
 
@@ -418,10 +418,11 @@ Mock `get_global_server()` to avoid spawning real llama-cpp processes. Mock `get
 - Consolidation: ~1-2 minutes (async, non-blocking)
 - Semantic search: ~18 ms/query (all-MiniLM-L6-v2 on CPU)
 
-**Token efficiency:**
-- Baseline (cold start): 9,000-15,000 tokens (depends on codebase size)
-- Follow-up session: 300-500 tokens (~95% reduction)
-- 10 sessions: ~11,000 tokens vs. ~120,000 without caching (91% savings)
+**Token efficiency (measured on this repo, 16384 ctx, qwen2.5-coder:7b):**
+- Baseline prompt: 7,630 tokens (system prompt + codebase)
+- Follow-up sessions: ~5 prompt tokens evaluated (~99% prompt cost reduction)
+- Output tokens are the same either way — caching eliminates re-evaluation, not generation
+- Absolute prompt savings per session: ~7,625 tokens; scales with codebase size
 
 ## License
 
