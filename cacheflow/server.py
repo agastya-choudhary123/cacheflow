@@ -76,8 +76,8 @@ class LlamaServer:
         if not custom_server.exists():
             raise FileNotFoundError(f"Custom server script not found: {custom_server}")
 
-        # Find available port
-        self.port = self._find_available_port(8080, 8090)
+        # Find available port via OS assignment (avoids hardcoded ranges and TOCTOU)
+        self.port = self._find_available_port()
         self.base_url = f"http://127.0.0.1:{self.port}"
         self.ctx_size = ctx_size
 
@@ -112,18 +112,12 @@ class LlamaServer:
         self._wait_for_health(timeout=60)
         self.http_client = httpx.Client(timeout=300.0)
 
-    def _find_available_port(self, start: int, end: int) -> int:
-        """Find an available port in the given range."""
+    def _find_available_port(self) -> int:
+        """Let the OS assign a free ephemeral port (avoids hardcoded ranges)."""
         import socket
-
-        for port in range(start, end + 1):
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.bind(("127.0.0.1", port))
-                    return port
-            except OSError:
-                continue
-        raise RuntimeError(f"No available ports in range {start}-{end}")
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
 
     def _wait_for_health(self, timeout: int = 30) -> None:
         """Poll until server is healthy."""
@@ -269,3 +263,15 @@ class LlamaServer:
         response = self.http_client.get(f"{self.base_url}/slots")
         response.raise_for_status()
         return response.json()
+
+    def count_tokens(self, text: str) -> int:
+        """Count tokens for a string using the server's tokenizer."""
+        if not self.http_client:
+            raise RuntimeError("Server not started")
+
+        response = self.http_client.post(
+            f"{self.base_url}/tokenize",
+            json={"content": text},
+        )
+        response.raise_for_status()
+        return response.json().get("n_tokens", len(text) // 4)

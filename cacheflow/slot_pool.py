@@ -130,9 +130,10 @@ class SlotPool:
         Args:
             slot_id: Slot ID
         """
-        state = self.slots.get(slot_id)
-        if state:
-            state.is_dirty = True
+        with self._lock:
+            state = self.slots.get(slot_id)
+            if state:
+                state.is_dirty = True
 
     def load_commit(self, slot_id: int, commit_id: UUID, agent_id: UUID) -> None:
         """Record that a snapshot was loaded into a slot.
@@ -142,11 +143,12 @@ class SlotPool:
             commit_id: Commit ID of the loaded snapshot
             agent_id: Agent ID
         """
-        state = self.slots.get(slot_id)
-        if state:
-            state.loaded_commit_id = commit_id
-            state.agent_id = agent_id
-            state.is_dirty = False
+        with self._lock:
+            state = self.slots.get(slot_id)
+            if state:
+                state.loaded_commit_id = commit_id
+                state.agent_id = agent_id
+                state.is_dirty = False
 
     def get_slot_state(self, slot_id: int) -> Optional[SlotState]:
         """Get the current state of a slot.

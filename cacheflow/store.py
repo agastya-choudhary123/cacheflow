@@ -6,11 +6,16 @@ from pathlib import Path
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, ForeignKey, Uuid, event, text
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, ForeignKey, Uuid, event, text, cast
 from sqlalchemy.orm import declarative_base, sessionmaker, Session as SQLSession
 from sqlalchemy.exc import IntegrityError
 
 Base = declarative_base()
+
+
+def _hash_context(text_content: str) -> str:
+    """Return SHA-256 hex digest of a string (64 chars)."""
+    return hashlib.sha256(text_content.encode()).hexdigest()
 
 
 class Agent(Base):
@@ -24,8 +29,11 @@ class Agent(Base):
     model_hash = Column(String, nullable=False)  # sha256 of model file
     model_name = Column(String, nullable=False)  # e.g. "qwen2.5-coder:7b"
     ctx_size = Column(Integer, nullable=False)
-    baseline_tokens_evaluated = Column(Integer, nullable=True)  # total prompt tokens on first session (N + task1), used to compute savings
-    stable_context = Column(String, nullable=True)  # exact stable prefix text used for current HEAD snapshot
+    baseline_tokens_evaluated = Column(Integer, nullable=True)
+    # SHA-256 of the stable prefix; replaces the old full-text stable_context column
+    stable_context_hash = Column(String, nullable=True)
+    # Legacy column kept for schema compat but no longer written
+    stable_context = Column(String, nullable=True)
     head_commit_id = Column(
         Uuid, ForeignKey("commits.id"), nullable=True
     )  # current HEAD
@@ -78,9 +86,9 @@ class SnapshotEmbedding(Base):
 
     commit_id = Column(Uuid, ForeignKey("commits.id"), primary_key=True)
     agent_id = Column(Uuid, ForeignKey("agents.id"), nullable=False)
-    short_summary = Column(String, nullable=False)  # 2-3 sentence NL summary derived from facets
-    facets = Column(String, nullable=False)  # JSON: {functions: [...], bugs: [...], patterns: [...], facts: [...]}
-    embedding = Column(String, nullable=False)  # JSON: list[float] 384-dim of short_summary
+    short_summary = Column(String, nullable=False)  # 2-3 sentence NL summary
+    facets = Column(String, nullable=False)  # JSON: {functions: [...], bugs: [...], ...}
+    embedding = Column(String, nullable=False)  # JSON: list[float] 384-dim
     facet_embeddings = Column(String, nullable=False)  # JSON: {facet_name: list[float]}
     deep_summary = Column(String, nullable=True)  # Populated on-demand, cached
     created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
@@ -98,7 +106,9 @@ class CacheFlowStore:
             isolation_level="SERIALIZABLE",
             connect_args={"timeout": 10},
         )
-        self.SessionLocal = sessionmaker(bind=self.engine)
+        # expire_on_commit=False: ORM objects remain usable after session.close()
+        # without triggering lazy-load errors on detached instances.
+        self.SessionLocal = sessionmaker(bind=self.engine, expire_on_commit=False)
 
         # Enable WAL mode for better concurrency
         @event.listens_for(self.engine, "connect")
@@ -124,6 +134,33 @@ class CacheFlowStore:
             if "stable_context" not in cols:
                 conn.execute(text("ALTER TABLE agents ADD COLUMN stable_context TEXT"))
                 conn.commit()
+            if "stable_context_hash" not in cols:
+                conn.execute(text("ALTER TABLE agents ADD COLUMN stable_context_hash TEXT"))
+                conn.commit()
+                # Backfill hash from existing stable_context values
+                conn.execute(text(
+                    "UPDATE agents SET stable_context_hash = lower(hex("
+                    "  CAST(stable_context AS BLOB)"  # placeholder; Python backfill below
+                    ")) WHERE stable_context IS NOT NULL AND stable_context_hash IS NULL"
+                ))
+                conn.commit()
+                # Python-side backfill for accurate SHA-256
+                self._backfill_stable_context_hash(conn)
+
+    def _backfill_stable_context_hash(self, conn) -> None:
+        """Compute SHA-256 hashes for existing stable_context values."""
+        rows = conn.execute(
+            text("SELECT id, stable_context FROM agents WHERE stable_context IS NOT NULL")
+        ).fetchall()
+        for row in rows:
+            agent_id, stable_context = row[0], row[1]
+            if stable_context:
+                h = _hash_context(stable_context)
+                conn.execute(
+                    text("UPDATE agents SET stable_context_hash = :h WHERE id = :id"),
+                    {"h": h, "id": agent_id},
+                )
+        conn.commit()
 
     def _get_session(self) -> SQLSession:
         """Get a new database session."""
@@ -154,22 +191,26 @@ class CacheFlowStore:
             session.close()
 
     def update_agent_stable_context(self, agent: Agent, stable_context: str) -> None:
-        """Persist the stable prefix text used for the current HEAD snapshot."""
+        """Persist the SHA-256 hash of the stable prefix for change detection.
+
+        Accepts the full stable_context text for API compatibility but only
+        stores the hash — the full text is never written to the database.
+        """
+        context_hash = _hash_context(stable_context)
         session = self._get_session()
         try:
-            agent.stable_context = stable_context
+            agent.stable_context_hash = context_hash
             session.merge(agent)
             session.commit()
         finally:
             session.close()
 
-    def update_agent_baseline(self, agent: Agent, baseline: int) -> None:
-        """Persist baseline_tokens_evaluated on first session completion.
+    def get_stable_context_hash(self, agent: Agent) -> str | None:
+        """Return the stored stable_context_hash for an agent."""
+        return agent.stable_context_hash
 
-        Args:
-            agent: Agent to update
-            baseline: tokens_evaluated from first session (must be > 0)
-        """
+    def update_agent_baseline(self, agent: Agent, baseline: int) -> None:
+        """Persist baseline_tokens_evaluated on first session completion."""
         if baseline <= 0:
             raise ValueError(f"Baseline tokens must be positive, got {baseline}")
 
@@ -217,36 +258,19 @@ class CacheFlowStore:
         llama_cpp_version: str = "0.0.0",
         snapshot_save_time_ms: int = 0,
         snapshot_restore_time_ms: int = 0,
-    ) -> Commit:
-        """
-        Create a new commit from a snapshot file.
-
-        Args:
-            All parameters as specified
-
-        Returns:
-            Commit object
-
-        Raises:
-            FileNotFoundError: if snapshot file doesn't exist
-            ValueError: if snapshot file is empty
-        """
-        # Validate snapshot file exists and is readable
+    ) -> "Commit":
+        """Create a new commit from a snapshot file."""
         snapshot_full_path = Path(snapshot_path)
         if not snapshot_full_path.exists():
             raise FileNotFoundError(f"Snapshot file not found: {snapshot_path}")
 
-        # Verify snapshot is not empty
         snapshot_size_bytes = snapshot_full_path.stat().st_size
         if snapshot_size_bytes == 0:
             raise ValueError(f"Snapshot file is empty: {snapshot_path}")
 
-        # Compute commit ID as sha256(snapshot content + agent_id + timestamp)
-        # This ensures different commits even if snapshot content is identical (e.g., forks)
         with open(snapshot_full_path, "rb") as f:
             file_contents = f.read()
 
-        # Hash includes snapshot content, agent ID, and timestamp for uniqueness
         hash_input = file_contents + str(agent.id).encode() + str(int(time.time() * 1e9)).encode()
         commit_hash = hashlib.sha256(hash_input).digest()
         commit_id = UUID(bytes=commit_hash[:16])
@@ -282,7 +306,7 @@ class CacheFlowStore:
         finally:
             session.close()
 
-    def get_commit(self, commit_id: UUID) -> Commit | None:
+    def get_commit(self, commit_id: UUID) -> "Commit | None":
         """Get a commit by ID."""
         session = self._get_session()
         try:
@@ -290,26 +314,27 @@ class CacheFlowStore:
         finally:
             session.close()
 
-    def get_commit_by_id_prefix(self, commit_id_prefix: str) -> Commit | None:
-        """Get a commit by ID prefix (short hash)."""
+    def get_commit_by_id_prefix(self, commit_id_prefix: str) -> "Commit | None":
+        """Get a commit by ID prefix (short hash). Uses SQL LIKE for O(log n) lookup."""
         session = self._get_session()
         try:
-            # Try parsing as UUID first
+            # Try exact UUID parse first
             try:
                 commit_id = UUID(commit_id_prefix)
                 return session.query(Commit).filter(Commit.id == commit_id).first()
             except ValueError:
-                # If not a valid UUID, treat as a prefix
-                all_commits = session.query(Commit).all()
-                for commit in all_commits:
-                    if str(commit.id).startswith(commit_id_prefix):
-                        return commit
-                return None
+                pass
+
+            # Prefix search via CAST + LIKE (SQLAlchemy stores UUIDs as strings in SQLite)
+            result = session.query(Commit).filter(
+                cast(Commit.id, String).like(f"{commit_id_prefix}%")
+            ).first()
+            return result
         finally:
             session.close()
 
-    def get_commit_history(self, agent: Agent) -> list[Commit]:
-        """Get commits from HEAD back to root, oldest last."""
+    def get_commit_history(self, agent: Agent) -> list["Commit"]:
+        """Get commits from HEAD back to root, oldest first."""
         commits = []
         session = self._get_session()
         try:
@@ -327,13 +352,13 @@ class CacheFlowStore:
     def log_session(
         self,
         agent: Agent,
-        commit: Commit,
+        commit: "Commit",
         prompt: str,
         response: str,
         tokens_in: int,
         tokens_out: int,
         duration_ms: int,
-    ) -> SessionLog:
+    ) -> "SessionLog":
         """Log a session."""
         session = self._get_session()
         try:
@@ -358,10 +383,10 @@ class CacheFlowStore:
         commit_id: UUID,
         agent_id: UUID,
         short_summary: str,
-        facets: str,  # JSON string
-        embedding: str,  # JSON string: list[float]
-        facet_embeddings: str,  # JSON string: {facet_name: list[float]}
-    ) -> SnapshotEmbedding:
+        facets: str,
+        embedding: str,
+        facet_embeddings: str,
+    ) -> "SnapshotEmbedding":
         """Save semantic embedding and knowledge facets for a snapshot."""
         session = self._get_session()
         try:
@@ -380,7 +405,7 @@ class CacheFlowStore:
         finally:
             session.close()
 
-    def get_snapshot_embedding(self, commit_id: UUID) -> SnapshotEmbedding | None:
+    def get_snapshot_embedding(self, commit_id: UUID) -> "SnapshotEmbedding | None":
         """Get semantic embedding for a specific commit."""
         session = self._get_session()
         try:
@@ -390,7 +415,7 @@ class CacheFlowStore:
         finally:
             session.close()
 
-    def get_all_embeddings(self, agent_name: str | None = None) -> list[SnapshotEmbedding]:
+    def get_all_embeddings(self, agent_name: str | None = None) -> list["SnapshotEmbedding"]:
         """Get all snapshot embeddings, optionally filtered by agent name."""
         session = self._get_session()
         try:

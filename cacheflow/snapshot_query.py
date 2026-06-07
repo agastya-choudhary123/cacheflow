@@ -172,12 +172,10 @@ class SnapshotQueryEngine:
                 yield f"Snapshot for {best_match.commit_id} not found."
                 return
 
-            # Restore KV cache to a slot (use slot 1 to avoid interfering with other operations)
-            restore_response = server.restore_slot(
-                path=commit.snapshot_path,
-                slot_id=1,
-            )
-            if not restore_response.get("success"):
+            # Restore KV cache to slot 1 (avoids interfering with agent's slot 0)
+            snapshot_filename = Path(commit.snapshot_path).name
+            restore_response = server.restore_slot(snapshot_filename, slot_id=1)
+            if not restore_response.get("filename"):
                 yield "Failed to restore snapshot."
                 return
 

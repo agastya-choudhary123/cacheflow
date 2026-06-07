@@ -408,6 +408,14 @@ HTML_TEMPLATE = """
         let currentNetwork = null;
         let selectedAgentName = '';
 
+        // Sanitise user-controlled strings before inserting into innerHTML
+        function escapeHtml(str) {
+            if (str == null) return '';
+            const div = document.createElement('div');
+            div.textContent = String(str);
+            return div.innerHTML;
+        }
+
         function formatNumber(n) {
             return n.toLocaleString();
         }
@@ -481,14 +489,14 @@ HTML_TEMPLATE = """
                 agents.forEach(agent => {
                     const savingsStr = agent.savings_pct ? agent.savings_pct.toFixed(1) + '%' : '—';
                     html += `<tr>`;
-                    html += `<td><strong>${agent.name}</strong></td>`;
-                    html += `<td class="text-dim">${agent.model}</td>`;
+                    html += `<td><strong>${escapeHtml(agent.name)}</strong></td>`;
+                    html += `<td class="text-dim">${escapeHtml(agent.model)}</td>`;
                     html += `<td>${agent.ctx_size}</td>`;
                     html += `<td>${agent.session_count}</td>`;
                     html += `<td>${formatNumber(agent.total_tokens_used)}</td>`;
                     html += `<td class="text-success">${formatNumber(agent.total_tokens_saved)}</td>`;
                     html += `<td>${savingsStr}</td>`;
-                    html += `<td><span class="tag">${agent.head_commit}</span></td>`;
+                    html += `<td><span class="tag">${escapeHtml(agent.head_commit)}</span></td>`;
                     html += `</tr>`;
                 });
 
@@ -511,8 +519,8 @@ HTML_TEMPLATE = """
                     const taskShort = session.task.substring(0, 50);
                     html += `<tr>`;
                     html += `<td class="text-dim">${date}</td>`;
-                    html += `<td><strong>${session.agent_name}</strong></td>`;
-                    html += `<td>${taskShort}${session.task.length > 50 ? '...' : ''}</td>`;
+                    html += `<td><strong>${escapeHtml(session.agent_name)}</strong></td>`;
+                    html += `<td>${escapeHtml(taskShort)}${session.task.length > 50 ? '...' : ''}</td>`;
                     html += `<td>${formatNumber(session.tokens_in)}</td>`;
                     html += `<td>${formatNumber(session.tokens_out)}</td>`;
                     html += `<td>${session.duration_ms}ms</td>`;
@@ -541,10 +549,10 @@ HTML_TEMPLATE = """
                     html += `</div>`;
                     snapshots.files.slice(0, 10).forEach(file => {
                         const taskLabel = file.is_fork
-                            ? `<span style="color:#f59e0b;">⑂ fork from ${file.agent}</span>`
-                            : `<span style="color:#e0e6ed;">${(file.task || '—').substring(0, 50)}</span>`;
+                            ? `<span style="color:#f59e0b;">⑂ fork from ${escapeHtml(file.agent)}</span>`
+                            : `<span style="color:#e0e6ed;">${escapeHtml((file.task || '—').substring(0, 50))}</span>`;
                         const agentBadge = file.agent
-                            ? `<span style="background:#2d3748; border:1px solid #3d4860; border-radius:4px; padding:1px 6px; font-family:monospace; font-size:11px;">${file.agent}</span>`
+                            ? `<span style="background:#2d3748; border:1px solid #3d4860; border-radius:4px; padding:1px 6px; font-family:monospace; font-size:11px;">${escapeHtml(file.agent)}</span>`
                             : `<span style="color:#718096;">—</span>`;
                         const savedBadge = file.saved > 0
                             ? `<span style="color:#48bb78; font-size:10px;">↓${file.saved}</span>`
@@ -1136,52 +1144,45 @@ def run_dashboard(base_path: Path, port: int = 8080) -> None:
             db_path = base_path / ".cacheflow" / "agents.db"
             from cacheflow.store import CacheFlowStore
             from cacheflow.config import load_config
-            from cacheflow.server import LlamaServer
+            from cacheflow.server import get_global_server
 
             store = CacheFlowStore(db_path)
 
-            # Find commit
             commit = store.get_commit_by_id_prefix(commit_id)
             if not commit:
                 return jsonify({"error": "Commit not found"}), 404
 
-            # Get embedding
             emb = store.get_snapshot_embedding(commit.id)
             if not emb:
                 return jsonify({"error": "Snapshot not indexed"}), 404
 
-            # If already cached, return it
             if emb.deep_summary:
                 return jsonify({"deep_summary": emb.deep_summary})
 
-            # Generate on-demand
+            # Reuse the global singleton — no extra process or port conflict
             config = load_config(base_path)
-            server = LlamaServer(
+            server = get_global_server(
                 model_path=config.model_path,
+                slot_save_path=str(config.slot_save_path),
                 ctx_size=config.ctx_size,
                 n_gpu_layers=config.n_gpu_layers,
             )
-            try:
-                restore_response = server.restore_slot(
-                    path=commit.snapshot_path,
-                    slot_id=1,
-                )
-                if not restore_response.get("success"):
-                    return jsonify({"error": "Failed to restore snapshot"}), 500
 
-                response = server.completion(
-                    prompt="Provide a comprehensive summary of what you learned in this session, including code references and design patterns.",
-                    slot_id=1,
-                    max_tokens=512,
-                )
-                deep_summary = response.get("content", "")
+            snapshot_filename = Path(commit.snapshot_path).name
+            restore_response = server.restore_slot(snapshot_filename, slot_id=1)
+            if not restore_response.get("filename"):
+                return jsonify({"error": "Failed to restore snapshot"}), 500
 
-                # Cache it
-                store.update_deep_summary(commit.id, deep_summary)
+            response = server.completion(
+                prompt="Provide a comprehensive summary of what you learned in this session, including code references and design patterns.",
+                slot_id=1,
+                max_tokens=512,
+            )
+            deep_summary = response.get("content", "")
 
-                return jsonify({"deep_summary": deep_summary})
-            finally:
-                server.stop()
+            store.update_deep_summary(commit.id, deep_summary)
+            return jsonify({"deep_summary": deep_summary})
+
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 

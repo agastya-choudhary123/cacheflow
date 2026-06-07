@@ -246,7 +246,7 @@ def test_consolidation_logs_result(store, config, compressor, temp_dir):
         "size_bytes": 2048,
     }
 
-    with patch("cacheflow.compressor.LlamaServer", return_value=mock_server):  # Compressor creates its own server
+    with patch("cacheflow.compressor.get_global_server", return_value=mock_server):
         result = compressor.compact(agent)
 
     # Check that consolidation happened

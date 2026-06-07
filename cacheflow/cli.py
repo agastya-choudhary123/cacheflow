@@ -550,20 +550,19 @@ def query(text, agent_name, top_k, live, global_search, base_path):
         engine = SnapshotQueryEngine(store)
 
         if live and not global_search:
-            # Live query: restore snapshot and ask the model
+            # Live query: restore snapshot and ask the model via the global server
+            from cacheflow.server import get_global_server
             config = load_config(base_path)
-            server = LlamaServer(
+            server = get_global_server(
                 model_path=config.model_path,
+                slot_save_path=str(config.slot_save_path),
                 ctx_size=config.ctx_size,
                 n_gpu_layers=config.n_gpu_layers,
             )
-            try:
-                click.echo("Querying restored snapshot...\n")
-                for chunk in engine.query_live(text, agent_name=agent_name, server=server):
-                    click.echo(chunk, nl=False)
-                click.echo()
-            finally:
-                server.stop()
+            click.echo("Querying restored snapshot...\n")
+            for chunk in engine.query_live(text, agent_name=agent_name, server=server):
+                click.echo(chunk, nl=False)
+            click.echo()
         else:
             # Semantic search
             matches = engine.query(text, agent_name=agent_name, top_k=top_k, global_search=global_search)
@@ -645,33 +644,28 @@ def snapshot_describe(commit_id, agent_name, deep, base_path):
                 click.echo(emb.deep_summary)
             else:
                 click.echo("Generating deep dive...")
+                from cacheflow.server import get_global_server
                 config = load_config(base_path)
-                server = LlamaServer(
+                server = get_global_server(
                     model_path=config.model_path,
+                    slot_save_path=str(config.slot_save_path),
                     ctx_size=config.ctx_size,
                     n_gpu_layers=config.n_gpu_layers,
                 )
-                try:
-                    # Restore snapshot and ask a richer question
-                    restore_response = server.restore_slot(
-                        path=commit.snapshot_path,
+                snapshot_filename = Path(commit.snapshot_path).name
+                restore_response = server.restore_slot(snapshot_filename, slot_id=1)
+                if restore_response.get("filename"):
+                    response = server.completion(
+                        prompt="Provide a comprehensive summary of what you learned in this session, including code references and design patterns.",
                         slot_id=1,
+                        max_tokens=512,
                     )
-                    if restore_response.get("success"):
-                        response = server.completion(
-                            prompt="Provide a comprehensive summary of what you learned in this session, including code references and design patterns.",
-                            slot_id=1,
-                            max_tokens=512,
-                        )
-                        deep_summary = response.get("content", "")
-                        # Cache it
-                        store.update_deep_summary(commit.id, deep_summary)
-                        click.echo("Deep Dive:")
-                        click.echo(deep_summary)
-                    else:
-                        raise click.ClickException("Failed to restore snapshot for deep dive.")
-                finally:
-                    server.stop()
+                    deep_summary = response.get("content", "")
+                    store.update_deep_summary(commit.id, deep_summary)
+                    click.echo("Deep Dive:")
+                    click.echo(deep_summary)
+                else:
+                    raise click.ClickException("Failed to restore snapshot for deep dive.")
     except click.ClickException:
         raise
     except Exception as e:
@@ -766,6 +760,53 @@ def mcp_server(dashboard_url, base_path):
         from cacheflow.mcp_server import run_mcp_server
         base_path = Path(base_path)
         run_mcp_server(base_path, dashboard_url)
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+
+@cli.command()
+@click.option("--keep", default=3, type=int, help="Keep N most recent snapshots per agent (default: 3)")
+@click.option("--dry-run", is_flag=True, help="Show what would be deleted without deleting")
+@click.option("--base-path", default=".", help="Project root")
+def gc(keep, dry_run, base_path):
+    """Garbage-collect unreferenced snapshot files.
+
+    Removes .bin files not referenced by any commit record, retaining the
+    latest N snapshots per agent for fast restore.
+
+    Examples:
+      cf gc                    # Delete unreferenced, keep last 3
+      cf gc --keep 5           # Keep last 5
+      cf gc --dry-run          # Preview what would be deleted
+    """
+    try:
+        from cacheflow.gc import SnapshotGC
+
+        base_path = Path(base_path)
+        db_path = base_path / ".cacheflow" / "agents.db"
+
+        if not db_path.exists():
+            raise click.ClickException("No database found. Run 'cf run' first.")
+
+        store = CacheFlowStore(db_path)
+        snapshots_dir = base_path / ".cacheflow" / "snapshots"
+        collector = SnapshotGC(store, snapshots_dir)
+
+        deleted = collector.collect(keep_latest_n=keep, dry_run=dry_run)
+
+        if dry_run:
+            if deleted:
+                click.echo(f"Would delete {len(deleted)} file(s):")
+                for p in deleted:
+                    click.echo(f"  {p.name}")
+            else:
+                click.echo("Nothing to delete.")
+        else:
+            if deleted:
+                total_mb = sum(0 for _ in deleted)  # files already removed
+                click.echo(f"Deleted {len(deleted)} unreferenced snapshot(s).")
+            else:
+                click.echo("Nothing to delete.")
     except Exception as e:
         raise click.ClickException(str(e))
 
