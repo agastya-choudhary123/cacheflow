@@ -115,9 +115,13 @@ def test_fix1_save_is_synchronous(temp_dir, config):
         "size_bytes": 1024,
     }
 
-    session = AgentSession("test-agent", temp_dir)
-    with patch("cacheflow.agent.get_global_server", return_value=mock_server):
-        result = session.run("task")
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.count.return_value = 10
+
+    with patch("cacheflow.agent.get_tokenizer", return_value=mock_tokenizer):
+        session = AgentSession("test-agent", temp_dir)
+        with patch("cacheflow.agent.get_global_server", return_value=mock_server):
+            result = session.run("task")
 
     # If run() succeeds, the file was found — no race
     assert result.snapshot_size_bytes > 0
@@ -127,29 +131,40 @@ def test_fix1_save_is_synchronous(temp_dir, config):
 
 def test_fix2_binary_snapshot_format():
     """_write_snapshot / _read_snapshot use a versioned binary format, not pickle."""
+    import numpy as np
     from cacheflow.llama_server_custom import _write_snapshot, _read_snapshot, _SNAPSHOT_MAGIC, _SNAPSHOT_VERSION
 
-    payload = os.urandom(4096)
+    # Build a minimal mock LlamaState (version 3 format — scores not stored)
+    state = MagicMock()
+    state.llama_state = os.urandom(4096)
+    state.input_ids = np.array([1, 2, 3, 4], dtype=np.int32)
+    state.scores = np.zeros((8, 16), dtype=np.float32)
+    state.n_tokens = 4
+    state.seed = 42
+    state.llama_state_size = len(state.llama_state)
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as f:
         tmp = Path(f.name)
 
     try:
-        _write_snapshot(tmp, payload)
+        _write_snapshot(tmp, state)
 
         # Verify header
         with open(tmp, "rb") as f:
             magic = f.read(4)
             version = struct.unpack("<I", f.read(4))[0]
-            length = struct.unpack("<Q", f.read(8))[0]
-            body = f.read(length)
 
         assert magic == _SNAPSHOT_MAGIC
         assert version == _SNAPSHOT_VERSION
-        assert body == payload
 
-        # Round-trip
+        # Round-trip: scores are zeroed on read (v3 format)
         recovered = _read_snapshot(tmp)
-        assert recovered == payload
+        assert recovered.n_tokens == state.n_tokens
+        assert recovered.seed == state.seed
+        assert bytes(recovered.llama_state) == bytes(state.llama_state)
+        assert list(recovered.input_ids) == list(state.input_ids)
+        assert recovered.scores.shape == state.scores.shape
+        assert (recovered.scores == 0).all()
 
     finally:
         tmp.unlink(missing_ok=True)
@@ -197,7 +212,10 @@ def test_fix3_compressor_uses_global_server(store, config, snapshots_dir):
 
 def test_fix4_release_lock_calls_release_slot_directly(temp_dir, config):
     """_release_lock calls _SLOT_POOL.release_slot directly, no __exit__ misuse."""
-    session = AgentSession("test-agent", temp_dir)
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.count.return_value = 10
+    with patch("cacheflow.agent.get_tokenizer", return_value=mock_tokenizer):
+        session = AgentSession("test-agent", temp_dir)
     session._acquire_lock()
     assert session.slot_id is not None
     slot_id = session.slot_id
@@ -265,7 +283,11 @@ def test_fix6_context_change_detected_by_hash(temp_dir, config):
         "filename": "snapshot.bin", "save_time_ms": 5, "size_bytes": 1024,
     }
 
-    session = AgentSession("test-agent", temp_dir)
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.count.return_value = 10
+
+    with patch("cacheflow.agent.get_tokenizer", return_value=mock_tokenizer):
+        session = AgentSession("test-agent", temp_dir)
     with patch("cacheflow.agent.get_global_server", return_value=mock_server):
         session.run("first task")
 
@@ -518,7 +540,10 @@ def test_fix15_gitignore_respected_in_fallback(temp_dir, config):
     (temp_dir / "visible.py").write_text("# public\n")
     (temp_dir / "secret.py").write_text("PASSWORD = 'hunter2'\n")
 
-    session = AgentSession("a", temp_dir)
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.count.return_value = 10
+    with patch("cacheflow.agent.get_tokenizer", return_value=mock_tokenizer):
+        session = AgentSession("a", temp_dir)
 
     # Force the non-git fallback by making git ls-files fail
     with patch("subprocess.run") as mock_run:
@@ -533,38 +558,40 @@ def test_fix15_gitignore_respected_in_fallback(temp_dir, config):
             pytest.skip("pathspec not installed")
 
 
-# ── Issue 16: Token-based budget instead of char heuristic ───────────────────
+# ── Issue 16: Exact tokenization via model's BPE tokenizer ───────────────────
 
-def test_fix16_count_tokens_uses_server_when_available(temp_dir, config):
-    """_count_tokens delegates to server.count_tokens when the server is set."""
-    session = AgentSession("a", temp_dir)
-    mock_server = MagicMock()
-    mock_server.count_tokens.return_value = 42
-    session.server = mock_server
+def test_fix16_count_tokens_uses_tokenizer(temp_dir, config):
+    """_count_tokens delegates to the model's BPE tokenizer, not the server."""
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.count.return_value = 42
+    with patch("cacheflow.agent.get_tokenizer", return_value=mock_tokenizer):
+        session = AgentSession("a", temp_dir)
 
     count = session._count_tokens("some text")
     assert count == 42
-    mock_server.count_tokens.assert_called_once_with("some text")
+    mock_tokenizer.count.assert_called_once_with("some text")
 
 
-def test_fix16_count_tokens_falls_back_on_exception(temp_dir, config):
-    """_count_tokens falls back to char heuristic if server raises."""
-    session = AgentSession("a", temp_dir)
-    mock_server = MagicMock()
-    mock_server.count_tokens.side_effect = RuntimeError("server down")
-    session.server = mock_server
+def test_fix16_count_tokens_no_server_needed(temp_dir, config):
+    """_count_tokens works without a running server (tokenizer is loaded at init)."""
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.count.return_value = 17
+    with patch("cacheflow.agent.get_tokenizer", return_value=mock_tokenizer):
+        session = AgentSession("a", temp_dir)
 
-    text = "a" * 400  # 400 chars → ~100 tokens heuristic
-    count = session._count_tokens(text)
-    assert count == 100
+    session.server = None  # server not running
+    assert session._count_tokens("hello world") == 17
 
 
-def test_fix16_count_tokens_no_server(temp_dir, config):
-    """_count_tokens uses char heuristic when server is None."""
-    session = AgentSession("a", temp_dir)
-    session.server = None
-    text = "x" * 800
-    assert session._count_tokens(text) == 200
+def test_fix16_count_tokens_exact_not_heuristic(temp_dir, config):
+    """_count_tokens returns whatever the BPE tokenizer returns, not len//4."""
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.count.return_value = 99  # distinct from any len//4 result
+    with patch("cacheflow.agent.get_tokenizer", return_value=mock_tokenizer):
+        session = AgentSession("a", temp_dir)
+
+    text = "x" * 800  # len//4 heuristic would give 200, not 99
+    assert session._count_tokens(text) == 99
 
 
 # ── Issue 17: Dashboard XSS escaping ─────────────────────────────────────────

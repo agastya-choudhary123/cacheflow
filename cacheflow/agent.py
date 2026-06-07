@@ -21,6 +21,7 @@ from cacheflow.indexer import CodeIndexer
 from cacheflow.retriever import CodeRetriever
 from cacheflow.tokenizer import ModelTokenizer, get_tokenizer
 from cacheflow.slot_pool import SlotPool, SlotLease
+from cacheflow.gc import SnapshotGC
 
 
 DEFAULT_SYSTEM_PROMPT = """You are an expert software engineer with deep knowledge of the codebase you've been given access to. You help with coding tasks efficiently and precisely. When you complete a task, briefly summarize what you did and what you learned about the codebase."""
@@ -450,6 +451,8 @@ class AgentSession:
 
             compressor = Compressor(self.store, self.config)
             compressor.maybe_compact_async(agent)
+
+            SnapshotGC(self.store, self.config.slot_save_path).collect(keep_latest_n=1)
 
             return SessionResult(
                 agent_name=self.agent_name,

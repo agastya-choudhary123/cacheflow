@@ -766,17 +766,19 @@ def mcp_server(dashboard_url, base_path):
 
 @cli.command()
 @click.option("--keep", default=3, type=int, help="Keep N most recent snapshots per agent (default: 3)")
+@click.option("--older-than", "older_than_days", default=None, type=int, help="Delete snapshots older than N days")
 @click.option("--dry-run", is_flag=True, help="Show what would be deleted without deleting")
 @click.option("--base-path", default=".", help="Project root")
-def gc(keep, dry_run, base_path):
+def gc(keep, older_than_days, dry_run, base_path):
     """Garbage-collect unreferenced snapshot files.
 
     Removes .bin files not referenced by any commit record, retaining the
-    latest N snapshots per agent for fast restore.
+    latest N snapshots per agent for fast restore. HEAD is always protected.
 
     Examples:
       cf gc                    # Delete unreferenced, keep last 3
-      cf gc --keep 5           # Keep last 5
+      cf gc --keep 1           # Keep only the most recent snapshot per agent
+      cf gc --older-than 7     # Delete snapshots from agents inactive for 7+ days
       cf gc --dry-run          # Preview what would be deleted
     """
     try:
@@ -792,7 +794,7 @@ def gc(keep, dry_run, base_path):
         snapshots_dir = base_path / ".cacheflow" / "snapshots"
         collector = SnapshotGC(store, snapshots_dir)
 
-        deleted = collector.collect(keep_latest_n=keep, dry_run=dry_run)
+        deleted = collector.collect(keep_latest_n=keep, dry_run=dry_run, older_than_days=older_than_days)
 
         if dry_run:
             if deleted:
@@ -803,7 +805,6 @@ def gc(keep, dry_run, base_path):
                 click.echo("Nothing to delete.")
         else:
             if deleted:
-                total_mb = sum(0 for _ in deleted)  # files already removed
                 click.echo(f"Deleted {len(deleted)} unreferenced snapshot(s).")
             else:
                 click.echo("Nothing to delete.")

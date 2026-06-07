@@ -23,29 +23,31 @@ from flask import Flask, request, jsonify
 
 
 # ── Binary snapshot format ────────────────────────────────────────────────────
-# Version 2 layout (no pickle — pure struct + raw arrays):
+# Version 3 layout (no pickle — pure struct + raw arrays, scores omitted):
 #
 #   4 bytes  magic = b"CFKV"
-#   4 bytes  version = 2 (LE uint32)
+#   4 bytes  version = 3 (LE uint32)
 #   8 bytes  n_tokens (LE uint64)
 #   8 bytes  seed (LE uint64)
 #   8 bytes  llama_state_size (LE uint64)
 #   <llama_state_size bytes>  raw KV cache bytes
 #   8 bytes  input_ids_len (LE uint64)  — number of int32 elements
 #   <input_ids_len * 4 bytes>  int32 LE array
-#   8 bytes  scores_rows (LE uint64)
+#   8 bytes  scores_rows (LE uint64)   — shape only, no data written
 #   8 bytes  scores_cols (LE uint64)
-#   <scores_rows * scores_cols * 4 bytes>  float32 LE array
+#
+# scores are reconstructed as zeros on read: they are last-batch logit outputs
+# that are immediately overwritten by the next forward pass, so storing them
+# wastes ~297 MB per snapshot with no benefit.
 #
 _SNAPSHOT_MAGIC = b"CFKV"
-_SNAPSHOT_VERSION = 2
+_SNAPSHOT_VERSION = 3
 
 
 def _write_snapshot(filepath: Path, state: "LlamaState") -> None:
-    """Serialize a LlamaState to disk using a versioned binary format (no pickle)."""
+    """Serialize a LlamaState to disk. Scores are not stored (see format note above)."""
     llama_state_bytes = bytes(state.llama_state)
     input_ids_bytes = state.input_ids.astype("<i4").tobytes()
-    scores_bytes = state.scores.astype("<f4").tobytes()
     scores_rows, scores_cols = state.scores.shape
 
     with open(filepath, "wb") as f:
@@ -58,7 +60,7 @@ def _write_snapshot(filepath: Path, state: "LlamaState") -> None:
         f.write(struct.pack("<Q", len(state.input_ids)))
         f.write(input_ids_bytes)
         f.write(struct.pack("<QQ", scores_rows, scores_cols))
-        f.write(scores_bytes)
+        # scores bytes intentionally omitted
 
 
 def _read_snapshot(filepath: Path) -> "LlamaState":
@@ -68,6 +70,11 @@ def _read_snapshot(filepath: Path) -> "LlamaState":
         if magic != _SNAPSHOT_MAGIC:
             raise ValueError(f"Not a CacheFlow snapshot (magic={magic!r}).")
         version = struct.unpack("<I", f.read(4))[0]
+        if version == 2:
+            raise ValueError(
+                "Snapshot is version 2 (outdated format). "
+                "Re-prime this agent to generate a new snapshot: run any task and it will rebuild."
+            )
         if version != _SNAPSHOT_VERSION:
             raise ValueError(
                 f"Unsupported snapshot version {version} (expected {_SNAPSHOT_VERSION}). "
@@ -89,10 +96,8 @@ def _read_snapshot(filepath: Path) -> "LlamaState":
         input_ids = np.frombuffer(input_ids_bytes, dtype="<i4").copy()
 
         scores_rows, scores_cols = struct.unpack("<QQ", f.read(16))
-        scores_bytes = f.read(scores_rows * scores_cols * 4)
-        if len(scores_bytes) != scores_rows * scores_cols * 4:
-            raise ValueError("Truncated scores")
-        scores = np.frombuffer(scores_bytes, dtype="<f4").reshape(scores_rows, scores_cols).copy()
+        # Reconstruct scores as zeros — the next forward pass overwrites them anyway
+        scores = np.zeros((scores_rows, scores_cols), dtype=np.float32)
 
     return LlamaState(
         input_ids=input_ids,
