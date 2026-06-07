@@ -19,6 +19,7 @@ from cacheflow.server import LlamaServer, get_global_server
 from cacheflow.compressor import Compressor
 from cacheflow.indexer import CodeIndexer
 from cacheflow.retriever import CodeRetriever
+from cacheflow.tokenizer import ModelTokenizer, get_tokenizer
 from cacheflow.slot_pool import SlotPool, SlotLease
 
 
@@ -57,6 +58,7 @@ class AgentSession:
         self.server: Optional[LlamaServer] = None
         self.slot_lease: Optional[SlotLease] = None
         self.slot_id: Optional[int] = None
+        self._tokenizer: Optional[ModelTokenizer] = None
         self._setup()
 
     def _setup(self) -> None:
@@ -66,6 +68,7 @@ class AgentSession:
         self.store = CacheFlowStore(db_path)
         with _DB_INIT_LOCK:
             self.store.init_db()
+        self._tokenizer = get_tokenizer(self.config.model_path)
 
     def _acquire_lock(self) -> None:
         """Acquire a KV cache slot for this agent."""
@@ -141,15 +144,8 @@ class AgentSession:
         return files
 
     def _count_tokens(self, text: str) -> int:
-        """Count tokens via server tokenizer if available, else char heuristic."""
-        if self.server is not None:
-            try:
-                result = self.server.count_tokens(text)
-                if isinstance(result, int):
-                    return result
-            except Exception:
-                pass
-        return len(text) // 4  # ~4 chars/token for typical code
+        """Return the exact token count using the model's tokenizer."""
+        return self._tokenizer.count(text)
 
     def _chunk_files_for_ingestion(self, files: list[Path]) -> list[str]:
         """Pack files into chunks that each fit within the context window."""
@@ -157,7 +153,9 @@ class AgentSession:
 
         SKIP_SUFFIXES = {".lock", ".sum", ".mod"}
         SKIP_NAMES = {"package-lock.json", "yarn.lock", "poetry.lock"}
-        MAX_FILE_CHARS = budget_tokens * 4  # approximate max for a single file
+        # Upper char limit per file slice before we do exact token counting.
+        # Assumes worst-case ~4 bytes/token to avoid reading huge files into one string.
+        MAX_FILE_CHARS = budget_tokens * 4
 
         blocks: list[tuple[str, str]] = []
         for f in files:
@@ -197,8 +195,7 @@ class AgentSession:
     def _build_stable_context(self, budget_tokens: int) -> str:
         """Build codebase context that is byte-for-byte identical every session.
 
-        Uses the server's tokenizer for precise token budgeting when available,
-        falling back to a char heuristic otherwise.
+        Uses the model's exact tokenizer for all token budget decisions.
         """
         SKIP_SUFFIXES = {".lock", ".sum", ".mod"}
         SKIP_NAMES = {"package-lock.json", "yarn.lock", "poetry.lock"}

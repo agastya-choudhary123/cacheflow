@@ -274,4 +274,7 @@ class LlamaServer:
             json={"content": text},
         )
         response.raise_for_status()
-        return response.json().get("n_tokens", len(text) // 4)
+        result = response.json()
+        if "n_tokens" not in result:
+            raise RuntimeError(f"Tokenize endpoint returned unexpected response: {result}")
+        return result["n_tokens"]
