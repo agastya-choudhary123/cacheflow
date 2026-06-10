@@ -365,7 +365,9 @@ class CustomLlamaServer:
                 self.slot_manager.invalidate(slot_id)
                 self.slot_manager.switch_to(slot_id)
 
-                tokens = self.model.tokenize(prefix.encode())
+                # special=True so ChatML markers tokenize as special ids, matching
+                # create_completion — otherwise the primed KV never prefix-matches.
+                tokens = self.model.tokenize(prefix.encode(), special=True)
                 self.model.eval(tokens)
 
                 elapsed = time.time() - start

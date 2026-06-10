@@ -58,10 +58,15 @@ class LlamaEngine:
             model_path=model_path,
             n_ctx=ctx_size,
             n_gpu_layers=n_gpu_layers,
-            # flash attention speeds up decode over long cached contexts (~18% on
-            # Metal here), which is exactly the regime CacheFlow runs in: a large
-            # primed codebase in KV, generating against it.
-            flash_attn=True,
+            # flash_attn must stay OFF: it makes llama.cpp's *partial*
+            # kv_cache_seq_rm fail, and llama-cpp-python falls back to
+            # re-evaluating the ENTIRE prompt whenever a new prompt diverges from
+            # the cached tokens before their end. The agentic loop appends an
+            # observation after each turn, so it would re-prefill the whole
+            # codebase (~7k tokens) every step. Keeping flash_attn off lets the
+            # prefix match reuse the KV and evaluate only the new tokens — the
+            # whole point of CacheFlow — at the cost of ~18% decode throughput.
+            flash_attn=False,
             verbose=False,
         )
 
@@ -92,7 +97,11 @@ class LlamaEngine:
             start = time.time()
             self.slot_manager.invalidate(slot_id)
             self.slot_manager.switch_to(slot_id)
-            tokens = self.model.tokenize(prefix.encode())
+            # special=True so ChatML markers like <|im_start|> become their single
+            # special-token ids — the SAME way create_completion tokenizes prompts.
+            # Without this, priming stores the literal characters '<','|','im',...
+            # and generation never prefix-matches the cache (KV reuse silently fails).
+            tokens = self.model.tokenize(prefix.encode(), special=True)
             self.model.eval(tokens)
             return {"n_tokens": self.model.n_tokens, "prime_time_ms": int((time.time() - start) * 1000)}
 
@@ -137,6 +146,7 @@ class LlamaEngine:
         slot_id: int = 0,
         max_tokens: int = 512,
         on_token: Optional[Callable[[str], None]] = None,
+        stop: Optional[list] = None,
     ) -> Dict[str, Any]:
         """Run a completion, reusing the slot's cached prefix via prefix matching.
 
@@ -154,7 +164,9 @@ class LlamaEngine:
             self.slot_manager.switch_to(slot_id)
             n_cached_before = self.model.n_tokens
 
-            prompt_tokens = self.model.tokenize(prompt.encode())
+            # special=True to match create_completion's own tokenization, so this
+            # reused/evaluated measurement reflects the ACTUAL kv prefix match.
+            prompt_tokens = self.model.tokenize(prompt.encode(), special=True)
             cached_ids = self.model._input_ids[:n_cached_before]
             lcp = 0
             for cached_tok, prompt_tok in zip(cached_ids, prompt_tokens):
@@ -169,6 +181,7 @@ class LlamaEngine:
                     prompt=prompt,
                     max_tokens=max_tokens,
                     temperature=0.7,
+                    stop=stop,
                 )
                 content = result["choices"][0]["text"]
                 total_prompt_tokens = result["usage"]["prompt_tokens"]
@@ -181,6 +194,7 @@ class LlamaEngine:
                     max_tokens=max_tokens,
                     temperature=0.7,
                     stream=True,
+                    stop=stop,
                 ):
                     # llama-cpp yields exactly one chunk per generated token, so
                     # counting chunks is the reliable token count — streamed chunks

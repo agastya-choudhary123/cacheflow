@@ -22,6 +22,9 @@ from cacheflow.retriever import CodeRetriever
 from cacheflow.tokenizer import ModelTokenizer, get_tokenizer
 from cacheflow.slot_pool import SlotPool, SlotLease
 from cacheflow.gc import SnapshotGC
+from cacheflow.tools import (
+    ToolContext, parse_action, execute, tools_help, ActionParseError,
+)
 
 
 DEFAULT_SYSTEM_PROMPT = """You are an expert software engineer with deep knowledge of the codebase you've been given access to. You help with coding tasks efficiently and precisely. When you complete a task, briefly summarize what you did and what you learned about the codebase."""
@@ -45,6 +48,30 @@ class SessionResult:
     snapshot_size_bytes: int
     duration_ms: int
     is_first_session: bool
+
+
+@dataclass
+class AgentStep:
+    """One iteration of the agentic loop."""
+
+    thought_action: str   # the model's raw THOUGHT/ACTION/ARGS text
+    tool: str
+    args: dict
+    observation: str
+
+
+@dataclass
+class AgentLoopResult:
+    """Result of an agentic (multi-step) session."""
+
+    agent_name: str
+    task: str
+    final_answer: Optional[str]
+    steps: list
+    completed: bool          # True if the model called finish (vs hit max_steps)
+    tokens_evaluated: int
+    tokens_generated: int
+    duration_ms: int
 
 
 class AgentSession:
@@ -455,6 +482,177 @@ class AgentSession:
                 is_first_session=is_first_session,
             )
 
+        finally:
+            self._release_lock()
+
+    def _restore_or_prime(self, agent: Agent, system_prompt: str) -> str:
+        """Ensure the agent's codebase KV is loaded in the active slot.
+
+        Restores the HEAD snapshot if it still matches; otherwise primes from
+        scratch and promotes the new snapshot to HEAD. Returns the stable prefix.
+        """
+        stable_prefix = self._build_stable_prefix(system_prompt, agent.knowledge_summary)
+        current_hash = _hash_context(stable_prefix)
+        is_first = agent.current_snapshot_path is None
+        context_changed = agent.stable_context_hash != current_hash
+
+        if is_first or context_changed:
+            self.server.prime_slot(stable_prefix, slot_id=self.slot_id)
+            save_result = self.server.save_slot(slot_id=self.slot_id)
+            saved_filename = save_result.get("filename", "")
+            saved_path = self.config.slot_save_path / saved_filename
+            if saved_filename and saved_path.exists() and saved_path.stat().st_size > 0:
+                final_name = f"{agent.name}_{uuid4()}.bin"
+                final_path = self.config.slot_save_path / final_name
+                saved_path.rename(final_path)
+                self.store.update_agent_snapshot(
+                    agent=agent,
+                    snapshot_path=str(final_path),
+                    snapshot_size_bytes=final_path.stat().st_size,
+                    tokens_saved=0,
+                )
+                self.store.update_agent_stable_context(agent, stable_prefix)
+                agent.stable_context_hash = current_hash
+        else:
+            self.server.restore_slot(
+                Path(agent.current_snapshot_path).name, slot_id=self.slot_id
+            )
+        return stable_prefix
+
+    def _build_agentic_preamble(self, task: str) -> str:
+        """First user turn: tool protocol + task, priming the assistant to act."""
+        instructions = (
+            "You are an autonomous coding agent operating in a loop over the codebase "
+            "above. On EACH turn output EXACTLY this, then stop:\n"
+            "THOUGHT: <your reasoning>\n"
+            "ACTION: <tool name>\n"
+            "ARGS: <one-line JSON object>\n"
+            "After ACTION you will receive an OBSERVATION; use it to decide the next "
+            "action. Available tools:\n"
+            f"{tools_help()}\n"
+            "When the task is complete, use ACTION: finish with ARGS "
+            '{"answer": "<final answer>"}.\n\n'
+            f"Task: {task}"
+        )
+        is_qwen = "qwen" in self.config.model_name.lower()
+        if is_qwen:
+            return (
+                f"<|im_start|>user\n{instructions}<|im_end|>\n"
+                f"<|im_start|>assistant\n"
+            )
+        return f"\n\n{instructions}\n\n"
+
+    def _append_observation(self, convo: str, assistant_text: str, observation: str) -> str:
+        """Close the assistant turn, add the observation, re-prime the assistant."""
+        is_qwen = "qwen" in self.config.model_name.lower()
+        if is_qwen:
+            return (
+                convo + assistant_text
+                + f"<|im_end|>\n<|im_start|>user\nOBSERVATION: {observation}<|im_end|>\n"
+                + "<|im_start|>assistant\n"
+            )
+        return convo + assistant_text + f"\nOBSERVATION: {observation}\n\n"
+
+    def run_agentic(
+        self,
+        task: str,
+        system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+        max_steps: int = 12,
+        max_tokens_per_step: int = 512,
+        allow_writes: bool = False,
+        allow_bash: bool = False,
+        on_token: Optional[Callable[[str], None]] = None,
+    ) -> AgentLoopResult:
+        """Run a multi-step agentic task: observe → act → observe over the codebase.
+
+        The codebase KV stays hot in one slot for the whole loop, so every step
+        prefix-matches the cached prefix and only evaluates the new observation +
+        generated action. Read tools are always available; mutating tools and bash
+        are gated behind `allow_writes` / `allow_bash`.
+        """
+        start_time = time.time()
+        try:
+            agent = self.store.get_agent(self.agent_name)
+            if not agent:
+                agent = self.store.create_agent(
+                    self.agent_name, self.config.model_name,
+                    self.config.model_hash, self.config.ctx_size,
+                )
+            elif agent.model_hash != self.config.model_hash:
+                raise RuntimeError(
+                    f"Agent '{self.agent_name}' was created with a different model "
+                    "(hash mismatch). Create a new agent or update config to match."
+                )
+
+            self._acquire_lock()
+            self.server = get_global_engine(
+                model_path=self.config.model_path,
+                slot_save_path=str(self.config.slot_save_path),
+                ctx_size=self.config.ctx_size,
+                n_gpu_layers=self.config.n_gpu_layers,
+            )
+
+            stable_prefix = self._restore_or_prime(agent, system_prompt)
+            ctx = ToolContext(
+                base_path=self.base_path,
+                allow_writes=allow_writes,
+                allow_bash=allow_bash,
+            )
+
+            convo = self._build_agentic_preamble(task)
+            steps: list[AgentStep] = []
+            tokens_evaluated = 0
+            tokens_generated = 0
+            final_answer: Optional[str] = None
+            completed = False
+
+            for _ in range(max_steps):
+                resp = self.server.completion(
+                    prompt=stable_prefix + convo,
+                    slot_id=self.slot_id,
+                    max_tokens=max_tokens_per_step,
+                    on_token=on_token,
+                    stop=["OBSERVATION:", "<|im_end|>"],
+                )
+                tokens_evaluated += resp.get("tokens_evaluated", 0)
+                tokens_generated += resp.get("tokens_predicted", 0)
+                # Keep the generated text VERBATIM (no strip/reformat): it is
+                # appended back into the next prompt, and any change would make the
+                # regenerated prompt diverge from the cached KV tokens, forcing a
+                # re-prefill instead of a cheap prefix-match.
+                content = resp.get("content") or ""
+
+                try:
+                    action = parse_action(content)
+                except ActionParseError as e:
+                    obs = (
+                        f"ERROR: {e}. Reply with exactly THOUGHT/ACTION/ARGS, "
+                        "where ARGS is a one-line JSON object."
+                    )
+                    steps.append(AgentStep(content, "(parse_error)", {}, obs))
+                    convo = self._append_observation(convo, content, obs)
+                    continue
+
+                if action.tool == "finish":
+                    final_answer = action.answer if action.answer is not None else content
+                    steps.append(AgentStep(content, "finish", action.args, ""))
+                    completed = True
+                    break
+
+                obs = execute(action, ctx)
+                steps.append(AgentStep(content, action.tool, action.args, obs))
+                convo = self._append_observation(convo, content, obs)
+
+            return AgentLoopResult(
+                agent_name=self.agent_name,
+                task=task,
+                final_answer=final_answer,
+                steps=steps,
+                completed=completed,
+                tokens_evaluated=tokens_evaluated,
+                tokens_generated=tokens_generated,
+                duration_ms=int((time.time() - start_time) * 1000),
+            )
         finally:
             self._release_lock()
 

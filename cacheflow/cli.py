@@ -204,6 +204,60 @@ def run(task, agent_name, system_prompt, max_tokens, stream, base_path):
 
 
 @cli.command()
+@click.argument("task")
+@click.option("--agent", "agent_name", default="main", help="Agent name (default: main)")
+@click.option("--system-prompt", default=DEFAULT_SYSTEM_PROMPT, help="Custom system prompt")
+@click.option("--max-steps", default=12, help="Max observe→act iterations")
+@click.option("--auto", is_flag=True, help="Allow file writes/edits (write_file, edit_file)")
+@click.option("--allow-bash", is_flag=True, help="Allow shell command execution (run_bash)")
+@click.option("--stream/--no-stream", default=True, help="Stream model output as it generates")
+@click.option("--base-path", default=".", help="Project root")
+def agent(task, agent_name, system_prompt, max_steps, auto, allow_bash, stream, base_path):
+    """Run an agentic task: the model reads/edits files and runs commands in a loop.
+
+    Read tools are always available. File edits require --auto; shell commands
+    require --allow-bash. The codebase stays cached across every step.
+    """
+    try:
+        base_path = Path(base_path)
+        ensure_initialized(base_path)
+        session = AgentSession(agent_name, base_path)
+
+        def on_token(piece: str) -> None:
+            click.echo(piece, nl=False)
+
+        result = session.run_agentic(
+            task,
+            system_prompt=system_prompt,
+            max_steps=max_steps,
+            allow_writes=auto,
+            allow_bash=allow_bash,
+            on_token=on_token if stream else None,
+        )
+
+        click.echo()
+        click.echo()
+        click.echo("✓ Agentic session complete")
+        click.echo()
+        click.echo(f"Agent: {result.agent_name}")
+        click.echo(f"Task: {result.task}")
+        click.echo(f"Steps: {len(result.steps)} (completed: {result.completed})")
+        click.echo(f"Tokens evaluated: {result.tokens_evaluated}")
+        click.echo(f"Tokens generated: {result.tokens_generated}")
+        click.echo(f"Duration: {result.duration_ms}ms")
+        click.echo()
+        click.echo("Tool calls:")
+        for i, step in enumerate(result.steps, 1):
+            obs_preview = step.observation.replace("\n", " ")[:80]
+            click.echo(f"  {i}. {step.tool} {step.args} -> {obs_preview}")
+        click.echo()
+        click.echo("Final answer:")
+        click.echo(result.final_answer or "(no finish action — hit max steps)")
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+
+@cli.command()
 @click.argument("agent_name")
 @click.option("--base-path", default=".", help="Project root")
 def log(agent_name, base_path):
