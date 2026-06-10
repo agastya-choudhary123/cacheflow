@@ -76,7 +76,7 @@ def test_agent_first_session(agent_session, temp_dir):
         "size_bytes": 1024,
     }
 
-    with patch("cacheflow.agent.get_global_server", return_value=mock_server):
+    with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
         result = agent_session.run(
             task="Test task",
             system_prompt=DEFAULT_SYSTEM_PROMPT,
@@ -145,7 +145,7 @@ def test_agent_consecutive_session(agent_session, temp_dir):
     mock_server.restore_slot = MagicMock()
     mock_server.prime_slot = MagicMock()
 
-    with patch("cacheflow.agent.get_global_server", return_value=mock_server):
+    with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
         result = agent_session.run(
             task="Second task",
             system_prompt=DEFAULT_SYSTEM_PROMPT,
@@ -277,7 +277,7 @@ def test_first_session_stores_baseline(agent_session, temp_dir):
         "size_bytes": 1024,
     }
 
-    with patch("cacheflow.agent.get_global_server", return_value=mock_server):
+    with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
         result = agent_session.run(
             task="Test task",
             system_prompt=DEFAULT_SYSTEM_PROMPT,
@@ -312,7 +312,7 @@ def test_codebase_injection_first_session(agent_session, temp_dir):
         "size_bytes": 1024,
     }
 
-    with patch("cacheflow.agent.get_global_server", return_value=mock_server):
+    with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
         agent_session.run(
             task="Analyze this codebase",
             system_prompt=DEFAULT_SYSTEM_PROMPT,

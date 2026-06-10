@@ -148,7 +148,7 @@ class TestRunCommand:
         mock_tokenizer = MagicMock()
         mock_tokenizer.count.return_value = 100
 
-        with patch("cacheflow.agent.get_global_server", return_value=mock_server), \
+        with patch("cacheflow.agent.get_global_engine", return_value=mock_server), \
              patch("cacheflow.agent.get_tokenizer", return_value=mock_tokenizer):
             result = runner.invoke(
                 cli,
@@ -185,7 +185,7 @@ class TestRunCommand:
         mock_tokenizer = MagicMock()
         mock_tokenizer.count.return_value = 100
 
-        with patch("cacheflow.agent.get_global_server", return_value=mock_server), \
+        with patch("cacheflow.agent.get_global_engine", return_value=mock_server), \
              patch("cacheflow.agent.get_tokenizer", return_value=mock_tokenizer):
             result = runner.invoke(
                 cli,
@@ -354,7 +354,7 @@ class TestRunCommandWithAgent:
         mock_tokenizer = MagicMock()
         mock_tokenizer.count.return_value = 100
 
-        with patch("cacheflow.agent.get_global_server", return_value=mock_server), \
+        with patch("cacheflow.agent.get_global_engine", return_value=mock_server), \
              patch("cacheflow.agent.get_tokenizer", return_value=mock_tokenizer):
             result = runner.invoke(
                 cli,

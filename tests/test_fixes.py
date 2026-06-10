@@ -120,7 +120,7 @@ def test_fix1_save_is_synchronous(temp_dir, config):
 
     with patch("cacheflow.agent.get_tokenizer", return_value=mock_tokenizer):
         session = AgentSession("test-agent", temp_dir)
-        with patch("cacheflow.agent.get_global_server", return_value=mock_server):
+        with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
             result = session.run("task")
 
     # If run() succeeds, the file was found — no race
@@ -288,7 +288,7 @@ def test_fix6_context_change_detected_by_hash(temp_dir, config):
 
     with patch("cacheflow.agent.get_tokenizer", return_value=mock_tokenizer):
         session = AgentSession("test-agent", temp_dir)
-    with patch("cacheflow.agent.get_global_server", return_value=mock_server):
+    with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
         session.run("first task")
 
     agent = session.store.get_agent("test-agent")

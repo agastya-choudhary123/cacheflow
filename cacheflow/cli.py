@@ -8,11 +8,13 @@ import click
 from cacheflow.agent import AgentSession, DEFAULT_SYSTEM_PROMPT, fork_agent
 from cacheflow.config import CacheFlowConfig, compute_model_hash, save_config, load_config, register_project
 from cacheflow.server import stop_global_server
+from cacheflow.engine import stop_global_engine
 from cacheflow.store import CacheFlowStore
 from cacheflow.ollama import list_ollama_models, get_ollama_model_path, ollama_is_installed
 
 # Register cleanup on exit
 atexit.register(stop_global_server)
+atexit.register(stop_global_engine)
 
 
 def _discover_models() -> list[tuple[str, str, str]]:
@@ -149,8 +151,9 @@ def init(ctx_size, n_gpu_layers, base_path):
 @click.option("--agent", "agent_name", default="main", help="Agent name (default: main)")
 @click.option("--system-prompt", default=DEFAULT_SYSTEM_PROMPT, help="Custom system prompt")
 @click.option("--max-tokens", default=1024, help="Max tokens to generate")
+@click.option("--stream/--no-stream", default=True, help="Stream the response token-by-token as it generates")
 @click.option("--base-path", default=".", help="Project root")
-def run(task, agent_name, system_prompt, max_tokens, base_path):
+def run(task, agent_name, system_prompt, max_tokens, stream, base_path):
     """Run a single agent session.
 
     Auto-initializes project if not already configured.
@@ -162,8 +165,27 @@ def run(task, agent_name, system_prompt, max_tokens, base_path):
         ensure_initialized(base_path)
 
         session = AgentSession(agent_name, base_path)
-        result = session.run(task, system_prompt=system_prompt, max_tokens=max_tokens)
 
+        # Stream tokens live. The header is printed lazily on the first token so it
+        # only appears once priming/restore is done and generation actually starts.
+        streamed = {"started": False}
+
+        def on_token(piece: str) -> None:
+            if not streamed["started"]:
+                click.echo("Response:")
+                streamed["started"] = True
+            click.echo(piece, nl=False)
+
+        result = session.run(
+            task,
+            system_prompt=system_prompt,
+            max_tokens=max_tokens,
+            on_token=on_token if stream else None,
+        )
+
+        if streamed["started"]:
+            click.echo()  # terminate the streamed line
+        click.echo()
         click.echo("✓ Session complete")
         click.echo()
         click.echo(f"Agent: {result.agent_name}")
@@ -173,9 +195,10 @@ def run(task, agent_name, system_prompt, max_tokens, base_path):
         click.echo(f"Snapshot size: {result.snapshot_size_bytes} bytes")
         click.echo(f"Duration: {result.duration_ms}ms")
         click.echo(f"Is first session: {result.is_first_session}")
-        click.echo()
-        click.echo("Response:")
-        click.echo(result.response)
+        if not streamed["started"]:
+            click.echo()
+            click.echo("Response:")
+            click.echo(result.response)
     except Exception as e:
         raise click.ClickException(str(e))
 

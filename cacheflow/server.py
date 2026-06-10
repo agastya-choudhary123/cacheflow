@@ -7,7 +7,7 @@ import time
 import httpx
 import shutil
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Callable
 from threading import Lock
 
 
@@ -161,6 +161,7 @@ class LlamaServer:
         prompt: str,
         slot_id: int = 0,
         max_tokens: int = 512,
+        on_token: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
         """
         Run a completion request.
@@ -169,6 +170,9 @@ class LlamaServer:
             prompt: Input prompt
             slot_id: Slot ID to use
             max_tokens: Maximum tokens to generate
+            on_token: Accepted for interface parity with LlamaEngine. The HTTP shim
+                does not stream; if given, it is invoked once with the full text so
+                callers relying on the callback still receive output.
 
         Returns:
             Response dict with keys: content, tokens_evaluated, tokens_predicted, usage, etc.
@@ -186,7 +190,10 @@ class LlamaServer:
             },
         )
         response.raise_for_status()
-        return response.json()
+        data = response.json()
+        if on_token is not None:
+            on_token(data.get("content", ""))
+        return data
 
     def prime_slot(self, prefix: str, slot_id: int = 0) -> Dict[str, Any]:
         """Reset the model and eval a stable prefix, establishing the KV baseline.

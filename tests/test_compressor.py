@@ -296,7 +296,7 @@ def test_consolidation_save_restore(config, temp_dir):
     }
     mock_server.save_slot.side_effect = mock_save_slot_side_effect
 
-    with patch("cacheflow.agent.get_global_server", return_value=mock_server):
+    with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
         # Run 3 sessions to accumulate tokens
         for i in range(3):
             result = session.run(
@@ -324,7 +324,7 @@ def test_consolidation_save_restore(config, temp_dir):
     }
     mock_server.save_slot.side_effect = mock_save_slot_side_effect
 
-    with patch("cacheflow.agent.get_global_server", return_value=mock_server):
+    with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
         result = session.run(
             task="Follow-up task",
             system_prompt=DEFAULT_SYSTEM_PROMPT,

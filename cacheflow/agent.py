@@ -9,13 +9,13 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID, uuid4
-from typing import Optional
+from typing import Optional, Callable
 
 logger = logging.getLogger(__name__)
 
 from cacheflow.config import load_config, CacheFlowConfig
 from cacheflow.store import CacheFlowStore, Agent, _hash_context
-from cacheflow.server import LlamaServer, get_global_server
+from cacheflow.engine import LlamaEngine, get_global_engine
 from cacheflow.compressor import Compressor
 from cacheflow.indexer import CodeIndexer
 from cacheflow.retriever import CodeRetriever
@@ -55,7 +55,7 @@ class AgentSession:
         self.base_path = Path(base_path)
         self.config: Optional[CacheFlowConfig] = None
         self.store: Optional[CacheFlowStore] = None
-        self.server: Optional[LlamaServer] = None
+        self.server: Optional[LlamaEngine] = None
         self.slot_lease: Optional[SlotLease] = None
         self.slot_id: Optional[int] = None
         self._tokenizer: Optional[ModelTokenizer] = None
@@ -282,8 +282,14 @@ class AgentSession:
         task: str,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         max_tokens: int = 1024,
+        on_token: Optional[Callable[[str], None]] = None,
     ) -> SessionResult:
-        """Run a single agent session."""
+        """Run a single agent session.
+
+        If `on_token` is given, the final completion streams each generated text
+        piece to the callback as it is produced (the codebase is already cached, so
+        only the task suffix is evaluated before tokens start flowing).
+        """
         start_time = time.time()
 
         try:
@@ -309,8 +315,10 @@ class AgentSession:
             # Step b: Acquire KV cache slot
             self._acquire_lock()
 
-            # Step c: Get persistent LlamaServer singleton
-            self.server = get_global_server(
+            # Step c: Get the in-process model engine (loads model once per process).
+            # In-process — not an HTTP subprocess — so token decode runs at full GPU
+            # speed (the HTTP path throttled decode ~10x on macOS).
+            self.server = get_global_engine(
                 model_path=self.config.model_path,
                 slot_save_path=str(self.config.slot_save_path),
                 ctx_size=self.config.ctx_size,
@@ -356,6 +364,7 @@ class AgentSession:
                 prompt=full_prompt,
                 slot_id=self.slot_id,
                 max_tokens=max_tokens,
+                on_token=on_token,
             )
             completion_time_ms = int((time.time() - completion_start) * 1000)
 

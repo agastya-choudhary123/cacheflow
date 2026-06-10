@@ -320,7 +320,7 @@ def test_multiturn_reasoning_sequence(temp_dir, config):
             "Generate implementation summary",
         ][turn]
 
-        with patch("cacheflow.agent.get_global_server", return_value=mock_server):
+        with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
             result = session.run(
                 task=task,
                 system_prompt=DEFAULT_SYSTEM_PROMPT,
@@ -391,7 +391,7 @@ def test_multiturn_context_coherence(temp_dir, config):
             "size_bytes": 1024,
         }
 
-        with patch("cacheflow.agent.get_global_server", return_value=mock_server):
+        with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
             result = session.run(
                 task=turn_data["task"],
                 system_prompt=DEFAULT_SYSTEM_PROMPT,
@@ -435,7 +435,7 @@ def test_token_accumulation_70_percent_threshold(temp_dir, config):
             "size_bytes": 2048 + (i * 512),
         }
 
-        with patch("cacheflow.agent.get_global_server", return_value=mock_server):
+        with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
             result = session.run(
                 task=f"Task {i}: Process {budget} tokens of data",
                 system_prompt=DEFAULT_SYSTEM_PROMPT,
@@ -475,7 +475,7 @@ def test_context_overflow_prevention(temp_dir, config):
             "size_bytes": 1024,
         }
 
-        with patch("cacheflow.agent.get_global_server", return_value=mock_server):
+        with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
             result = session.run(
                 task=f"Batch {i}: Process data",
                 system_prompt=DEFAULT_SYSTEM_PROMPT,
@@ -536,7 +536,7 @@ def test_concurrent_agents_max_capacity(temp_dir, config):
                 "size_bytes": 1024,
             }
 
-            with patch("cacheflow.agent.get_global_server", return_value=mock_server):
+            with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
                 result = session.run(
                     task=f"Agent {agent_idx}: Analyze codebase",
                     system_prompt=DEFAULT_SYSTEM_PROMPT,
@@ -606,7 +606,7 @@ def test_concurrent_agents_lru_eviction(temp_dir, config):
                 "size_bytes": 1024,
             }
 
-            with patch("cacheflow.agent.get_global_server", return_value=mock_server):
+            with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
                 result = session.run(
                     task=f"Agent {agent_idx}: Task",
                     system_prompt=DEFAULT_SYSTEM_PROMPT,
@@ -667,7 +667,7 @@ def test_kv_cache_prefix_matching_accuracy(temp_dir, config):
         "size_bytes": 4096,
     }
 
-    with patch("cacheflow.agent.get_global_server", return_value=mock_server):
+    with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
         result1 = session.run(
             task="Prime cache with architecture context",
             system_prompt=large_system_prompt,
@@ -688,7 +688,7 @@ def test_kv_cache_prefix_matching_accuracy(temp_dir, config):
         "size_bytes": 4096,
     }
 
-    with patch("cacheflow.agent.get_global_server", return_value=mock_server):
+    with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
         result2 = session.run(
             task="New task, expecting cached KV state",
             system_prompt=large_system_prompt,
@@ -730,7 +730,7 @@ def test_knowledge_probing_accuracy(temp_dir, config):
             "size_bytes": 1024,
         }
 
-        with patch("cacheflow.agent.get_global_server", return_value=mock_server):
+        with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
             session.run(
                 task=f"Fact: {fact}",
                 system_prompt=DEFAULT_SYSTEM_PROMPT,
@@ -769,7 +769,7 @@ def test_compression_triggered_at_threshold(temp_dir, config):
             "size_bytes": 1024,
         }
 
-        with patch("cacheflow.agent.get_global_server", return_value=mock_server):
+        with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
             result = session.run(
                 task=f"Batch {i}",
                 system_prompt=DEFAULT_SYSTEM_PROMPT,
@@ -858,7 +858,7 @@ def test_agent_forking_stress(temp_dir, config):
         "size_bytes": 2048,
     }
 
-    with patch("cacheflow.agent.get_global_server", return_value=mock_server):
+    with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
         parent_result = parent.run(
             task="Analyze codebase architecture",
             system_prompt=DEFAULT_SYSTEM_PROMPT,
@@ -885,7 +885,7 @@ def test_agent_forking_stress(temp_dir, config):
             "size_bytes": 1024,
         }
 
-        with patch("cacheflow.agent.get_global_server", return_value=mock_server):
+        with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
             child_result = child.run(
                 task=f"Child {i} specializes in domain X",
                 system_prompt=DEFAULT_SYSTEM_PROMPT,
