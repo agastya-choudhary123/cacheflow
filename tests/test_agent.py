@@ -183,12 +183,8 @@ def test_default_system_prompt():
 
 def test_session_result_dataclass():
     """Test SessionResult dataclass."""
-    from uuid import uuid4
-
-    commit_id = uuid4()
     result = SessionResult(
         agent_name="test",
-        commit_id=commit_id,
         task="test task",
         response="test response",
         tokens_this_session=100,
@@ -199,7 +195,6 @@ def test_session_result_dataclass():
     )
 
     assert result.agent_name == "test"
-    assert result.commit_id == commit_id
     assert result.tokens_this_session == 100
     assert result.is_first_session is True
 
@@ -250,10 +245,10 @@ def test_fork_agent_no_head_commit(temp_dir, config):
     store = CacheFlowStore(db_path)
     store.init_db()
 
-    # Create parent with no commits
+    # Create parent with no snapshot
     store.create_agent("main", "qwen2.5-coder:7b", "abc123", 8192)
 
-    with pytest.raises(ValueError, match="no HEAD commit"):
+    with pytest.raises(ValueError, match="no snapshot to fork from"):
         fork_agent("main", "child", temp_dir)
 
 
