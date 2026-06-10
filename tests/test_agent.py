@@ -39,7 +39,11 @@ def config(temp_dir):
 @pytest.fixture
 def agent_session(temp_dir, config):
     """Create an agent session."""
-    session = AgentSession("test-agent", temp_dir)
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.count.return_value = 100
+
+    with patch("cacheflow.agent.get_tokenizer", return_value=mock_tokenizer):
+        session = AgentSession("test-agent", temp_dir)
     return session
 
 
