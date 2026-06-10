@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
-from cacheflow.cli import cli, init, run, log, agents, fork, diff, status
+from cacheflow.cli import cli, init, run, log, agents, fork, status
 from cacheflow.config import CacheFlowConfig, save_config
 from cacheflow.store import CacheFlowStore
 from cacheflow.agent import fork_agent
@@ -142,14 +142,20 @@ class TestRunCommand:
             "save_time_ms": 100,
             "size_bytes": 1024,
         }
+        mock_server.prime_slot.return_value = None
 
-        with patch("cacheflow.agent.get_global_server", return_value=mock_server):
+        # Mock tokenizer
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.count.return_value = 100
+
+        with patch("cacheflow.agent.get_global_server", return_value=mock_server), \
+             patch("cacheflow.agent.get_tokenizer", return_value=mock_tokenizer):
             result = runner.invoke(
                 cli,
                 ["run", "Test task", "--agent", "test-agent", "--base-path", str(temp_dir)],
             )
 
-        assert result.exit_code == 0
+        assert result.exit_code == 0, f"Error: {result.output}"
         assert "✓ Session complete" in result.output
         assert "test-agent" in result.output
         assert "Test task" in result.output
@@ -199,90 +205,43 @@ class TestLogCommand:
     """Test the log command."""
 
     def test_log_command_empty(self, runner, temp_dir, config):
-        """Test log command with no commits."""
+        """Test log command with an agent with no snapshot."""
         db_path = temp_dir / ".cacheflow" / "agents.db"
         store = CacheFlowStore(db_path)
 
-        # Create an agent with no commits
+        # Create an agent with no snapshot
         store.create_agent("test-agent", "qwen2.5-coder:7b", "abc123", 8192)
 
         result = runner.invoke(cli, ["log", "test-agent", "--base-path", str(temp_dir)])
 
         assert result.exit_code == 0
-        assert "Commit history for test-agent:" in result.output
-        assert "(no commits)" in result.output
+        assert "test-agent" in result.output
+        assert "qwen2.5-coder:7b" in result.output
 
-    def test_log_command_with_commits(self, runner, temp_dir, config):
-        """Test log command with commit history."""
+    def test_log_command_with_snapshot(self, runner, temp_dir, config):
+        """Test log command with agent that has a snapshot."""
         db_path = temp_dir / ".cacheflow" / "agents.db"
         store = CacheFlowStore(db_path)
 
-        # Create agent and commits
+        # Create agent and snapshot
         agent = store.create_agent("test-agent", "qwen2.5-coder:7b", "abc123", 8192)
 
         snapshot_path = temp_dir / ".cacheflow" / "snapshots" / "snapshot1.bin"
         snapshot_path.parent.mkdir(parents=True, exist_ok=True)
         snapshot_path.write_bytes(os.urandom(1024))
 
-        commit = store.create_commit(
+        store.update_agent_snapshot(
             agent=agent,
             snapshot_path=str(snapshot_path),
-            task="First task",
-            tokens_this_session=100,
-            tokens_saved=0,
-            llama_cpp_version="0.0.0",
-            snapshot_save_time_ms=100,
-            snapshot_restore_time_ms=0,
+            snapshot_size_bytes=1024,
+            tokens_saved=50,
         )
-
-        # Rename to match commit ID
-        final_path = snapshot_path.parent / f"{commit.id}.bin"
-        snapshot_path.rename(final_path)
 
         result = runner.invoke(cli, ["log", "test-agent", "--base-path", str(temp_dir)])
 
         assert result.exit_code == 0
-        assert "Commit history for test-agent:" in result.output
-        assert "First task" in result.output
-        assert "tokens:" in result.output
-
-    def test_log_command_limit(self, runner, temp_dir, config):
-        """Test log command with limit option."""
-        db_path = temp_dir / ".cacheflow" / "agents.db"
-        store = CacheFlowStore(db_path)
-
-        agent = store.create_agent("test-agent", "qwen2.5-coder:7b", "abc123", 8192)
-
-        # Create multiple commits
-        for i in range(3):
-            snapshot_path = temp_dir / ".cacheflow" / "snapshots" / f"snapshot{i}.bin"
-            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-            snapshot_path.write_bytes(os.urandom(1024))
-
-            commit = store.create_commit(
-                agent=agent,
-                snapshot_path=str(snapshot_path),
-                task=f"Task {i}",
-                tokens_this_session=100,
-                tokens_saved=0,
-                parent_id=agent.head_commit_id,
-                llama_cpp_version="0.0.0",
-                snapshot_save_time_ms=100,
-                snapshot_restore_time_ms=0,
-            )
-
-            final_path = snapshot_path.parent / f"{commit.id}.bin"
-            snapshot_path.rename(final_path)
-
-        result = runner.invoke(
-            cli, ["log", "test-agent", "--limit", "2", "--base-path", str(temp_dir)]
-        )
-
-        assert result.exit_code == 0
-        assert "Commit history for test-agent:" in result.output
-        # Should have at most 2 commits shown
-        lines = [line for line in result.output.split("\n") if "Task" in line]
-        assert len(lines) <= 2
+        assert "test-agent" in result.output
+        assert "50" in result.output  # tokens saved
 
     def test_log_command_nonexistent_agent(self, runner, temp_dir, config):
         """Test log command with non-existent agent."""
@@ -481,66 +440,6 @@ class TestForkCommand:
 
 class TestDiffCommand:
     """Test the diff command."""
-
-    def test_diff_command_with_commits(self, runner, temp_dir, config):
-        """Test diff command with two commits."""
-        db_path = temp_dir / ".cacheflow" / "agents.db"
-        store = CacheFlowStore(db_path)
-
-        agent = store.create_agent("main", "qwen2.5-coder:7b", "abc123", 8192)
-
-        # Create two commits
-        for i in range(2):
-            snapshot_path = temp_dir / ".cacheflow" / "snapshots" / f"snapshot{i}.bin"
-            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-            snapshot_path.write_bytes(os.urandom(1024))
-
-            commit = store.create_commit(
-                agent=agent,
-                snapshot_path=str(snapshot_path),
-                task=f"Task {i}",
-                tokens_this_session=100 + i * 10,
-                tokens_saved=0,
-                parent_id=agent.head_commit_id,
-                llama_cpp_version="0.0.0",
-                snapshot_save_time_ms=100,
-                snapshot_restore_time_ms=0,
-            )
-
-            final_path = snapshot_path.parent / f"{commit.id}.bin"
-            snapshot_path.rename(final_path)
-
-        # Get the two commit IDs
-        commits = store.get_commit_history(agent)
-        commit_a = str(commits[0].id)[:8]
-        commit_b = str(commits[1].id)[:8]
-
-        result = runner.invoke(
-            cli,
-            ["diff", commit_a, commit_b, "--agent", "main", "--base-path", str(temp_dir)],
-        )
-
-        assert result.exit_code == 0
-        assert "Diff:" in result.output
-
-    def test_diff_command_nonexistent_commit(self, runner, temp_dir, config):
-        """Test diff with non-existent commit."""
-        result = runner.invoke(
-            cli,
-            [
-                "diff",
-                "ffffffff",
-                "gggggggg",
-                "--agent",
-                "main",
-                "--base-path",
-                str(temp_dir),
-            ],
-        )
-
-        assert result.exit_code != 0
-        assert "not found" in result.output.lower()
-
 
 class TestStatusCommand:
     """Test the status command."""

@@ -9,3 +9,4 @@ build/
 .env.local
 *.db
 *.bin
+.cacheflow/index.json

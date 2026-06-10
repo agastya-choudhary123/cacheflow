@@ -104,39 +104,21 @@ def test_agent_consecutive_session(agent_session, temp_dir):
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     snapshot_path.write_bytes(os.urandom(1024))
 
-    # Create initial commit
-    commit = store.create_commit(
+    # Update agent's snapshot
+    store.update_agent_snapshot(
         agent=agent,
         snapshot_path=str(snapshot_path),
-        task="Initial task",
-        tokens_this_session=100,
+        snapshot_size_bytes=1024,
         tokens_saved=0,
-        llama_cpp_version="0.0.0",
-        snapshot_save_time_ms=100,
-        snapshot_restore_time_ms=0,
     )
 
-    # Set baseline and stable_context for this agent (simulating first session completing)
+    # Set baseline and stable_context for this agent
     store.update_agent_baseline(agent, 100)
-    # Stable context would be set during first session
     store.update_agent_stable_context(agent, DEFAULT_SYSTEM_PROMPT)
-    agent = store.get_agent("test-agent")  # Refresh agent to get updated baseline and stable_context
+    agent = store.get_agent("test-agent")  # Refresh agent
 
-    # Rename to match commit ID and update commit record
-    final_path = snapshot_path.parent / f"{commit.id}.bin"
-    snapshot_path.rename(final_path)
-
-    # Update commit record with final path (like agent.py does)
-    commit.snapshot_path = str(final_path)
-    session = store._get_session()
-    try:
-        session.merge(commit)
-        session.commit()
-    finally:
-        session.close()
-
-    # Create snapshot file that matches the commit record
-    final_path.write_bytes(os.urandom(2048))
+    # Create snapshot file
+    snapshot_path.write_bytes(os.urandom(2048))
 
     # Mock the server for second run
     mock_server = MagicMock()
@@ -228,35 +210,19 @@ def test_fork_agent(temp_dir, config):
     store = CacheFlowStore(db_path)
     store.init_db()
 
-    # Create parent agent with a commit
+    # Create parent agent with a snapshot
     parent = store.create_agent("main", "qwen2.5-coder:7b", "abc123", 8192)
 
     snapshot_path = temp_dir / ".cacheflow" / "snapshots" / "parent_snapshot.bin"
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     snapshot_path.write_bytes(os.urandom(1024))
 
-    parent_commit = store.create_commit(
+    store.update_agent_snapshot(
         agent=parent,
         snapshot_path=str(snapshot_path),
-        task="Parent task",
-        tokens_this_session=100,
+        snapshot_size_bytes=1024,
         tokens_saved=0,
-        llama_cpp_version="0.0.0",
-        snapshot_save_time_ms=100,
-        snapshot_restore_time_ms=0,
     )
-
-    final_path = snapshot_path.parent / f"{parent_commit.id}.bin"
-    snapshot_path.rename(final_path)
-
-    # Update commit's snapshot_path to point to the final renamed file
-    parent_commit.snapshot_path = str(final_path)
-    session = store._get_session()
-    try:
-        session.merge(parent_commit)
-        session.commit()
-    finally:
-        session.close()
 
     # Fork the agent
     child = fork_agent("main", "child", temp_dir, scope="test scope")
@@ -264,14 +230,8 @@ def test_fork_agent(temp_dir, config):
     assert child.name == "child"
     assert child.model_name == parent.model_name
     assert child.ctx_size == parent.ctx_size
-    assert child.head_commit_id is not None
-
-    # Verify child's initial commit
-    child_commit = store.get_commit(child.head_commit_id)
-    assert child_commit is not None
-    assert child_commit.forked_from_id == parent_commit.id
-    assert "Forked from main" in child_commit.task
-    assert "test scope" in child_commit.task
+    assert child.current_snapshot_path is not None
+    assert child.parent_agent_id == parent.id
 
 
 def test_fork_agent_nonexistent_parent(temp_dir, config):

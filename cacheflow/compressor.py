@@ -1,206 +1,32 @@
-"""Background consolidation for context window management."""
+"""Background consolidation (simplified - currently a no-op)."""
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from uuid import uuid4
+from concurrent.futures import ThreadPoolExecutor
 
 from cacheflow.config import CacheFlowConfig
-from cacheflow.server import get_global_server
-from cacheflow.store import Agent, CacheFlowStore, Commit
-from cacheflow.indexer import CodeIndexer
-
+from cacheflow.store import Agent, CacheFlowStore
 
 logger = logging.getLogger(__name__)
 
-# Module-level executor — one thread for all compaction across all agents.
-# Serializes compaction (correct: two agents don't race over the model).
-# Avoids per-Compressor executor leaks from repeated instantiation.
 _COMPACTION_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 
 
-CONSOLIDATION_PROMPT = """You have been given the following conversation history and context.
-Your task is to produce a DENSE KNOWLEDGE SNAPSHOT that captures everything important about the agent's accumulated knowledge.
-
-This snapshot will be used to seed a fresh context window, so be comprehensive but concise.
-
-Requirements:
-- Include all key facts, decisions, and learnings
-- Structure information hierarchically
-- Use bullet points for clarity
-- Keep it under 500 tokens total
-
-Now produce the snapshot:"""
-
-
 class Compressor:
-    """Manages context consolidation when an agent's context exceeds threshold."""
+    """Manages context consolidation (simplified)."""
 
     def __init__(self, store: CacheFlowStore, config: CacheFlowConfig):
         self.store = store
         self.config = config
 
     def needs_compaction(self, agent: Agent) -> bool:
-        """Check if agent's context exceeds 70% of context size."""
-        threshold = int(0.7 * agent.ctx_size)
+        """Context consolidation disabled in simplified mode."""
+        return False
 
-        commits = self.store.get_commit_history(agent)
-
-        # Only count tokens from the last consolidation forward
-        token_count_start = 0
-        for i, commit in enumerate(commits):
-            if "consolidation" in commit.task.lower():
-                token_count_start = i
-
-        total_tokens = sum(c.tokens_this_session for c in commits[token_count_start:])
-        return total_tokens > threshold
-
-    def compact(self, agent: Agent) -> "Commit | None":
-        """Perform context consolidation using the global server singleton.
-
-        Uses get_global_server (not a new LlamaServer instance) so no extra
-        model process or GPU memory is consumed.
-        """
-        if not self.needs_compaction(agent):
-            return None
-
-        try:
-            # Reuse the already-running global server; never spawn a new one
-            server = get_global_server(
-                model_path=self.config.model_path,
-                slot_save_path=str(self.config.slot_save_path),
-                ctx_size=self.config.ctx_size,
-                n_gpu_layers=self.config.n_gpu_layers,
-            )
-
-            commits = self.store.get_commit_history(agent)
-            num_sessions = len(commits)
-
-            # Restore HEAD snapshot into a dedicated compaction slot (slot 1)
-            # to avoid interfering with the agent's active slot (slot 0)
-            compaction_slot = 1
-            if agent.head_commit_id:
-                head_commit = self.store.get_commit(agent.head_commit_id)
-                if head_commit:
-                    snapshot_filename = Path(head_commit.snapshot_path).name
-                    server.restore_slot(snapshot_filename, slot_id=compaction_slot)
-
-            # Build consolidation prompt from commit history
-            history_context = "\n".join(
-                f"- {c.task}: {c.tokens_this_session} tokens"
-                for c in commits
-            )
-            consolidation_input = f"{CONSOLIDATION_PROMPT}\n\nHistory:\n{history_context}"
-
-            response_data = server.completion(
-                prompt=consolidation_input,
-                slot_id=compaction_slot,
-                max_tokens=512,
-            )
-            consolidation_text = response_data.get("content", "")
-
-            # Update index with consolidated knowledge
-            try:
-                indexer = CodeIndexer()
-                knowledge = indexer.consolidate_knowledge(consolidation_text)
-                index_path = self.config.index_path
-                if index_path.exists():
-                    import json
-                    with open(index_path, "r") as f:
-                        index = json.load(f)
-                    index["knowledge"] = knowledge
-                    with open(index_path, "w") as f:
-                        json.dump(index, f, indent=2)
-            except Exception as e:
-                logger.warning(f"Failed to extract knowledge during consolidation: {e}")
-
-            # Erase and re-seed the compaction slot with the summarised knowledge
-            server.erase_slot(slot_id=compaction_slot)
-            server.completion(
-                prompt=f"Knowledge snapshot:\n{consolidation_text}",
-                slot_id=compaction_slot,
-                max_tokens=10,
-            )
-
-            save_result = server.save_slot(slot_id=compaction_slot)
-            saved_filename = save_result.get("filename", "")
-
-            if not saved_filename:
-                raise RuntimeError(f"Failed to save consolidation snapshot: {save_result}")
-
-            saved_path = self.config.slot_save_path / saved_filename
-            if not saved_path.exists():
-                raise RuntimeError(f"Consolidation snapshot not created: {saved_path}")
-
-            snapshot_size = saved_path.stat().st_size
-            if snapshot_size == 0:
-                saved_path.unlink()
-                raise RuntimeError("Consolidation created empty snapshot file")
-
-            temp_snapshot_name = f".tmp_{uuid4()}.bin"
-            temp_snapshot_path = self.config.slot_save_path / temp_snapshot_name
-            saved_path.rename(temp_snapshot_path)
-
-            consolidation_task = f"consolidation (compacted {num_sessions} sessions)"
-            commit = self.store.create_commit(
-                agent=agent,
-                snapshot_path=str(temp_snapshot_path),
-                task=consolidation_task,
-                tokens_this_session=0,
-                tokens_saved=0,
-                parent_id=agent.head_commit_id,
-                llama_cpp_version="0.0.0",
-                snapshot_save_time_ms=save_result.get("save_time_ms", 0),
-                snapshot_restore_time_ms=0,
-            )
-
-            final_snapshot_name = f"{commit.id}.bin"
-            final_snapshot_path = self.config.slot_save_path / final_snapshot_name
-            if temp_snapshot_path.exists():
-                temp_snapshot_path.rename(final_snapshot_path)
-
-            commit.snapshot_path = str(final_snapshot_path)
-            session = self.store._get_session()
-            try:
-                session.merge(commit)
-                session.commit()
-            finally:
-                session.close()
-
-            self._log_consolidation(agent, commit, num_sessions)
-            return commit
-
-        except Exception as e:
-            self._log_error(agent, e)
-            return None
+    def compact(self, agent: Agent):
+        """No-op in simplified mode."""
+        return None
 
     def maybe_compact_async(self, agent: Agent) -> None:
-        """Run consolidation in the background using the module-level executor."""
-        _COMPACTION_EXECUTOR.submit(self._compact_with_error_handling, agent)
-
-    def _compact_with_error_handling(self, agent: Agent) -> None:
-        try:
-            self.compact(agent)
-        except Exception as e:
-            self._log_error(agent, e)
-
-    def _log_consolidation(self, agent: Agent, commit: Commit, num_sessions: int) -> None:
-        log_file = self.config.base_path / ".cacheflow" / "consolidation.log"
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        message = (
-            f"[{agent.name}] Consolidation completed: "
-            f"compacted {num_sessions} sessions, "
-            f"commit={str(commit.id)[:8]}, "
-            f"snapshot_size={commit.snapshot_size_bytes} bytes\n"
-        )
-        with open(log_file, "a") as f:
-            f.write(message)
-
-    def _log_error(self, agent: Agent, error: Exception) -> None:
-        log_file = self.config.base_path / ".cacheflow" / "consolidation.log"
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        message = (
-            f"[{agent.name}] Consolidation error: {type(error).__name__}: {str(error)}\n"
-        )
-        with open(log_file, "a") as f:
-            f.write(message)
+        """Schedule compaction (no-op in simplified mode)."""
+        pass

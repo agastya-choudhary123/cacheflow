@@ -38,7 +38,6 @@ class SessionResult:
     """Result of a single agent session."""
 
     agent_name: str
-    commit_id: UUID
     task: str
     response: str
     tokens_this_session: int
@@ -321,7 +320,7 @@ class AgentSession:
             # Step d: Build stable prefix and detect codebase changes
             restore_time_ms = 0
             prime_time_ms = 0
-            is_first_session = agent.head_commit_id is None
+            is_first_session = agent.current_snapshot_path is None
 
             stable_prefix = self._build_stable_prefix(system_prompt)
             task_suffix = self._build_task_suffix(task)
@@ -336,10 +335,9 @@ class AgentSession:
                 self.server.prime_slot(stable_prefix, slot_id=self.slot_id)
                 prime_time_ms = int((time.time() - prime_start) * 1000)
             else:
-                head_commit = self.store.get_commit(agent.head_commit_id)
-                if head_commit:
+                if agent.current_snapshot_path:
                     restore_start = time.time()
-                    snapshot_filename = Path(head_commit.snapshot_path).name
+                    snapshot_filename = Path(agent.current_snapshot_path).name
                     self.server.restore_slot(snapshot_filename, slot_id=self.slot_id)
                     restore_time_ms = int((time.time() - restore_start) * 1000)
 
@@ -397,57 +395,19 @@ class AgentSession:
                 saved_path.unlink()
                 raise RuntimeError("Server created empty snapshot file")
 
-            # Atomic rename before DB commit
-            temp_snapshot_name = f".tmp_{uuid4()}.bin"
-            temp_snapshot_path = self.config.slot_save_path / temp_snapshot_name
-            saved_path.rename(temp_snapshot_path)
-
-            commit = self.store.create_commit(
-                agent=agent,
-                snapshot_path=str(temp_snapshot_path),
-                task=task,
-                tokens_this_session=tokens_this_session,
-                tokens_saved=tokens_saved,
-                parent_id=agent.head_commit_id,
-                llama_cpp_version="0.0.0",
-                snapshot_save_time_ms=save_time_ms,
-                snapshot_restore_time_ms=restore_time_ms,
-            )
-
-            final_snapshot_name = f"{commit.id}.bin"
+            final_snapshot_name = f"{agent.name}_{uuid4()}.bin"
             final_snapshot_path = self.config.slot_save_path / final_snapshot_name
-            if temp_snapshot_path.exists():
-                temp_snapshot_path.rename(final_snapshot_path)
+            saved_path.rename(final_snapshot_path)
 
-            commit.snapshot_path = str(final_snapshot_path)
-            session = self.store._get_session()
-            try:
-                session.merge(commit)
-                session.commit()
-            finally:
-                session.close()
-
-            prompt_to_log = full_prompt[:1000]
-            session_log = self.store.log_session(
+            self.store.update_agent_snapshot(
                 agent=agent,
-                commit=commit,
-                prompt=prompt_to_log,
-                response=response_text[:5000],
-                tokens_in=tokens_in,
-                tokens_out=tokens_out,
-                duration_ms=completion_time_ms,
+                snapshot_path=str(final_snapshot_path),
+                snapshot_size_bytes=final_snapshot_path.stat().st_size,
+                tokens_saved=tokens_saved,
             )
-
-            try:
-                from cacheflow.knowledge_prober import KnowledgeProber
-                KnowledgeProber(self.store).probe(self.server, self.slot_id, commit, session_log)
-            except Exception:
-                pass
 
             total_duration_ms = int((time.time() - start_time) * 1000)
-            snapshot_size_bytes = (
-                final_snapshot_path.stat().st_size if final_snapshot_path.exists() else 0
-            )
+            snapshot_size_bytes = final_snapshot_path.stat().st_size if final_snapshot_path.exists() else 0
 
             compressor = Compressor(self.store, self.config)
             compressor.maybe_compact_async(agent)
@@ -456,7 +416,6 @@ class AgentSession:
 
             return SessionResult(
                 agent_name=self.agent_name,
-                commit_id=commit.id,
                 task=task,
                 response=response_text,
                 tokens_this_session=tokens_this_session,
@@ -473,7 +432,7 @@ class AgentSession:
 def fork_agent(
     parent_name: str, child_name: str, base_path: Path, scope: str = ""
 ) -> Agent:
-    """Fork a new agent from an existing agent's HEAD snapshot."""
+    """Fork a new agent from an existing agent's snapshot."""
     base_path = Path(base_path)
     db_path = base_path / ".cacheflow" / "agents.db"
     store = CacheFlowStore(db_path)
@@ -482,12 +441,18 @@ def fork_agent(
     if not parent_agent:
         raise ValueError(f"Parent agent '{parent_name}' not found")
 
-    if not parent_agent.head_commit_id:
-        raise ValueError(f"Parent agent '{parent_name}' has no HEAD commit to fork from")
+    if not parent_agent.current_snapshot_path:
+        raise ValueError(f"Parent agent '{parent_name}' has no snapshot to fork from")
 
-    head_commit = store.get_commit(parent_agent.head_commit_id)
-    if not head_commit:
-        raise ValueError(f"Parent's HEAD commit not found")
+    parent_snapshot_path = Path(parent_agent.current_snapshot_path)
+    if not parent_snapshot_path.is_absolute():
+        parent_snapshot_path = base_path / ".cacheflow" / parent_snapshot_path
+
+    if not parent_snapshot_path.exists():
+        raise ValueError(
+            f"Parent snapshot not found at {parent_snapshot_path}. "
+            f"Cannot fork without a valid snapshot to copy."
+        )
 
     child_agent = store.create_agent(
         name=child_name,
@@ -496,44 +461,27 @@ def fork_agent(
         ctx_size=parent_agent.ctx_size,
     )
 
+    # Update child to have parent_agent_id
+    session = store._get_session()
+    try:
+        child_agent.parent_agent_id = parent_agent.id
+        session.merge(child_agent)
+        session.commit()
+    finally:
+        session.close()
+
     snapshots_dir = base_path / ".cacheflow" / "snapshots"
     snapshots_dir.mkdir(parents=True, exist_ok=True)
 
-    parent_snapshot_path = Path(head_commit.snapshot_path)
-    if not parent_snapshot_path.is_absolute():
-        parent_snapshot_path = base_path / ".cacheflow" / parent_snapshot_path
-
-    # Fail fast: a fork without a valid parent snapshot is meaningless
-    if not parent_snapshot_path.exists():
-        raise ValueError(
-            f"Parent snapshot not found at {parent_snapshot_path}. "
-            f"Cannot fork without a valid snapshot to copy."
-        )
-
-    fork_snapshot_name = f"fork_{child_name}_{str(parent_agent.head_commit_id)[:8]}.bin"
+    fork_snapshot_name = f"{child_name}_{uuid4()}.bin"
     fork_snapshot_path = snapshots_dir / fork_snapshot_name
     shutil.copy2(parent_snapshot_path, fork_snapshot_path)
 
-    fork_task = (
-        f"Forked from {parent_name} at {str(parent_agent.head_commit_id)[:8]}"
-        + (f": {scope}" if scope else "")
-    )
-
-    child_commit = store.create_commit(
+    store.update_agent_snapshot(
         agent=child_agent,
         snapshot_path=str(fork_snapshot_path),
-        task=fork_task,
-        tokens_this_session=0,
-        tokens_saved=0,
-        parent_id=None,
-        forked_from_id=parent_agent.head_commit_id,
-        llama_cpp_version="0.0.0",
-        snapshot_save_time_ms=0,
-        snapshot_restore_time_ms=0,
+        snapshot_size_bytes=fork_snapshot_path.stat().st_size,
+        tokens_saved=parent_agent.last_tokens_saved,
     )
-
-    final_snapshot_path = snapshots_dir / f"{child_commit.id}.bin"
-    if fork_snapshot_path.exists():
-        fork_snapshot_path.rename(final_snapshot_path)
 
     return child_agent
