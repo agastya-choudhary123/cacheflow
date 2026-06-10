@@ -134,6 +134,15 @@ def test_edit_not_found_hints_closest_line(temp_dir):
     assert "Closest line" in obs and "def compute(x):" in obs
 
 
+def test_edit_empty_search_rejected(temp_dir):
+    # Guard against text.replace("", x), which inserts x between every char.
+    (temp_dir / "a.py").write_text("x = 1\n")
+    ctx = ToolContext(base_path=temp_dir, allow_writes=True)
+    obs = execute(Action("edit_file", {"path": "a.py", "search": "", "replace": "y", "replace_all": True}, ""), ctx)
+    assert "non-empty" in obs
+    assert (temp_dir / "a.py").read_text() == "x = 1\n"  # unchanged
+
+
 def test_edit_identical_search_replace_rejected(temp_dir):
     (temp_dir / "a.py").write_text("k = 1\n")
     ctx = ToolContext(base_path=temp_dir, allow_writes=True)
@@ -155,6 +164,37 @@ def test_write_overwrite_returns_diff(temp_dir):
     obs = execute(Action("write_file", {"path": "a.py", "content": "new = 1\n"}, ""), ctx)
     assert obs.startswith("OK: overwrote")
     assert "-old = 1" in obs and "+new = 1" in obs
+
+
+def test_syntax_check_valid_python(temp_dir):
+    (temp_dir / "ok.py").write_text("def f(x):\n    return x + 1\n")
+    ctx = ToolContext(base_path=temp_dir)
+    obs = execute(Action("syntax_check", {"path": "ok.py"}, ""), ctx)
+    assert obs.startswith("OK") and "valid Python" in obs
+
+
+def test_syntax_check_catches_python_error(temp_dir):
+    # the exact broken-edit failure mode from the live run: an orphaned return
+    (temp_dir / "bad.py").write_text("def f(x):\n    return x\n    return x - 1\nclass C(\n")
+    ctx = ToolContext(base_path=temp_dir)
+    obs = execute(Action("syntax_check", {"path": "bad.py"}, ""), ctx)
+    assert obs.startswith("SYNTAX ERROR")
+    assert "bad.py:" in obs
+
+
+def test_syntax_check_json(temp_dir):
+    (temp_dir / "good.json").write_text('{"a": 1}')
+    (temp_dir / "bad.json").write_text('{"a": }')
+    ctx = ToolContext(base_path=temp_dir)
+    assert execute(Action("syntax_check", {"path": "good.json"}, ""), ctx).startswith("OK")
+    assert execute(Action("syntax_check", {"path": "bad.json"}, ""), ctx).startswith("SYNTAX ERROR")
+
+
+def test_syntax_check_unknown_type_not_checked(temp_dir):
+    (temp_dir / "notes.txt").write_text("anything goes")
+    ctx = ToolContext(base_path=temp_dir)
+    obs = execute(Action("syntax_check", {"path": "notes.txt"}, ""), ctx)
+    assert obs.startswith("OK") and "not checked" in obs
 
 
 def test_bash_gated_off_by_default(temp_dir):

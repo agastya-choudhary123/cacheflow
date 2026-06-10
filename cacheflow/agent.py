@@ -530,6 +530,8 @@ class AgentSession:
             "After ACTION you will receive an OBSERVATION; use it to decide the next "
             "action. Available tools:\n"
             f"{tools_help()}\n"
+            "After editing or writing a code file, run syntax_check on it and fix "
+            "any reported error before continuing.\n"
             "When the task is complete, use ACTION: finish with ARGS "
             '{"answer": "<final answer>"}.\n\n'
             f"Task: {task}"

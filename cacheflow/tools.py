@@ -153,6 +153,9 @@ def _edit_file(args: dict, ctx: ToolContext) -> str:
     if not path.is_file():
         return f"ERROR: not a file: {args['path']}"
     search, replace = args["search"], args["replace"]
+    if search == "":
+        # text.replace("", x) inserts x between every character — never allow it.
+        return "ERROR: search must be non-empty (provide the exact text to replace)"
     if search == replace:
         return "ERROR: search and replace are identical (no change)"
     text = path.read_text(encoding="utf-8", errors="replace")
@@ -182,6 +185,33 @@ def _closest_line_hint(text: str, search: str) -> str:
     return f" Closest line in file: {best[0].strip()!r}" if best else ""
 
 
+def _syntax_check(args: dict, ctx: ToolContext) -> str:
+    """Parse a file to catch syntax errors after an edit. Never executes code.
+
+    `compile()` only compiles to bytecode (no imports, no side effects), so this is
+    safe to run unattended — it lets the loop verify its own edits and self-correct.
+    """
+    path = _resolve_in_workspace(ctx, args["path"])
+    if not path.is_file():
+        return f"ERROR: not a file: {args['path']}"
+    suffix = path.suffix.lower()
+    text = path.read_text(encoding="utf-8", errors="replace")
+
+    if suffix == ".py":
+        try:
+            compile(text, str(path), "exec")
+            return f"OK: {args['path']} is valid Python"
+        except SyntaxError as e:
+            return f"SYNTAX ERROR: {args['path']}:{e.lineno}: {e.msg}"
+    if suffix == ".json":
+        try:
+            json.loads(text)
+            return f"OK: {args['path']} is valid JSON"
+        except json.JSONDecodeError as e:
+            return f"SYNTAX ERROR: {args['path']}:{e.lineno}: {e.msg}"
+    return f"OK: no syntax checker for '{suffix}' files (not checked)"
+
+
 def _run_bash(args: dict, ctx: ToolContext) -> str:
     if not ctx.allow_bash:
         return "ERROR: bash is disabled (run with --allow-bash to enable command execution)"
@@ -204,6 +234,7 @@ TOOLS: Dict[str, tuple[Callable[[dict, ToolContext], str], str]] = {
     "grep": (_grep, 'grep {"pattern": "regex"} — search the codebase, returns path:line: text'),
     "write_file": (_write_file, 'write_file {"path": "rel/path", "content": "..."} — create/overwrite a file, returns a diff (needs --auto)'),
     "edit_file": (_edit_file, 'edit_file {"path": "rel/path", "search": "exact text", "replace": "new text", "replace_all"?: bool} — replace an exact snippet, returns a diff (needs --auto)'),
+    "syntax_check": (_syntax_check, 'syntax_check {"path": "rel/path"} — verify a file parses (Python/JSON); run this after editing to catch mistakes'),
     "run_bash": (_run_bash, 'run_bash {"command": "..."} — run a shell command (needs --allow-bash)'),
     "finish": (None, 'finish {"answer": "..."} — end the task with a final answer'),
 }
