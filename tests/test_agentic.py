@@ -111,6 +111,52 @@ def test_edit_requires_unique_exact_match(temp_dir):
     assert "a = 9" in (temp_dir / "a.py").read_text()
 
 
+def test_edit_returns_diff(temp_dir):
+    (temp_dir / "a.py").write_text("x = 1\n")
+    ctx = ToolContext(base_path=temp_dir, allow_writes=True)
+    obs = execute(Action("edit_file", {"path": "a.py", "search": "x = 1", "replace": "x = 2"}, ""), ctx)
+    assert "-x = 1" in obs and "+x = 2" in obs
+
+
+def test_edit_replace_all(temp_dir):
+    (temp_dir / "a.py").write_text("v = 1\nv = 1\n")
+    ctx = ToolContext(base_path=temp_dir, allow_writes=True)
+    obs = execute(Action("edit_file", {"path": "a.py", "search": "v = 1", "replace": "v = 9", "replace_all": True}, ""), ctx)
+    assert obs.startswith("OK") and "2 replacements" in obs
+    assert (temp_dir / "a.py").read_text() == "v = 9\nv = 9\n"
+
+
+def test_edit_not_found_hints_closest_line(temp_dir):
+    (temp_dir / "a.py").write_text("def compute(x):\n    return x\n")
+    ctx = ToolContext(base_path=temp_dir, allow_writes=True)
+    obs = execute(Action("edit_file", {"path": "a.py", "search": "def compute(y):", "replace": "z"}, ""), ctx)
+    assert obs.startswith("ERROR")
+    assert "Closest line" in obs and "def compute(x):" in obs
+
+
+def test_edit_identical_search_replace_rejected(temp_dir):
+    (temp_dir / "a.py").write_text("k = 1\n")
+    ctx = ToolContext(base_path=temp_dir, allow_writes=True)
+    obs = execute(Action("edit_file", {"path": "a.py", "search": "k = 1", "replace": "k = 1"}, ""), ctx)
+    assert "identical" in obs
+
+
+def test_read_file_line_window(temp_dir):
+    (temp_dir / "a.py").write_text("L1\nL2\nL3\nL4\nL5\n")
+    ctx = ToolContext(base_path=temp_dir)
+    obs = execute(Action("read_file", {"path": "a.py", "start_line": 2, "end_line": 4}, ""), ctx)
+    assert "L2" in obs and "L4" in obs
+    assert "L1" not in obs and "L5" not in obs
+
+
+def test_write_overwrite_returns_diff(temp_dir):
+    (temp_dir / "a.py").write_text("old = 1\n")
+    ctx = ToolContext(base_path=temp_dir, allow_writes=True)
+    obs = execute(Action("write_file", {"path": "a.py", "content": "new = 1\n"}, ""), ctx)
+    assert obs.startswith("OK: overwrote")
+    assert "-old = 1" in obs and "+new = 1" in obs
+
+
 def test_bash_gated_off_by_default(temp_dir):
     ctx = ToolContext(base_path=temp_dir, allow_bash=False)
     obs = execute(Action("run_bash", {"command": "echo hi"}, ""), ctx)

@@ -14,6 +14,7 @@ read-only and safe.
 
 from __future__ import annotations
 
+import difflib
 import json
 import re
 import subprocess
@@ -67,13 +68,33 @@ def _truncate(text: str) -> str:
     return f"{text[:half]}\n... [truncated {len(text) - _MAX_OBS_CHARS} chars] ...\n{text[-half:]}"
 
 
+def _unified_diff(old: str, new: str, path: str) -> str:
+    """Compact unified diff so the model can see exactly what its edit changed."""
+    diff = difflib.unified_diff(
+        old.splitlines(keepends=True), new.splitlines(keepends=True),
+        fromfile=f"a/{path}", tofile=f"b/{path}", n=2,
+    )
+    return _truncate("".join(diff)) or "(no textual change)"
+
+
 # ── tools ─────────────────────────────────────────────────────────────────────
 
 def _read_file(args: dict, ctx: ToolContext) -> str:
     path = _resolve_in_workspace(ctx, args["path"])
     if not path.is_file():
         return f"ERROR: not a file: {args['path']}"
-    return _truncate(path.read_text(encoding="utf-8", errors="replace"))
+    text = path.read_text(encoding="utf-8", errors="replace")
+    # Optional 1-indexed line window so a big file can be read exactly in chunks
+    # (the whole-file return truncates, which would make edit_file searches fail).
+    start = args.get("start_line")
+    end = args.get("end_line")
+    if start is not None or end is not None:
+        lines = text.splitlines(keepends=True)
+        s = max(1, int(start)) if start is not None else 1
+        e = min(len(lines), int(end)) if end is not None else len(lines)
+        window = "".join(lines[s - 1:e])
+        return _truncate(f"[lines {s}-{e} of {len(lines)}]\n{window}")
+    return _truncate(text)
 
 
 def _list_dir(args: dict, ctx: ToolContext) -> str:
@@ -117,10 +138,12 @@ def _write_file(args: dict, ctx: ToolContext) -> str:
     path = _resolve_in_workspace(ctx, args["path"])
     path.parent.mkdir(parents=True, exist_ok=True)
     content = args["content"]
+    old = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
     existed = path.is_file()
     path.write_text(content, encoding="utf-8")
-    verb = "overwrote" if existed else "created"
-    return f"OK: {verb} {args['path']} ({len(content)} chars)"
+    if not existed:
+        return f"OK: created {args['path']} ({len(content)} chars)"
+    return f"OK: overwrote {args['path']}\n{_unified_diff(old, content, args['path'])}"
 
 
 def _edit_file(args: dict, ctx: ToolContext) -> str:
@@ -130,14 +153,33 @@ def _edit_file(args: dict, ctx: ToolContext) -> str:
     if not path.is_file():
         return f"ERROR: not a file: {args['path']}"
     search, replace = args["search"], args["replace"]
+    if search == replace:
+        return "ERROR: search and replace are identical (no change)"
     text = path.read_text(encoding="utf-8", errors="replace")
     count = text.count(search)
     if count == 0:
-        return "ERROR: search text not found (it must match exactly, including whitespace)"
-    if count > 1:
-        return f"ERROR: search text matches {count} places; make it unique"
-    path.write_text(text.replace(search, replace, 1), encoding="utf-8")
-    return f"OK: edited {args['path']}"
+        # Help the model recover: point at the closest existing line.
+        hint = _closest_line_hint(text, search)
+        return f"ERROR: search text not found (must match exactly, incl. whitespace).{hint}"
+    replace_all = bool(args.get("replace_all", False))
+    if count > 1 and not replace_all:
+        return (
+            f"ERROR: search text matches {count} places; make it unique "
+            'or pass "replace_all": true'
+        )
+    new_text = text.replace(search, replace) if replace_all else text.replace(search, replace, 1)
+    path.write_text(new_text, encoding="utf-8")
+    n = count if replace_all else 1
+    return f"OK: edited {args['path']} ({n} replacement{'s' if n != 1 else ''})\n{_unified_diff(text, new_text, args['path'])}"
+
+
+def _closest_line_hint(text: str, search: str) -> str:
+    """If the search nearly matches a line, surface it so the model can fix whitespace."""
+    needle = search.strip().splitlines()[0] if search.strip() else ""
+    if not needle:
+        return ""
+    best = difflib.get_close_matches(needle, text.splitlines(), n=1, cutoff=0.6)
+    return f" Closest line in file: {best[0].strip()!r}" if best else ""
 
 
 def _run_bash(args: dict, ctx: ToolContext) -> str:
@@ -157,11 +199,11 @@ def _run_bash(args: dict, ctx: ToolContext) -> str:
 
 # Registry: name → (callable, one-line help shown to the model)
 TOOLS: Dict[str, tuple[Callable[[dict, ToolContext], str], str]] = {
-    "read_file": (_read_file, 'read_file {"path": "rel/path"} — return a file\'s contents'),
+    "read_file": (_read_file, 'read_file {"path": "rel/path", "start_line"?: N, "end_line"?: N} — file contents (use a line window for big files so edits can match exactly)'),
     "list_dir": (_list_dir, 'list_dir {"path": "rel/dir"} — list a directory'),
     "grep": (_grep, 'grep {"pattern": "regex"} — search the codebase, returns path:line: text'),
-    "write_file": (_write_file, 'write_file {"path": "rel/path", "content": "..."} — create/overwrite a file (needs --auto)'),
-    "edit_file": (_edit_file, 'edit_file {"path": "rel/path", "search": "exact text", "replace": "new text"} — replace a unique snippet (needs --auto)'),
+    "write_file": (_write_file, 'write_file {"path": "rel/path", "content": "..."} — create/overwrite a file, returns a diff (needs --auto)'),
+    "edit_file": (_edit_file, 'edit_file {"path": "rel/path", "search": "exact text", "replace": "new text", "replace_all"?: bool} — replace an exact snippet, returns a diff (needs --auto)'),
     "run_bash": (_run_bash, 'run_bash {"command": "..."} — run a shell command (needs --allow-bash)'),
     "finish": (None, 'finish {"answer": "..."} — end the task with a final answer'),
 }
