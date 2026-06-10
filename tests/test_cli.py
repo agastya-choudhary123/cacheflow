@@ -180,8 +180,13 @@ class TestRunCommand:
             "save_time_ms": 100,
             "size_bytes": 1024,
         }
+        mock_server.prime_slot.return_value = None
 
-        with patch("cacheflow.agent.get_global_server", return_value=mock_server):
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.count.return_value = 100
+
+        with patch("cacheflow.agent.get_global_server", return_value=mock_server), \
+             patch("cacheflow.agent.get_tokenizer", return_value=mock_tokenizer):
             result = runner.invoke(
                 cli,
                 [
@@ -196,7 +201,7 @@ class TestRunCommand:
                 ],
             )
 
-        assert result.exit_code == 0
+        assert result.exit_code == 0, f"Error: {result.output}"
         # Verify max_tokens was passed to the session
         assert mock_server.completion.called
 
@@ -306,27 +311,14 @@ class TestAgentsCommand:
         snapshot_path.parent.mkdir(parents=True, exist_ok=True)
         snapshot_path.write_bytes(os.urandom(1024))
 
-        commit = store.create_commit(
-            agent=agent,
-            snapshot_path=str(snapshot_path),
-            task="Test task",
-            tokens_this_session=100,
-            tokens_saved=0,
-            llama_cpp_version="0.0.0",
-            snapshot_save_time_ms=100,
-            snapshot_restore_time_ms=0,
-        )
-
-        final_path = snapshot_path.parent / f"{commit.id}.bin"
-        snapshot_path.rename(final_path)
+        store.update_agent_snapshot(agent, str(snapshot_path), 1024, tokens_saved=50)
 
         result = runner.invoke(cli, ["agents", "--base-path", str(temp_dir)])
 
         assert result.exit_code == 0
         assert "test-agent" in result.output
-        assert "head:" in result.output
-        # Should show a short commit ID, not "none"
-        assert "none" not in result.output.lower() or "head: none" not in result.output.lower()
+        assert "✓" in result.output  # Has snapshot indicator
+        assert "50" in result.output  # Tokens saved
 
     def test_agents_command_no_database(self, runner, temp_dir):
         """Test agents command when database doesn't exist."""
@@ -357,8 +349,13 @@ class TestRunCommandWithAgent:
             "save_time_ms": 100,
             "size_bytes": 1024,
         }
+        mock_server.prime_slot.return_value = None
 
-        with patch("cacheflow.agent.get_global_server", return_value=mock_server):
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.count.return_value = 100
+
+        with patch("cacheflow.agent.get_global_server", return_value=mock_server), \
+             patch("cacheflow.agent.get_tokenizer", return_value=mock_tokenizer):
             result = runner.invoke(
                 cli,
                 [
@@ -371,7 +368,7 @@ class TestRunCommandWithAgent:
                 ],
             )
 
-        assert result.exit_code == 0
+        assert result.exit_code == 0, f"Error: {result.output}"
         assert "custom-agent" in result.output
 
 
@@ -383,35 +380,14 @@ class TestForkCommand:
         db_path = temp_dir / ".cacheflow" / "agents.db"
         store = CacheFlowStore(db_path)
 
-        # Create parent agent with a commit
+        # Create parent agent with a snapshot
         parent = store.create_agent("main", "qwen2.5-coder:7b", "abc123", 8192)
 
         snapshot_path = temp_dir / ".cacheflow" / "snapshots" / "snapshot.bin"
         snapshot_path.parent.mkdir(parents=True, exist_ok=True)
         snapshot_path.write_bytes(os.urandom(1024))
 
-        parent_commit = store.create_commit(
-            agent=parent,
-            snapshot_path=str(snapshot_path),
-            task="Initial task",
-            tokens_this_session=100,
-            tokens_saved=0,
-            llama_cpp_version="0.0.0",
-            snapshot_save_time_ms=100,
-            snapshot_restore_time_ms=0,
-        )
-
-        final_path = snapshot_path.parent / f"{parent_commit.id}.bin"
-        snapshot_path.rename(final_path)
-
-        # Update commit's snapshot_path to point to the final renamed file
-        parent_commit.snapshot_path = str(final_path)
-        session = store._get_session()
-        try:
-            session.merge(parent_commit)
-            session.commit()
-        finally:
-            session.close()
+        store.update_agent_snapshot(parent, str(snapshot_path), 1024, tokens_saved=50)
 
         # Fork the agent
         result = runner.invoke(
@@ -419,13 +395,14 @@ class TestForkCommand:
             ["fork", "main", "test-agent", "--base-path", str(temp_dir)],
         )
 
-        assert result.exit_code == 0
+        assert result.exit_code == 0, f"Error: {result.output}"
         assert "Forked 'main' → 'test-agent'" in result.output
 
         # Verify child agent was created
         child = store.get_agent("test-agent")
         assert child is not None
-        assert child.head_commit_id is not None
+        assert child.current_snapshot_path is not None
+        assert child.parent_agent_id == parent.id
 
     def test_fork_command_nonexistent_parent(self, runner, temp_dir, config):
         """Test forking with non-existent parent."""
@@ -445,7 +422,7 @@ class TestStatusCommand:
     """Test the status command."""
 
     def test_status_command_empty(self, runner, temp_dir, config):
-        """Test status command with no commits."""
+        """Test status command with no snapshot."""
         db_path = temp_dir / ".cacheflow" / "agents.db"
         store = CacheFlowStore(db_path)
 
@@ -455,10 +432,10 @@ class TestStatusCommand:
 
         assert result.exit_code == 0
         assert "Status: main" in result.output
-        assert "Total sessions:" in result.output and "0" in result.output
+        assert "Model: qwen2.5-coder:7b" in result.output
 
-    def test_status_command_with_commits(self, runner, temp_dir, config):
-        """Test status command with commits."""
+    def test_status_command_with_snapshot(self, runner, temp_dir, config):
+        """Test status command with snapshot."""
         db_path = temp_dir / ".cacheflow" / "agents.db"
         store = CacheFlowStore(db_path)
 
@@ -468,27 +445,16 @@ class TestStatusCommand:
         snapshot_path.parent.mkdir(parents=True, exist_ok=True)
         snapshot_path.write_bytes(os.urandom(2048))
 
-        commit = store.create_commit(
-            agent=agent,
-            snapshot_path=str(snapshot_path),
-            task="Test task",
-            tokens_this_session=100,
-            tokens_saved=50,
-            llama_cpp_version="0.0.0",
-            snapshot_save_time_ms=100,
-            snapshot_restore_time_ms=0,
-        )
-
-        final_path = snapshot_path.parent / f"{commit.id}.bin"
-        snapshot_path.rename(final_path)
+        store.update_agent_snapshot(agent, str(snapshot_path), 2048, tokens_saved=50)
+        store.update_agent_baseline(agent, 100)
 
         result = runner.invoke(cli, ["status", "--base-path", str(temp_dir)])
 
         assert result.exit_code == 0
         assert "Status: main" in result.output
-        assert "Total sessions:" in result.output and "1" in result.output
-        assert "Total used: 100" in result.output
-        assert "Total saved: 50" in result.output
+        assert "qwen2.5-coder:7b" in result.output
+        assert "50" in result.output  # Last tokens saved
+        assert "100" in result.output  # Baseline
 
     def test_status_command_custom_agent(self, runner, temp_dir, config):
         """Test status command with custom agent."""
