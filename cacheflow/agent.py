@@ -222,25 +222,32 @@ class AgentSession:
             return ""
         return "Codebase:\n" + "".join(parts)
 
-    def _build_stable_prefix(self, system_prompt: str) -> str:
-        """Build the stable KV prefix: system prompt + codebase, WITHOUT the task."""
+    def _build_stable_prefix(self, system_prompt: str, knowledge_summary: Optional[str] = None) -> str:
+        """Build the stable KV prefix: system prompt + codebase, WITHOUT the task.
+
+        If the agent has a distilled `knowledge_summary` (produced by background
+        consolidation), it is folded into the prefix so the learned knowledge
+        persists across sessions as part of the cached KV. Including it changes the
+        prefix hash, which triggers exactly one re-prime; thereafter it's stable.
+        """
         budget_tokens = int(self.config.ctx_size * 0.6)
         context = self._build_stable_context(budget_tokens=budget_tokens)
         is_qwen = "qwen" in self.config.model_name.lower()
 
+        summary = (knowledge_summary or "").strip()
+        summary_block = (
+            f"Consolidated knowledge from previous sessions:\n{summary}\n" if summary else ""
+        )
+
         if is_qwen:
-            if context:
-                return (
-                    f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-                    f"<|im_start|>user\n{context}<|im_end|>\n"
-                )
-            else:
-                return f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+            blocks = f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+            user_parts = "".join(p for p in (context, summary_block) if p)
+            if user_parts:
+                blocks += f"<|im_start|>user\n{user_parts}<|im_end|>\n"
+            return blocks
         else:
-            if context:
-                return f"{system_prompt}\n\n{context}\n\n"
-            else:
-                return f"{system_prompt}\n\n"
+            tail = "".join(f"{p}\n\n" for p in (context, summary_block) if p)
+            return f"{system_prompt}\n\n{tail}" if tail else f"{system_prompt}\n\n"
 
     def _build_task_suffix(self, task: str) -> str:
         """Build the task-specific suffix that appends to the stable prefix."""
@@ -330,7 +337,7 @@ class AgentSession:
             prime_time_ms = 0
             is_first_session = agent.current_snapshot_path is None
 
-            stable_prefix = self._build_stable_prefix(system_prompt)
+            stable_prefix = self._build_stable_prefix(system_prompt, agent.knowledge_summary)
             task_suffix = self._build_task_suffix(task)
             full_prompt = stable_prefix + task_suffix
 
@@ -349,10 +356,17 @@ class AgentSession:
                     self.server.restore_slot(snapshot_filename, slot_id=self.slot_id)
                     restore_time_ms = int((time.time() - restore_start) * 1000)
 
-            # Step e: Save snapshot (stable prefix only, before task evaluation)
-            save_start = time.time()
-            save_result = self.server.save_slot(slot_id=self.slot_id)
-            save_time_ms = int((time.time() - save_start) * 1000)
+            # Step e: Save snapshot (stable prefix only, before task evaluation).
+            # Only save when we actually re-primed: on the restore path the HEAD
+            # snapshot already exists on disk and is byte-identical to what save_slot
+            # would write, so saving again is pure redundant I/O (~503 MB write).
+            primed = is_first_session or context_changed
+            save_time_ms = 0
+            save_result = None
+            if primed:
+                save_start = time.time()
+                save_result = self.server.save_slot(slot_id=self.slot_id)
+                save_time_ms = int((time.time() - save_start) * 1000)
 
             # Step f: Run completion
             completion_start = time.time()
@@ -390,23 +404,27 @@ class AgentSession:
             else:
                 tokens_saved = max(0, agent.baseline_tokens_evaluated - tokens_in)
 
-            # Validate save result
-            saved_filename = save_result.get("filename", "")
-            if not saved_filename:
-                raise RuntimeError(f"Server failed to save snapshot: {save_result}")
+            if primed:
+                # Validate save result and promote the new snapshot to HEAD
+                saved_filename = save_result.get("filename", "")
+                if not saved_filename:
+                    raise RuntimeError(f"Server failed to save snapshot: {save_result}")
 
-            saved_path = self.config.slot_save_path / saved_filename
-            if not saved_path.exists():
-                raise RuntimeError(f"Snapshot file not created by server: {saved_path}")
+                saved_path = self.config.slot_save_path / saved_filename
+                if not saved_path.exists():
+                    raise RuntimeError(f"Snapshot file not created by server: {saved_path}")
 
-            snapshot_size = saved_path.stat().st_size
-            if snapshot_size == 0:
-                saved_path.unlink()
-                raise RuntimeError("Server created empty snapshot file")
+                snapshot_size = saved_path.stat().st_size
+                if snapshot_size == 0:
+                    saved_path.unlink()
+                    raise RuntimeError("Server created empty snapshot file")
 
-            final_snapshot_name = f"{agent.name}_{uuid4()}.bin"
-            final_snapshot_path = self.config.slot_save_path / final_snapshot_name
-            saved_path.rename(final_snapshot_path)
+                final_snapshot_name = f"{agent.name}_{uuid4()}.bin"
+                final_snapshot_path = self.config.slot_save_path / final_snapshot_name
+                saved_path.rename(final_snapshot_path)
+            else:
+                # Restore path: reuse the existing HEAD snapshot (no new file written)
+                final_snapshot_path = Path(agent.current_snapshot_path)
 
             self.store.update_agent_snapshot(
                 agent=agent,
@@ -418,6 +436,9 @@ class AgentSession:
             total_duration_ms = int((time.time() - start_time) * 1000)
             snapshot_size_bytes = final_snapshot_path.stat().st_size if final_snapshot_path.exists() else 0
 
+            # Accumulate this session's token volume, then let the background
+            # compressor decide whether to consolidate (≥70% of context).
+            self.store.add_accumulated_tokens(agent, tokens_this_session)
             compressor = Compressor(self.store, self.config)
             compressor.maybe_compact_async(agent)
 
@@ -436,6 +457,79 @@ class AgentSession:
 
         finally:
             self._release_lock()
+
+    def _build_consolidation_suffix(self) -> str:
+        """The prompt suffix that asks the model to distill what it has learned."""
+        question = (
+            "Based on this codebase and your prior analysis, write a dense, factual "
+            "summary (max ~500 tokens) of the most important things to know: key "
+            "modules and their responsibilities, important functions/classes, "
+            "architectural patterns, and known risks. Be specific and terse. "
+            "Do not include preamble."
+        )
+        is_qwen = "qwen" in self.config.model_name.lower()
+        if is_qwen:
+            return f"<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n"
+        return f"Task: {question}"
+
+    def consolidate(self, summary_max_tokens: int = 500) -> Optional[str]:
+        """Distill the agent's learned knowledge into a persistent summary.
+
+        Runs against the agent's hot codebase KV (restored from HEAD, or primed if
+        needed), asks the model for a dense summary, and stores it. The summary is
+        folded into the stable prefix on the next session, so learned knowledge
+        survives even though each session otherwise restores only the codebase KV.
+        Resets the token accumulator. Best-effort: never raises into the caller.
+
+        Returns the summary text, or None if consolidation was skipped/failed.
+        """
+        try:
+            agent = self.store.get_agent(self.agent_name)
+            if agent is None or agent.current_snapshot_path is None:
+                # Nothing primed yet — nothing to consolidate.
+                return None
+
+            self._acquire_lock()
+            try:
+                self.server = get_global_engine(
+                    model_path=self.config.model_path,
+                    slot_save_path=str(self.config.slot_save_path),
+                    ctx_size=self.config.ctx_size,
+                    n_gpu_layers=self.config.n_gpu_layers,
+                )
+
+                stable_prefix = self._build_stable_prefix(
+                    DEFAULT_SYSTEM_PROMPT, agent.knowledge_summary
+                )
+                current_hash = _hash_context(stable_prefix)
+
+                # Restore the codebase KV if it still matches; otherwise prime fresh.
+                if agent.stable_context_hash == current_hash and agent.current_snapshot_path:
+                    snapshot_filename = Path(agent.current_snapshot_path).name
+                    self.server.restore_slot(snapshot_filename, slot_id=self.slot_id)
+                else:
+                    self.server.prime_slot(stable_prefix, slot_id=self.slot_id)
+
+                response = self.server.completion(
+                    prompt=stable_prefix + self._build_consolidation_suffix(),
+                    slot_id=self.slot_id,
+                    max_tokens=summary_max_tokens,
+                )
+                summary = (response.get("content") or "").strip()
+                if not summary:
+                    return None
+
+                self.store.update_agent_knowledge_summary(agent, summary)
+                logger.info(
+                    "consolidated agent '%s': %d-char knowledge summary, accumulator reset",
+                    self.agent_name, len(summary),
+                )
+                return summary
+            finally:
+                self._release_lock()
+        except Exception:
+            logger.exception("consolidation failed for agent '%s'", self.agent_name)
+            return None
 
 
 def fork_agent(

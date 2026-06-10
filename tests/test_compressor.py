@@ -52,217 +52,6 @@ def compressor(store, config):
     return Compressor(store, config)
 
 
-def test_consolidation_triggers_at_threshold(store, config, compressor, temp_dir):
-    """Test that consolidation triggers when tokens exceed 70% of ctx_size."""
-    # Create agent
-    agent = store.create_agent(
-        "test-agent",
-        "qwen2.5-coder:7b",
-        "abc123def456",
-        8192,
-    )
-
-    # Create commits that sum to >70% of ctx_size (>5734 tokens)
-    threshold = int(0.7 * agent.ctx_size)
-
-    # Create multiple snapshots
-    snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
-    snapshots_dir.mkdir(parents=True, exist_ok=True)
-
-    # First commit: 3000 tokens
-    snapshot1 = snapshots_dir / "snap1.bin"
-    snapshot1.write_bytes(os.urandom(1024))
-    commit1 = store.create_commit(
-        agent=agent,
-        snapshot_path=str(snapshot1),
-        task="First task",
-        tokens_this_session=3000,
-        tokens_saved=0,
-        llama_cpp_version="0.0.0",
-        snapshot_save_time_ms=100,
-        snapshot_restore_time_ms=0,
-    )
-    snapshot1.rename(snapshots_dir / f"{commit1.id}.bin")
-
-    # Second commit: 2800 tokens (total: 5800 > 5734)
-    snapshot2 = snapshots_dir / "snap2.bin"
-    snapshot2.write_bytes(os.urandom(1024))
-    commit2 = store.create_commit(
-        agent=agent,
-        snapshot_path=str(snapshot2),
-        task="Second task",
-        tokens_this_session=2800,
-        tokens_saved=agent.ctx_size,
-        parent_id=commit1.id,
-        llama_cpp_version="0.0.0",
-        snapshot_save_time_ms=100,
-        snapshot_restore_time_ms=100,
-    )
-    snapshot2.rename(snapshots_dir / f"{commit2.id}.bin")
-
-    # Reload agent to get updated head commit
-    agent = store.get_agent("test-agent")
-
-    # Check that consolidation is needed
-    assert compressor.needs_compaction(agent) is True
-    assert sum(c.tokens_this_session for c in store.get_commit_history(agent)) > threshold
-
-
-def test_consolidation_not_triggered_below_threshold(store, config, compressor, temp_dir):
-    """Test that consolidation doesn't trigger below 70% threshold."""
-    # Create agent
-    agent = store.create_agent(
-        "test-agent",
-        "qwen2.5-coder:7b",
-        "abc123def456",
-        8192,
-    )
-
-    # Create commits that sum to <70% of ctx_size (<5734 tokens)
-    snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
-    snapshots_dir.mkdir(parents=True, exist_ok=True)
-
-    # First commit: 2000 tokens (below threshold)
-    snapshot1 = snapshots_dir / "snap1.bin"
-    snapshot1.write_bytes(os.urandom(1024))
-    commit1 = store.create_commit(
-        agent=agent,
-        snapshot_path=str(snapshot1),
-        task="First task",
-        tokens_this_session=2000,
-        tokens_saved=0,
-        llama_cpp_version="0.0.0",
-        snapshot_save_time_ms=100,
-        snapshot_restore_time_ms=0,
-    )
-    snapshot1.rename(snapshots_dir / f"{commit1.id}.bin")
-
-    # Reload agent
-    agent = store.get_agent("test-agent")
-
-    # Check that consolidation is not needed
-    assert compressor.needs_compaction(agent) is False
-
-
-def test_consolidation_compact_returns_none_if_not_needed(
-    store, config, compressor, temp_dir
-):
-    """Test that compact returns None if consolidation not needed."""
-    # Create agent with low tokens
-    agent = store.create_agent(
-        "test-agent",
-        "qwen2.5-coder:7b",
-        "abc123def456",
-        8192,
-    )
-
-    # Create single commit with low tokens
-    snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
-    snapshots_dir.mkdir(parents=True, exist_ok=True)
-
-    snapshot = snapshots_dir / "snap.bin"
-    snapshot.write_bytes(os.urandom(1024))
-    commit = store.create_commit(
-        agent=agent,
-        snapshot_path=str(snapshot),
-        task="Task",
-        tokens_this_session=1000,
-        tokens_saved=0,
-        llama_cpp_version="0.0.0",
-        snapshot_save_time_ms=100,
-        snapshot_restore_time_ms=0,
-    )
-    snapshot.rename(snapshots_dir / f"{commit.id}.bin")
-
-    # Reload agent
-    agent = store.get_agent("test-agent")
-
-    # Should return None since consolidation not needed
-    result = compressor.compact(agent)
-    assert result is None
-
-
-def test_consolidation_logs_result(store, config, compressor, temp_dir):
-    """Test that consolidation result is logged to consolidation.log."""
-    # Create agent
-    agent = store.create_agent(
-        "test-agent",
-        "qwen2.5-coder:7b",
-        "abc123def456",
-        8192,
-    )
-
-    # Create commits that exceed threshold
-    snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
-    snapshots_dir.mkdir(parents=True, exist_ok=True)
-
-    # Create two commits with high tokens
-    snapshot1 = snapshots_dir / "snap1.bin"
-    snapshot1.write_bytes(os.urandom(1024))
-    commit1 = store.create_commit(
-        agent=agent,
-        snapshot_path=str(snapshot1),
-        task="First task",
-        tokens_this_session=4000,
-        tokens_saved=0,
-        llama_cpp_version="0.0.0",
-        snapshot_save_time_ms=100,
-        snapshot_restore_time_ms=0,
-    )
-    snapshot1.rename(snapshots_dir / f"{commit1.id}.bin")
-
-    snapshot2 = snapshots_dir / "snap2.bin"
-    snapshot2.write_bytes(os.urandom(1024))
-    commit2 = store.create_commit(
-        agent=agent,
-        snapshot_path=str(snapshot2),
-        task="Second task",
-        tokens_this_session=2000,
-        tokens_saved=agent.ctx_size,
-        parent_id=commit1.id,
-        llama_cpp_version="0.0.0",
-        snapshot_save_time_ms=100,
-        snapshot_restore_time_ms=100,
-    )
-    snapshot2.rename(snapshots_dir / f"{commit2.id}.bin")
-
-    # Reload agent
-    agent = store.get_agent("test-agent")
-
-    # Create a mock snapshot file for the server to "save"
-    consolidated_snapshot = snapshots_dir / "consolidated.bin"
-    consolidated_snapshot.write_bytes(os.urandom(2048))
-
-    # Mock the server to perform consolidation
-    mock_server = MagicMock()
-    mock_server.completion.return_value = {
-        "content": "Consolidated knowledge snapshot",
-        "tokens_evaluated": 100,
-        "tokens_predicted": 50,
-    }
-    mock_server.save_slot.return_value = {
-        "filename": "consolidated.bin",
-        "save_time_ms": 200,
-        "size_bytes": 2048,
-    }
-
-    with patch("cacheflow.compressor.get_global_server", return_value=mock_server):
-        result = compressor.compact(agent)
-
-    # Check that consolidation happened
-    assert result is not None
-    assert "consolidation" in result.task
-
-    # Check that log file was created and contains the consolidation entry
-    log_file = temp_dir / ".cacheflow" / "consolidation.log"
-    assert log_file.exists()
-
-    log_content = log_file.read_text()
-    assert "test-agent" in log_content
-    assert "Consolidation completed" in log_content
-    assert "compacted" in log_content
-
-
 def test_consolidation_save_restore(config, temp_dir):
     """Test that consolidation preserves agent knowledge across sessions."""
     # This is a higher-level integration test
@@ -334,42 +123,64 @@ def test_consolidation_save_restore(config, temp_dir):
         assert result.response == "Follow-up task completed"
 
 
-def test_consolidation_async_execution(store, config, temp_dir):
-    """Test that maybe_compact_async runs in background thread."""
-    compressor = Compressor(store, config)
+def test_needs_compaction_threshold(store, compressor):
+    """needs_compaction flips True once accumulated tokens reach 70% of context."""
+    agent = store.create_agent("a", "model", "hash", 8192)
+    threshold = int(8192 * 0.7)  # 5734
 
-    # Create agent with low tokens (no consolidation needed)
-    agent = store.create_agent(
-        "test-agent",
-        "qwen2.5-coder:7b",
-        "abc123def456",
-        8192,
-    )
+    store.add_accumulated_tokens(agent, threshold - 1)
+    assert compressor.needs_compaction(agent) is False
 
+    store.add_accumulated_tokens(agent, 2)  # now over the threshold
+    assert compressor.needs_compaction(agent) is True
+
+
+def test_stable_prefix_folds_in_knowledge_summary(temp_dir, config):
+    """A stored knowledge summary is woven into the agent's stable prefix."""
+    session = AgentSession("a", temp_dir)
+    base = session._build_stable_prefix(DEFAULT_SYSTEM_PROMPT, None)
+    with_summary = session._build_stable_prefix(DEFAULT_SYSTEM_PROMPT, "KEY_FACT_XYZ")
+
+    assert "KEY_FACT_XYZ" not in base
+    assert "KEY_FACT_XYZ" in with_summary
+    # Folding in a summary changes the prefix (and therefore its hash → re-prime)
+    assert base != with_summary
+
+
+def test_consolidate_stores_summary_and_resets_accumulator(store, config, temp_dir):
+    """consolidate() distills a summary, persists it, and zeroes the accumulator."""
     snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
     snapshots_dir.mkdir(parents=True, exist_ok=True)
+    snap = snapshots_dir / "head.bin"
+    snap.write_bytes(os.urandom(1024))
 
-    snapshot = snapshots_dir / "snap.bin"
-    snapshot.write_bytes(os.urandom(1024))
-    commit = store.create_commit(
-        agent=agent,
-        snapshot_path=str(snapshot),
-        task="Task",
-        tokens_this_session=1000,
-        tokens_saved=0,
-        llama_cpp_version="0.0.0",
-        snapshot_save_time_ms=100,
-        snapshot_restore_time_ms=0,
-    )
-    snapshot.rename(snapshots_dir / f"{commit.id}.bin")
+    agent = store.create_agent("a", "model", "hash", 8192)
+    store.update_agent_snapshot(agent, str(snap), snap.stat().st_size, tokens_saved=0)
+    store.add_accumulated_tokens(agent, 9000)  # over threshold
 
-    # Calling maybe_compact_async should not raise even though consolidation is not needed
-    # (it will return early in the background thread)
-    compressor.maybe_compact_async(agent)
+    mock_server = MagicMock()
+    mock_server.completion.return_value = {
+        "content": "  Dense summary of the codebase.  ",
+        "tokens_evaluated": 10,
+        "tokens_predicted": 6,
+    }
 
-    # Give thread executor a moment to complete
-    import time
-    time.sleep(0.1)
+    session = AgentSession("a", temp_dir)
+    with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
+        summary = session.consolidate()
 
-    # Should complete without error
-    assert True
+    assert summary == "Dense summary of the codebase."
+    refreshed = store.get_agent("a")
+    assert refreshed.knowledge_summary == "Dense summary of the codebase."
+    assert refreshed.accumulated_tokens == 0
+    # The model was actually consulted (restore-or-prime + completion)
+    assert mock_server.completion.called
+
+
+def test_consolidate_noop_without_snapshot(store, temp_dir):
+    """consolidate() is a safe no-op when the agent has never primed."""
+    store.create_agent("a", "model", "hash", 8192)
+    session = AgentSession("a", temp_dir)
+    assert session.consolidate() is None
+
+

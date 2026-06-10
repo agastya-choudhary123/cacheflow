@@ -1,6 +1,6 @@
 # CacheFlow
 
-**Persistent KV cache for AI agents with multi-agent concurrency. Agents remember everything and run in parallel.**
+**Persistent KV cache for AI agents with multi-agent concurrency. Agents remember the codebase across sessions and run in parallel.**
 
 ## The Problem
 
@@ -8,7 +8,7 @@ Coding agents re-analyze your codebase from scratch in every session, burning to
 
 ## How It Works
 
-CacheFlow uses llama-cpp-python's native KV cache state serialization to save and restore the model's learned knowledge across sessions. Each agent run persists the KV cache state as a snapshot. The next run restores it instead of re-ingesting the codebase.
+CacheFlow uses llama-cpp-python's native KV cache state serialization to save and restore the model's learned knowledge across sessions. Each agent's first run primes the KV cache on `system_prompt + codebase` and persists it as a snapshot. The next run restores that snapshot instead of re-ingesting the codebase, and llama-cpp-python's prefix-matching evaluates only the new task tokens.
 
 **Measured token cost (16384 context window, qwen2.5-coder:7b, this repo):**
 
@@ -18,13 +18,13 @@ CacheFlow uses llama-cpp-python's native KV cache state serialization to save an
 | Prompt cost reduction | — | **~99%** |
 | Total session cost | 7,630 + output | ~5 + output |
 
-The baseline prompt for this codebase is 7,630 tokens (system prompt + codebase). Every session after the first restores the KV snapshot and evaluates only the task suffix (~5-50 tokens). Output tokens are the same either way — caching eliminates prompt re-evaluation, not generation. Savings scale with codebase size.
+The baseline prompt for this codebase is 7,630 tokens (system prompt + codebase). Every session after the first restores the KV snapshot and evaluates only the task suffix (~5–50 tokens). Output tokens are the same either way — caching eliminates prompt re-evaluation, not generation. Savings scale with codebase size.
 
 ## Quick Start
 
 ```bash
 # 1. Install CacheFlow
-pip install cacheflow
+pip install -e ".[dev]"
 
 # 2. Install and run ollama (auto-detected by CacheFlow)
 brew install ollama
@@ -34,18 +34,22 @@ ollama serve
 # 3. Run your first task (auto-initializes project, prompts to pick a model)
 cf run "Analyze this codebase and summarize its architecture"
 
-# 4. Follow up with another task (uses cached knowledge — 95%+ token savings)
+# 4. Follow up with another task (uses cached knowledge — ~99% prompt savings)
 cf run "What are the three highest-priority bugs to fix?"
 
 # 5. See the cost breakdown
 cf log main
 ```
 
-`cf init` is not required — `cf run` auto-initializes on first use by scanning for installed models (ollama, LM Studio, raw GGUF files) and prompting you to pick one. Context size is locked at init time and cannot be changed after.
+`cf init` is not required — `cf run` auto-initializes on first use by scanning for installed models (ollama, LM Studio, raw GGUF files) and prompting you to pick one. Context size is locked at init time and cannot be changed afterward.
+
+## In-Process Execution
+
+CacheFlow runs the model **in the same process** as the agent (`cacheflow/engine.py`, `LlamaEngine`) — no subprocess, no HTTP round-trips. This matters on macOS, where token-by-token GPU decode collapses ~10x while an inbound HTTP request is in flight, and it avoids reloading the model on every `cf run`. A Flask-based HTTP shim (`server.py` + `llama_server_custom.py`) is kept for the out-of-process / multi-client case but is not the default.
 
 ## Multi-Agent Workflows
 
-CacheFlow supports **concurrent execution of multiple agents** using the same model instance. Each agent gets an independent KV cache slot, enabling true parallelism without duplicating the model in memory.
+CacheFlow supports **concurrent execution of multiple agents** sharing a single in-memory model. Each agent gets an independent KV cache slot, enabling parallelism without duplicating the model.
 
 ```python
 from cacheflow.agent import AgentSession
@@ -70,43 +74,18 @@ for t in threads:
     t.join()
 ```
 
-- **True Parallelism**: Multiple agents run simultaneously without blocking
-- **Memory Efficient**: Single model instance shared across all agents
-- **Token Independent**: Each agent's token savings tracked separately
-- **Automatic LRU**: When all 8 slots are full, least-recently-used agent's slot is reclaimed
-- **Independent Histories**: Each agent has its own commit DAG, baseline, and snapshots
+- **Shared model**: one GGUF load in memory; the `CooperativeSlotManager` swaps KV state between agents
+- **Up to 8 slots**: `SlotPool` allocates one slot per agent (the llama.cpp limit)
+- **Automatic LRU**: when all 8 slots are full, the least-recently-used idle agent's slot is reclaimed (never an actively-running one)
+- **Independent HEADs**: each agent points at its own current snapshot and tracks its own baseline/savings
 
-## Snapshot Intelligence Layer
-
-After each session completes (while the KV cache is still hot), CacheFlow runs 4 targeted probes to extract what the model learned:
-
-- What key functions/classes did you analyze?
-- What bugs or risks did you identify?
-- What architectural patterns did you observe?
-- What are the 3 most important facts you learned?
-
-These responses are stored as **knowledge facets**, embedded with `sentence-transformers`, and indexed in SQLite. You can then search and query across past sessions.
+## Forking
 
 ```bash
-# Semantic search across indexed snapshots
-cf query "What do you know about authentication?"
-cf query "database schema" --agent main --top-k 3
-
-# Restore the best-matching snapshot's KV state and query the model live
-cf query --live "How does token refresh work?"
-
-# Search across all registered CacheFlow projects on this machine
-cf query "authentication" --global
-
-# Describe a snapshot
-cf snapshot-describe b353c3e6
-cf snapshot-describe b353c3e6 --deep    # Richer on-demand summary via model inference
-
-# See what changed between two snapshots
-cf diff-knowledge b353c3e6 424c66b8
+cf fork main research          # research inherits a copy of main's HEAD snapshot
 ```
 
-**The novel part**: Most RAG systems inject context into a fresh model. CacheFlow restores the model's *actual past memory state* — the KV cache IS the context. No re-ingestion needed.
+A forked agent's `parent_agent_id` records its lineage and it starts from a copy of the parent's HEAD KV state — all the parent's accumulated codebase knowledge, none of the re-priming cost.
 
 ## CLI Reference
 
@@ -115,127 +94,99 @@ cf init [--ctx-size SIZE] [--n-gpu-layers N] [--base-path PATH]
   Initialize CacheFlow. Discovers installed models and prompts to pick one.
   Locks ctx_size immutably. Rarely needed — cf run auto-runs this.
 
-cf run TASK [--agent AGENT] [--max-tokens N] [--system-prompt TEXT]
-  Run a task. Restores previous snapshot if available; auto-inits on first use.
-  Prints: tokens used, tokens saved, snapshot size, duration.
+cf run TASK [--agent AGENT] [--max-tokens N] [--system-prompt TEXT] [--stream/--no-stream]
+  Run a task. Restores the agent's snapshot if available; auto-inits on first use.
+  Prints: tokens used, tokens saved, snapshot size, duration. Streams by default.
 
 cf repl [--base-path PATH]
-  Interactive REPL with a hot server (model stays loaded between tasks).
+  Interactive REPL with the model kept hot between tasks.
   Commands inside: run AGENT TASK | log AGENT | status [AGENT] | agents | fork PARENT CHILD | exit
 
-cf log AGENT [--limit N]
-  Commit history with token savings per session.
+cf log AGENT [--base-path PATH]
+  Session history with token savings per run.
 
-cf agents
-  List all agents: name, model, context size, HEAD commit.
+cf agents [--base-path PATH]
+  List all agents: name, model, context size, HEAD snapshot.
 
-cf status [--agent AGENT]
-  Agent summary: sessions, total tokens used/saved, snapshot disk usage.
+cf status [--agent AGENT] [--base-path PATH]
+  Agent summary: total tokens used/saved, snapshot disk usage.
 
-cf fork PARENT_AGENT CHILD_AGENT [--scope DESCRIPTION]
-  Fork from parent's HEAD snapshot. Child inherits all knowledge.
+cf fork PARENT_AGENT CHILD_AGENT [--scope DESCRIPTION] [--base-path PATH]
+  Fork from the parent's HEAD snapshot. Child inherits all cached knowledge.
 
-cf diff COMMIT_A COMMIT_B [--agent AGENT]
-  Show task descriptions and token delta between two commits.
-
-cf diff-knowledge COMMIT_A COMMIT_B [--agent AGENT]
-  Semantic diff of knowledge facets (new/removed functions, bugs, patterns, facts).
-
-cf query TEXT [--agent AGENT] [--top-k N] [--live] [--global]
-  Search snapshots semantically. --live restores the best-match KV and asks the model.
-  --global searches across all registered CacheFlow projects.
-
-cf snapshot-describe COMMIT_ID [--deep]
-  Natural language summary of a snapshot. --deep generates richer summary via model inference.
-
-cf gc [--keep N] [--dry-run]
-  Garbage-collect unreferenced snapshot .bin files.
-  Retains HEAD + last N snapshots per agent (default: 3). --dry-run previews.
-
-cf dashboard [--port PORT]
-  Launch web dashboard: commit DAG, search, summaries, live metrics.
-
-cf mcp-server [--dashboard-url URL]
-  Launch MCP server (stdio) for Claude Code / Cursor / Copilot integration.
+cf mcp-server [--dashboard-url URL] [--base-path PATH]
+  Launch the MCP server (stdio) for Claude Code / Cursor / Copilot integration.
 ```
 
 ## How It Works: Technical
 
-### KV Cache Persistence Architecture
+### KV Cache Persistence
 
 CacheFlow's core is **prefix-matching KV cache reuse**. The stable codebase prefix is computed once, serialized to disk, and restored for every subsequent session. Only the new task tokens are evaluated.
 
-**Session 1:**
-1. Prime slot: Evaluate `system_prompt + codebase` (N tokens), populating the KV cache
-2. Save snapshot: Persist the KV state to disk (before task evaluation)
-3. Complete: Eval `stable_prefix + task_suffix` and generate response
-4. Baseline recorded: `tokens_evaluated = N + task_tokens`
+**Session 1 (cold / prime):**
+1. Prime slot: evaluate `system_prompt + codebase` (N tokens), populating the KV cache
+2. Save snapshot: persist the KV state to disk (before task evaluation)
+3. Complete: evaluate `stable_prefix + task_suffix` and generate the response
+4. Baseline recorded: `tokens_evaluated ≈ N + task_tokens`
 
-**Session 2+:**
-1. Restore snapshot: Load the saved KV state from disk (has N cached tokens)
-2. Complete: Eval `task_suffix` only
-   - llama-cpp-python prefix-matches `stable_prefix` against the restored KV (0 re-evaluation)
-   - Only `task_suffix` tokens are newly evaluated (~300-400 tokens)
-3. Savings: `baseline_tokens − newly_evaluated_tokens = ~8,600 tokens saved`
+**Session 2+ (warm / restore):**
+1. Restore snapshot: load the saved KV state from disk (N cached tokens)
+2. Complete: llama-cpp-python prefix-matches `stable_prefix` against the restored KV (0 re-evaluation), so only `task_suffix` is newly evaluated
+3. Savings: `baseline_tokens − newly_evaluated_tokens`
 
-If the codebase changes (detected via SHA-256 hash of the stable prefix), the KV cache is erased and re-primed from scratch. This prevents silent breakage where stale bytes don't match the restored snapshot.
+The warm path **does not re-save** the snapshot — the HEAD on disk is already byte-identical, so re-writing it would be pure redundant I/O.
+
+If the codebase changes (detected via a SHA-256 hash of the stable prefix), the KV cache is erased and re-primed from scratch. This prevents silent breakage where stale bytes don't match the restored snapshot.
+
+### Per-Sequence Snapshots (format v4)
+
+Snapshots use a compact binary format (`CFKV`, version 4) defined in `llama_server_custom.py`. Instead of `model.save_state()` — which serializes the **entire** `n_ctx` buffer (e.g. 16384 tokens) regardless of occupancy — v4 serializes only the live KV via `llama_state_seq_get_data`. A 9k-token prime no longer writes the full 16384-ctx buffer, shrinking both the save write and the restore read. Restore splices the sequence back in with `llama_state_seq_set_data` after clearing the KV. Older v3 (full-state) snapshots remain readable; agents upgrade transparently on their next prime.
 
 ### Exact Token Counting
 
-Token counts are never approximated. CacheFlow uses two sources:
+Token counts are never approximated:
 
-- **Reported stats** (`tokens_this_session`, `tokens_saved`): Come directly from llama-cpp-python's completion response metadata — exact values from the model itself.
-- **Context budget sizing** (`_count_tokens`): Uses `ModelTokenizer` from `cacheflow/tokenizer.py`, which loads the model with `vocab_only=True` — only the BPE vocabulary tables (~50-100 MB), no weights or KV cache. This gives exact token counts for context packing decisions without loading the full model a second time.
+- **Completion stats** (`tokens_this_session`, `tokens_saved`): come directly from llama-cpp-python's response metadata.
+- **Context budget sizing**: `ModelTokenizer` (`cacheflow/tokenizer.py`) loads the model with `vocab_only=True` — only the BPE vocabulary tables (~50–100 MB, no weights or KV cache) — giving exact counts for context-packing decisions without a second full model load.
 
 ### Multi-Slot KV Cache Management
 
-- Up to 8 concurrent agents (via `SlotPool`)
-- Each agent gets an exclusive slot during its session
-- LRU eviction when all slots are full — only idle agents are evicted
-- All agents share a single model instance (one subprocess, one GGUF load)
-- `SlotLease` context manager guarantees cleanup on crash or exception
+- Up to 8 concurrent agents via `SlotPool`
+- Each agent gets an exclusive slot during its session; the `SlotLease` context manager guarantees cleanup on crash or exception
+- LRU eviction only reclaims idle agents' slots, never an actively-running one
+- All agents share a single in-memory model; `CooperativeSlotManager` swaps KV state on context switch
+
+### Semantic RAG for Stable Context
+
+On the first session, `CodeIndexer` chunks the codebase (by file/class/function) and embeds the chunks with `sentence-transformers`; `CodeRetriever` selects the most relevant chunks to build the agent's stable context efficiently rather than dumping the entire tree.
 
 ### Background Consolidation
 
-When an agent's accumulated token count exceeds **70% of context_size**, a background thread fires:
+Each session restores only the codebase KV, so knowledge the model picks up while completing tasks would normally be lost. To keep it, every session adds its token volume to `agent.accumulated_tokens`; once that crosses **70% of the context size**, the `Compressor` schedules consolidation on a background thread (it never blocks the agent). Consolidation restores the agent's hot KV, asks the model for a dense ≤500-token summary of the codebase and what it has learned, and stores it. That summary is folded into the agent's stable prefix on the next session — so distilled knowledge persists across runs — and the token accumulator resets to 0. Folding the summary in changes the prefix hash, triggering exactly one re-prime, after which the agent is stable again.
 
-1. Restore agent's HEAD snapshot
-2. Ask model for a dense knowledge summary (500 tokens)
-3. Erase KV cache; re-seed with summary only
-4. Save new snapshot; create a "consolidation" commit
-5. Reset token counter to 0
+### Snapshot Lifecycle & GC
 
-Never blocks the agent. Preserves learned knowledge while freeing context space.
-
-### Knowledge Probing & Semantic Search
-
-After each session, `KnowledgeProber` runs 4 targeted probes against the hot KV cache to extract structured facets (functions, bugs, patterns, facts). These are embedded with `all-MiniLM-L6-v2` and stored in the `snapshot_embeddings` table.
-
-`SnapshotQueryEngine` uses cosine similarity over these embeddings for semantic search, can restore a past snapshot's KV state for live querying, and computes structured knowledge diffs between any two commits.
-
-### Snapshot Lifecycle
-
-1. **Save**: Written to `.tmp_{uuid}.bin`, DB commit created, then atomically renamed to `{commit-id}.bin`
-2. **Restore**: Read from disk, loaded into model via `load_state()`
-3. **GC**: `SnapshotGC.collect()` removes `.bin` files not referenced by any commit record, retaining HEAD + last N snapshots per agent. Orphaned `.tmp_` files from crashes are always deleted.
-
-Snapshots are named by commit UUID — no accidental overwrites, exact provenance per commit.
+1. **Save** (prime path only): the engine writes the snapshot file; `agent.py` renames it to its final name, then advances the agent's HEAD (`update_agent_snapshot`).
+2. **Restore**: read from disk and splice into the live KV (`_Snapshot.apply_to`).
+3. **GC**: `SnapshotGC.collect()` runs after each session, deleting `.bin` files not referenced by any agent's HEAD plus `.tmp_` orphans from crashed sessions.
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────┐
 │                  CacheFlow CLI                   │
-│  init | run | repl | log | fork | diff | gc ...  │
+│  init | run | repl | log | agents | status |     │
+│  fork | mcp-server                               │
 └──────────────────────┬──────────────────────────┘
                        │
          ┌─────────────┴────────────┐
          │                          │
-   ┌─────▼──────┐          ┌────────▼────────┐
-   │  SlotPool  │          │  CacheFlowStore  │
-   │  (8 slots) │          │  (SQLite DAG)    │
-   └─────┬──────┘          └────────┬─────────┘
-         │                          │
+   ┌─────▼──────┐          ┌────────▼─────────────┐
+   │  SlotPool  │          │   CacheFlowStore     │
+   │  (8 slots) │          │  (SQLite, flat:      │
+   └─────┬──────┘          │   agent + HEAD snap) │
+         │                 └────────┬─────────────┘
    ┌─────▼──────────────┐           │
    │  Agent A (Slot 0)  │           │
    │  Agent B (Slot 1)  ├───┐  ┌────▼──────────────┐
@@ -243,10 +194,11 @@ Snapshots are named by commit UUID — no accidental overwrites, exact provenanc
    │  [Slots 3-7: free] │   │  │  (.cacheflow/     │
    └────────┬───────────┘   │  │   snapshots/)     │
             │               └─►└────┬──────────────┘
-      ┌─────▼──────────┐            │
-      │  LlamaServer   │◄───────────┘
-      │  (subprocess)  │
-      └─────┬──────────┘
+      ┌─────▼──────────────┐        │
+      │   LlamaEngine      │◄───────┘
+      │   (in-process,     │
+      │    single model)   │
+      └─────┬──────────────┘
             │
       ┌─────▼──────────────┐   ┌───────────────────┐
       │  Model Weights     │   │  ModelTokenizer   │
@@ -261,96 +213,80 @@ Snapshots are named by commit UUID — no accidental overwrites, exact provenanc
 cacheflow/
 ├── cacheflow/
 │   ├── cli.py                  # Entry point; all CLI commands
-│   ├── agent.py                # Core loop: prime → save → complete → commit
-│   ├── server.py               # LlamaServer subprocess manager + slot API client
-│   ├── llama_server_custom.py  # Flask server wrapping llama-cpp-python
-│   ├── store.py                # SQLite DAG: agents, commits, sessions, embeddings
+│   ├── agent.py                # Core loop: restore/prime → save → complete → record HEAD
+│   ├── engine.py               # In-process LlamaEngine (primary execution path)
+│   ├── server.py               # Optional HTTP shim: LlamaServer subprocess + client
+│   ├── llama_server_custom.py  # Flask shim + v4 snapshot format + CooperativeSlotManager
+│   ├── store.py                # SQLite flat store: agents + HEAD snapshot pointers
 │   ├── slot_pool.py            # SlotPool: LRU eviction, concurrency, SlotLease
-│   ├── compressor.py           # Background consolidation (70% threshold)
-│   ├── config.py               # Model config, paths, context size
+│   ├── compressor.py           # Background consolidation (≥70%-of-context threshold)
+│   ├── config.py               # Model config, paths, immutable context size
 │   ├── tokenizer.py            # ModelTokenizer: exact token counts via vocab_only
-│   ├── knowledge_prober.py     # KnowledgeProber: facet extraction after each session
-│   ├── snapshot_query.py       # SnapshotQueryEngine: semantic search, live query, diff
 │   ├── gc.py                   # SnapshotGC: garbage-collect unreferenced .bin files
 │   ├── indexer.py              # CodeIndexer: codebase chunking + embedding
 │   ├── retriever.py            # CodeRetriever: semantic RAG for stable context
 │   ├── ollama.py               # Ollama model discovery and path resolution
-│   ├── dashboard.py            # Flask dashboard with REST API
-│   └── mcp_server.py           # MCP server (stdio transport for IDE integration)
-├── frontend/
-│   └── src/
-│       ├── App.tsx             # React dashboard: DAG visualization, search
-│       └── components/         # UI components
-├── tests/                      # Pytest suite (14 test modules)
+│   └── mcp_server.py           # MCP stdio server for IDE integration
+├── tests/                      # Pytest suite
 ├── pyproject.toml              # Package metadata, dependencies, cf entrypoint
 └── .cacheflow/                 # Created at runtime per project
     ├── config.json             # Model path, model hash, ctx_size, GPU layers
-    ├── agents.db               # SQLite: agents, commits, sessions, embeddings
-    ├── snapshots/              # KV cache .bin files (named by commit UUID)
-    ├── index.json              # Semantic index of codebase
-    └── server.log              # llama-server subprocess output
+    ├── agents.db               # SQLite: agents + HEAD snapshot metadata
+    ├── snapshots/              # KV cache .bin files
+    └── server.log              # HTTP-shim subprocess output (when used)
 ```
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `cacheflow/agent.py` | Core `AgentSession.run()` — prime → save → complete → commit |
+| `cacheflow/agent.py` | Core `AgentSession.run()` — restore/prime → save → complete → record HEAD |
+| `cacheflow/engine.py` | In-process `LlamaEngine`; `get_global_engine()` singleton |
 | `cacheflow/cli.py` | All CLI commands; model discovery via ollama/GGUF search |
-| `cacheflow/server.py` | Singleton `LlamaServer` lifecycle; slot API (prime, save, restore) |
-| `cacheflow/llama_server_custom.py` | Flask server wrapping llama-cpp-python; `/tokenize`, `/completion`, `/slots/*` |
-| `cacheflow/store.py` | SQLite schema and DAG operations |
+| `cacheflow/server.py` + `llama_server_custom.py` | Optional HTTP shim; the latter owns the v4 snapshot format and `CooperativeSlotManager` |
+| `cacheflow/store.py` | SQLite flat store (agent + HEAD snapshot) operations |
 | `cacheflow/slot_pool.py` | Multi-agent slot allocation and LRU eviction |
 | `cacheflow/tokenizer.py` | `ModelTokenizer`: exact BPE token counts, `vocab_only=True` |
-| `cacheflow/snapshot_query.py` | `SnapshotQueryEngine`: semantic search, live restore, knowledge diff |
 | `cacheflow/gc.py` | `SnapshotGC`: clean up unreferenced snapshot files |
+| `cacheflow/indexer.py` / `retriever.py` | Semantic RAG: chunk, embed, and retrieve codebase context |
 | `cacheflow/ollama.py` | Ollama model discovery and path resolution |
-| `cacheflow/compressor.py` | Background consolidation thread |
-| `cacheflow/knowledge_prober.py` | Runs 4 probes after each session, embeds results |
-| `cacheflow/dashboard.py` | Flask app + REST API for web dashboard |
 | `cacheflow/mcp_server.py` | MCP stdio server for Claude Code / Cursor integration |
 
 ## MCP Server Integration
 
-CacheFlow provides an **MCP (Model Context Protocol) server** that wraps its REST API as tools, enabling Claude Code, Cursor, Copilot, and other AI tools to query snapshots without leaving your IDE.
+CacheFlow provides an **MCP (Model Context Protocol) server** (`cacheflow/mcp_server.py`) over the stdio transport, for integration with Claude Code, Cursor, Copilot, and other AI tools.
 
-### Available MCP Tools
+Registered tools: `run_agent_task`, `query_snapshots`, `get_snapshot_summary`, `get_dashboard_data`, `get_agent_dag`, `list_agents`.
 
-- `run_agent_task` — Run a task with a CacheFlow agent, using cached KV state if available
-- `query_snapshots` — Semantically search snapshots across an agent's knowledge base
-- `get_snapshot_summary` — Get short summary and faceted knowledge for a snapshot
-- `get_dashboard_data` — Overall metrics, agent stats, session history, and snapshots
-- `get_agent_dag` — Commit DAG showing an agent's evolution
-- `list_agents` — List all agents and their stats
-
-### Starting the MCP Server
+> ⚠️ These tool implementations currently proxy to a REST backend at `--dashboard-url`. That HTTP backend is **not part of this repository**, so tools that depend on it will fail until a backend is supplied. `cf mcp-server` still launches the stdio transport itself.
 
 ```bash
-cf dashboard                    # Start dashboard (optional, default port 8080)
-cf mcp-server                   # Start MCP server (reads from http://127.0.0.1:8080)
-cf mcp-server --dashboard-url http://custom.url:9000
+cf mcp-server                                          # stdio transport
+cf mcp-server --dashboard-url http://custom.url:9000   # custom backend URL
 ```
 
-The MCP server uses stdio transport, making it compatible with IDE config files (e.g., `claude_desktop_config.json` for Claude Code, `cline_mcp_config.json` for Cline).
+The server uses stdio transport, compatible with IDE config files (e.g. `claude_desktop_config.json` for Claude Code, `cline_mcp_config.json` for Cline).
 
 ## Design Decisions
 
-**Immutable snapshots (UUID-named)**: Snapshots are named by commit UUID. No overwrites, exact provenance per commit.
+**Flat store, HEAD per agent**: each agent points at a single current snapshot (`current_snapshot_path`); there is no commit DAG. Forking copies the parent's HEAD and records `parent_agent_id`.
 
-**No slot eviction during session**: `SlotLease` prevents LRU from evicting a slot that's actively in use, even under contention.
+**Per-sequence snapshots**: serialize only the live KV (v4), not the full context buffer.
 
-**Atomic commit and rename**: Snapshot written to `.tmp_{uuid}.bin`, DB transaction committed, then file atomically renamed. Crash-safe — orphaned temp files are cleaned by `cf gc`.
+**Skip the redundant warm-path save**: on restore, the HEAD on disk is already identical, so no re-write.
 
-**Context size immutability**: Locked in `config.json` at init time. Prevents snapshot/restore mismatches if context is later reconfigured.
+**No slot eviction during a session**: `SlotLease` prevents LRU from evicting a slot that's actively in use, even under contention.
 
-**Global server singleton**: `get_global_server()` returns one persistent `LlamaServer` subprocess. Multiple agents share the same model in memory — no duplication.
+**Context size immutability**: locked in `config.json` at init time; prevents snapshot/restore mismatches if context is later reconfigured.
 
-**Exact tokenizer**: `ModelTokenizer` loads the model with `vocab_only=True` in the main process — only the BPE vocabulary (~50-100 MB, no weights) — so token budget decisions during context packing are exact, not approximated.
+**Single in-memory model**: `get_global_engine()` returns one persistent `LlamaEngine`; agents share the model — no duplication.
+
+**Exact tokenizer**: `ModelTokenizer` loads the model with `vocab_only=True` in the main process, so token-budget decisions are exact, not approximated.
 
 ## Requirements
 
 - Python 3.10+
-- `llama-cpp-python` (installed via pip with the package; GPU acceleration requires Metal/CUDA build)
+- `llama-cpp-python` (GPU acceleration requires a Metal/CUDA build)
 - A GGUF model file — any llama.cpp-compatible model works; Qwen models get automatic ChatML formatting
 
 Recommended: `ollama pull qwen2.5-coder:7b` — CacheFlow auto-discovers ollama models on init.
@@ -358,16 +294,9 @@ Recommended: `ollama pull qwen2.5-coder:7b` — CacheFlow auto-discovers ollama 
 ## Installation
 
 ```bash
-# Install from source
 git clone https://github.com/agastya-choudhary123/cacheflow
 cd cacheflow
 pip install -e ".[dev]"
-
-# Build the frontend dashboard (optional)
-cd frontend
-npm install
-npm run build
-cd ..
 ```
 
 ## Testing
@@ -376,47 +305,19 @@ cd ..
 pytest tests/                           # Run all tests
 pytest tests/test_agent.py              # Specific file
 pytest tests/test_agent.py::test_name   # Specific test
-pytest tests/test_stress.py             # Stress tests (13 tests, ~90s)
 pytest -xvs                             # Stop on first failure, verbose
 ```
 
-**Test modules:**
-- `test_agent.py` — Core session flow, prefix-matching, consolidation
-- `test_cli.py` — CLI commands, initialization, agent management
-- `test_store.py` — SQLite DAG operations, commit records
-- `test_slot_pool.py` — Multi-agent concurrency, LRU eviction
-- `test_compressor.py` — Background consolidation logic
-- `test_rag_integration.py` — Semantic retrieval, indexing
-- `test_multi_agent.py` — Concurrent agents, forking
-- `test_server_smoke.py` — Server subprocess health
-- `test_stress.py` — Large codebase (10k+ LOC), 8 concurrent agents, RAG throughput
+A shared `tests/conftest.py` autouse fixture patches `cacheflow.agent.get_tokenizer` with a lightweight fake, so constructing an `AgentSession` in unit tests never loads a real model. Mock `get_global_engine()` (or `get_global_server()` for the HTTP shim) to avoid running a real model; tests needing specific token counts patch `get_tokenizer` inline to override the default fake.
 
-**Mocking conventions:**
-```python
-from unittest.mock import patch
-
-@patch('cacheflow.agent.get_global_server')
-@patch('cacheflow.agent.get_tokenizer')
-def test_something(mock_tokenizer, mock_server):
-    mock_tokenizer.return_value.count.return_value = 100
-    # ...
-```
-
-Mock `get_global_server()` to avoid spawning real llama-cpp processes. Mock `get_tokenizer()` to avoid loading the model's vocabulary in unit tests. Use the `temp_cacheflow_dir` fixture for isolated project directories.
+**Test modules:** `test_agent.py`, `test_cli.py`, `test_store.py`, `test_config.py`, `test_compressor.py`, `test_rag_integration.py`, `test_indexer.py`, `test_multi_agent.py`, `test_fixes.py` (regressions incl. snapshot format + `SnapshotGC`), `test_stress.py`, `test_server_smoke.py`, `test_system_questions*.py`.
 
 ## Performance
 
 **Memory:**
-- Model weights: ~4-8 GB (7B model at 4-bit quantization)
-- Model tokenizer (vocab_only): ~50-100 MB (main process)
-- KV cache per slot: ~1-2 GB at 8192 context
-- SQLite database: ~100 MB per 100 sessions
-
-**Speed:**
-- Session 1 (full codebase prime): ~2-3 minutes (includes model load)
-- Session 2+ (cached): ~30-60 seconds (restore + task completion)
-- Consolidation: ~1-2 minutes (async, non-blocking)
-- Semantic search: ~18 ms/query (all-MiniLM-L6-v2 on CPU)
+- Model weights: ~4–8 GB (7B model at 4-bit quantization)
+- Model tokenizer (vocab_only): ~50–100 MB (main process)
+- KV cache per slot: ~1–2 GB at 8192 context
 
 **Token efficiency (measured on this repo, 16384 ctx, qwen2.5-coder:7b):**
 - Baseline prompt: 7,630 tokens (system prompt + codebase)

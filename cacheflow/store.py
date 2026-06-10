@@ -5,7 +5,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, ForeignKey, Uuid, event, text
+from sqlalchemy import create_engine, Column, String, Integer, Text, DateTime, ForeignKey, Uuid, event, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session as SQLSession
 from sqlalchemy.exc import IntegrityError
 
@@ -34,6 +34,12 @@ class Agent(Base):
     current_snapshot_size_bytes = Column(Integer, nullable=False, default=0)
     last_tokens_saved = Column(Integer, nullable=False, default=0)
     parent_agent_id = Column(Uuid, ForeignKey("agents.id"), nullable=True)  # for forking
+    # Running sum of tokens processed since the last consolidation; drives the
+    # background Compressor's 70%-of-context threshold.
+    accumulated_tokens = Column(Integer, nullable=False, default=0)
+    # Dense distilled knowledge the agent has learned, folded into its stable
+    # prefix on the next prime so it persists across sessions.
+    knowledge_summary = Column(Text, nullable=True)
 
 
 class CacheFlowStore:
@@ -75,6 +81,8 @@ class CacheFlowStore:
                 ("last_tokens_saved", "ALTER TABLE agents ADD COLUMN last_tokens_saved INTEGER DEFAULT 0"),
                 ("parent_agent_id", "ALTER TABLE agents ADD COLUMN parent_agent_id TEXT"),
                 ("stable_context_hash", "ALTER TABLE agents ADD COLUMN stable_context_hash TEXT"),
+                ("accumulated_tokens", "ALTER TABLE agents ADD COLUMN accumulated_tokens INTEGER DEFAULT 0"),
+                ("knowledge_summary", "ALTER TABLE agents ADD COLUMN knowledge_summary TEXT"),
             ]
 
             for col_name, migration_sql in migrations:
@@ -139,6 +147,40 @@ class CacheFlowStore:
             agent.baseline_tokens_evaluated = baseline
             session.merge(agent)
             session.commit()
+        finally:
+            session.close()
+
+    def add_accumulated_tokens(self, agent: Agent, n: int) -> int:
+        """Add n to the agent's running token accumulator; return the new total."""
+        session = self._get_session()
+        try:
+            fresh = session.query(Agent).filter(Agent.id == agent.id).first()
+            if fresh is None:
+                return 0
+            fresh.accumulated_tokens = (fresh.accumulated_tokens or 0) + max(0, n)
+            total = fresh.accumulated_tokens
+            session.commit()
+            agent.accumulated_tokens = total
+            return total
+        finally:
+            session.close()
+
+    def update_agent_knowledge_summary(self, agent: Agent, summary: str) -> None:
+        """Store the distilled knowledge summary and reset the token accumulator.
+
+        Resetting the accumulator here (not separately) keeps the two consistent:
+        the summary *is* the consolidation of everything accumulated so far.
+        """
+        session = self._get_session()
+        try:
+            fresh = session.query(Agent).filter(Agent.id == agent.id).first()
+            if fresh is None:
+                return
+            fresh.knowledge_summary = summary
+            fresh.accumulated_tokens = 0
+            session.commit()
+            agent.knowledge_summary = summary
+            agent.accumulated_tokens = 0
         finally:
             session.close()
 

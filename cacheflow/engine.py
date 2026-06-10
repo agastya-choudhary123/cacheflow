@@ -103,10 +103,15 @@ class LlamaEngine:
             filepath = self.slot_save_path / filename
             if not filepath.exists():
                 raise FileNotFoundError(f"Snapshot not found: {filepath}")
-            state = _read_snapshot(filepath)
-            self.slot_manager._slot_states[slot_id] = state
-            self.slot_manager._active_slot = None  # force switch_to to load it
+            snap = _read_snapshot(filepath)
+            # Make this slot active (flushing any other), splice the snapshot's KV
+            # into the live context, then record the resulting in-memory state so
+            # later context switches preserve it.
+            self.slot_manager.invalidate(slot_id)
             self.slot_manager.switch_to(slot_id)
+            snap.apply_to(self.model)
+            self.slot_manager._slot_states[slot_id] = self.model.save_state()
+            self.slot_manager._active_slot = slot_id
             return {"filename": filename, "restore_time_ms": int((time.time() - start) * 1000)}
 
     def save_slot(self, slot_id: int = 0) -> Dict[str, Any]:
@@ -119,7 +124,7 @@ class LlamaEngine:
             filename = f"slot_{slot_id}_{uuid.uuid4().hex[:8]}.bin"
             filepath = self.slot_save_path / filename
             start = time.time()
-            _write_snapshot(filepath, state)
+            _write_snapshot(filepath, self.model, state)
             return {
                 "filename": filename,
                 "save_time_ms": int((time.time() - start) * 1000),

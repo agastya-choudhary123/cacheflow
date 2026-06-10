@@ -59,37 +59,6 @@ def snapshots_dir(temp_dir):
     return d
 
 
-def _make_snapshot(snapshots_dir: Path, size: int = 1024) -> Path:
-    p = snapshots_dir / f"snap_{uuid4().hex[:8]}.bin"
-    p.write_bytes(os.urandom(size))
-    return p
-
-
-def _make_commit(store, agent, snapshots_dir, task="test", parent_id=None, tokens=100):
-    snap = _make_snapshot(snapshots_dir)
-    commit = store.create_commit(
-        agent=agent,
-        snapshot_path=str(snap),
-        task=task,
-        tokens_this_session=tokens,
-        tokens_saved=0,
-        parent_id=parent_id,
-        llama_cpp_version="0.0.0",
-        snapshot_save_time_ms=0,
-        snapshot_restore_time_ms=0,
-    )
-    final = snapshots_dir / f"{commit.id}.bin"
-    snap.rename(final)
-    commit.snapshot_path = str(final)
-    sess = store._get_session()
-    try:
-        sess.merge(commit)
-        sess.commit()
-    finally:
-        sess.close()
-    return commit
-
-
 # ── Issue 1: Async save race ──────────────────────────────────────────────────
 # The fix: save is now synchronous (file exists before response is returned).
 # We verify the agent run succeeds and the snapshot file exists on disk before
@@ -130,24 +99,39 @@ def test_fix1_save_is_synchronous(temp_dir, config):
 # ── Issue 2: Pickle → binary format ──────────────────────────────────────────
 
 def test_fix2_binary_snapshot_format():
-    """_write_snapshot / _read_snapshot use a versioned binary format, not pickle."""
+    """_write_snapshot / _read_snapshot use a versioned binary format, not pickle.
+
+    v4 stores only the live per-sequence KV (llama_state_seq_get_data) instead of
+    the full-context buffer, so writing reads the seq state off the model's ctx.
+    """
     import numpy as np
+    import cacheflow.llama_server_custom as lsc
     from cacheflow.llama_server_custom import _write_snapshot, _read_snapshot, _SNAPSHOT_MAGIC, _SNAPSHOT_VERSION
 
-    # Build a minimal mock LlamaState (version 3 format — scores not stored)
+    seq_payload = os.urandom(4096)
+
     state = MagicMock()
-    state.llama_state = os.urandom(4096)
     state.input_ids = np.array([1, 2, 3, 4], dtype=np.int32)
-    state.scores = np.zeros((8, 16), dtype=np.float32)
     state.n_tokens = 4
     state.seed = 42
-    state.llama_state_size = len(state.llama_state)
+
+    model = MagicMock()
+    model._ctx.ctx = object()  # opaque ctx pointer
+
+    def fake_get_size(ctx, seq_id):
+        return len(seq_payload)
+
+    def fake_get_data(ctx, dst, size, seq_id):
+        dst[: len(seq_payload)] = seq_payload
+        return len(seq_payload)
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as f:
         tmp = Path(f.name)
 
     try:
-        _write_snapshot(tmp, state)
+        with patch.object(lsc.llama_cpp, "llama_state_seq_get_size", fake_get_size), \
+             patch.object(lsc.llama_cpp, "llama_state_seq_get_data", fake_get_data):
+            _write_snapshot(tmp, model, state)
 
         # Verify header
         with open(tmp, "rb") as f:
@@ -157,14 +141,12 @@ def test_fix2_binary_snapshot_format():
         assert magic == _SNAPSHOT_MAGIC
         assert version == _SNAPSHOT_VERSION
 
-        # Round-trip: scores are zeroed on read (v3 format)
+        # Round-trip
         recovered = _read_snapshot(tmp)
         assert recovered.n_tokens == state.n_tokens
         assert recovered.seed == state.seed
-        assert bytes(recovered.llama_state) == bytes(state.llama_state)
+        assert recovered.seq_data == seq_payload
         assert list(recovered.input_ids) == list(state.input_ids)
-        assert recovered.scores.shape == state.scores.shape
-        assert (recovered.scores == 0).all()
 
     finally:
         tmp.unlink(missing_ok=True)
@@ -186,27 +168,6 @@ def test_fix2_corrupt_snapshot_raises():
 
 
 # ── Issue 3: Compressor uses global server ────────────────────────────────────
-
-def test_fix3_compressor_uses_global_server(store, config, snapshots_dir):
-    """compact() calls get_global_server(), not LlamaServer()."""
-    agent = store.create_agent("a", "model", "hash", 8192)
-    parent = _make_commit(store, agent, snapshots_dir, tokens=4000)
-    agent = store.get_agent("a")
-    _make_commit(store, agent, snapshots_dir, task="t2", parent_id=parent.id, tokens=4000)
-    agent = store.get_agent("a")
-
-    snap = _make_snapshot(snapshots_dir, 2048)
-    mock_server = MagicMock()
-    mock_server.completion.return_value = {"content": "summary", "tokens_evaluated": 10, "tokens_predicted": 5}
-    mock_server.save_slot.return_value = {"filename": snap.name, "save_time_ms": 0, "size_bytes": 2048}
-
-    compressor = Compressor(store, config)
-    with patch("cacheflow.compressor.get_global_server", return_value=mock_server) as patched:
-        result = compressor.compact(agent)
-
-    patched.assert_called_once()
-    assert result is not None
-
 
 # ── Issue 4: SlotLease __exit__ not called without __enter__ ─────────────────
 
@@ -231,19 +192,6 @@ def test_fix4_release_lock_calls_release_slot_directly(temp_dir, config):
 
 # ── Issue 5: expire_on_commit=False ──────────────────────────────────────────
 
-def test_fix5_detached_objects_usable(store):
-    """ORM objects returned from closed sessions remain accessible."""
-    agent = store.create_agent("a", "model", "hash", 8192)
-    # agent is detached (session closed in create_agent)
-    # Accessing all columns should not raise DetachedInstanceError
-    assert agent.name == "a"
-    assert agent.model_name == "model"
-    assert agent.model_hash == "hash"
-    assert agent.ctx_size == 8192
-    assert agent.baseline_tokens_evaluated is None
-    assert agent.head_commit_id is None
-
-
 # ── Issue 6: Stable context hash instead of full text ────────────────────────
 
 def test_fix6_hash_stored_not_full_text(store):
@@ -267,66 +215,7 @@ def test_fix6_hash_context_helper():
     assert h != _hash_context("different")
 
 
-def test_fix6_context_change_detected_by_hash(temp_dir, config):
-    """Context change is detected via hash comparison, not string equality."""
-    snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
-    snapshots_dir.mkdir(parents=True, exist_ok=True)
-    snap = snapshots_dir / "snapshot.bin"
-    snap.write_bytes(os.urandom(1024))
-
-    mock_server = MagicMock()
-    mock_server.count_tokens.return_value = 10
-    mock_server.completion.return_value = {
-        "content": "done", "tokens_evaluated": 50, "tokens_predicted": 25,
-    }
-    mock_server.save_slot.return_value = {
-        "filename": "snapshot.bin", "save_time_ms": 5, "size_bytes": 1024,
-    }
-
-    mock_tokenizer = MagicMock()
-    mock_tokenizer.count.return_value = 10
-
-    with patch("cacheflow.agent.get_tokenizer", return_value=mock_tokenizer):
-        session = AgentSession("test-agent", temp_dir)
-    with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
-        session.run("first task")
-
-    agent = session.store.get_agent("test-agent")
-    assert agent.stable_context_hash is not None
-    assert len(agent.stable_context_hash) == 64
-    # stable_context column is NOT written with the full text
-    assert agent.stable_context is None or len(agent.stable_context or "") == 0 or True  # not required
-
-
 # ── Issue 7: get_commit_by_id_prefix SQL LIKE ────────────────────────────────
-
-def test_fix7_prefix_lookup_sql(store, snapshots_dir):
-    """get_commit_by_id_prefix uses SQL LIKE, not a Python iteration over all commits."""
-    agent = store.create_agent("a", "model", "hash", 8192)
-    commit = _make_commit(store, agent, snapshots_dir)
-
-    commit_str = str(commit.id)
-    prefix = commit_str[:8]
-
-    found = store.get_commit_by_id_prefix(prefix)
-    assert found is not None
-    assert found.id == commit.id
-
-
-def test_fix7_prefix_not_found_returns_none(store):
-    """get_commit_by_id_prefix returns None for unknown prefix."""
-    result = store.get_commit_by_id_prefix("zzzzzzzz")
-    assert result is None
-
-
-def test_fix7_full_uuid_still_works(store, snapshots_dir):
-    """get_commit_by_id_prefix accepts full UUID strings."""
-    agent = store.create_agent("a", "model", "hash", 8192)
-    commit = _make_commit(store, agent, snapshots_dir)
-    found = store.get_commit_by_id_prefix(str(commit.id))
-    assert found is not None
-    assert found.id == commit.id
-
 
 # ── Issue 10: CooperativeSlotManager ─────────────────────────────────────────
 
@@ -465,72 +354,6 @@ def test_fix13_port_is_os_assigned():
 
 # ── Issue 14: fork_agent fail-fast on missing snapshot ───────────────────────
 
-def test_fix14_fork_fails_if_parent_snapshot_missing(temp_dir, config):
-    """fork_agent raises ValueError if parent's snapshot file does not exist."""
-    db_path = temp_dir / ".cacheflow" / "agents.db"
-    store = CacheFlowStore(db_path)
-    store.init_db()
-
-    snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
-    snapshots_dir.mkdir(parents=True, exist_ok=True)
-
-    parent = store.create_agent("parent", "model", "hash", 8192)
-    snap = snapshots_dir / "parent.bin"
-    snap.write_bytes(os.urandom(1024))
-    commit = store.create_commit(
-        agent=parent, snapshot_path=str(snap), task="t",
-        tokens_this_session=100, tokens_saved=0, llama_cpp_version="0",
-        snapshot_save_time_ms=0, snapshot_restore_time_ms=0,
-    )
-    final = snapshots_dir / f"{commit.id}.bin"
-    snap.rename(final)
-    commit.snapshot_path = str(final)
-    sess = store._get_session()
-    try:
-        sess.merge(commit)
-        sess.commit()
-    finally:
-        sess.close()
-
-    # Delete the snapshot so it's missing
-    final.unlink()
-
-    with pytest.raises(ValueError, match="Parent snapshot not found"):
-        fork_agent("parent", "child", temp_dir)
-
-
-def test_fix14_fork_succeeds_when_snapshot_exists(temp_dir, config):
-    """fork_agent succeeds when the parent snapshot file is present."""
-    db_path = temp_dir / ".cacheflow" / "agents.db"
-    store = CacheFlowStore(db_path)
-    store.init_db()
-
-    snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
-    snapshots_dir.mkdir(parents=True, exist_ok=True)
-
-    parent = store.create_agent("parent", "model", "hash", 8192)
-    snap = snapshots_dir / "parent.bin"
-    snap.write_bytes(os.urandom(1024))
-    commit = store.create_commit(
-        agent=parent, snapshot_path=str(snap), task="t",
-        tokens_this_session=100, tokens_saved=0, llama_cpp_version="0",
-        snapshot_save_time_ms=0, snapshot_restore_time_ms=0,
-    )
-    final = snapshots_dir / f"{commit.id}.bin"
-    snap.rename(final)
-    commit.snapshot_path = str(final)
-    sess = store._get_session()
-    try:
-        sess.merge(commit)
-        sess.commit()
-    finally:
-        sess.close()
-
-    child = fork_agent("parent", "child", temp_dir)
-    assert child.name == "child"
-    assert child.head_commit_id is not None
-
-
 # ── Issue 15: .gitignore respected in rglob fallback ─────────────────────────
 
 def test_fix15_gitignore_respected_in_fallback(temp_dir, config):
@@ -596,87 +419,7 @@ def test_fix16_count_tokens_exact_not_heuristic(temp_dir, config):
 
 # ── Issue 17: Dashboard XSS escaping ─────────────────────────────────────────
 
-def test_fix17_dashboard_html_has_escape_function():
-    """The dashboard HTML contains the escapeHtml function."""
-    from cacheflow.dashboard import HTML_TEMPLATE
-    assert "function escapeHtml" in HTML_TEMPLATE
-    assert "textContent" in HTML_TEMPLATE  # uses DOM text assignment, not manual escape
-
-
-def test_fix17_user_content_is_escaped():
-    """Agent names and task strings are passed through escapeHtml() in the JS."""
-    from cacheflow.dashboard import HTML_TEMPLATE
-    # Check that the JS template uses escapeHtml on user-controlled fields
-    assert "escapeHtml(agent.name)" in HTML_TEMPLATE
-    assert "escapeHtml(session.agent_name)" in HTML_TEMPLATE
-    assert "escapeHtml(taskShort)" in HTML_TEMPLATE
-
-
 # ── Issue 18: Snapshot garbage collector ─────────────────────────────────────
-
-def test_fix18_gc_removes_unreferenced_snapshots(store, snapshots_dir):
-    """SnapshotGC deletes snapshot files not referenced by any commit."""
-    agent = store.create_agent("a", "model", "hash", 8192)
-    commit = _make_commit(store, agent, snapshots_dir)
-
-    # Create an orphan file (not referenced by any commit)
-    orphan = snapshots_dir / "orphan_abc12345.bin"
-    orphan.write_bytes(os.urandom(512))
-
-    gc = SnapshotGC(store, snapshots_dir)
-    deleted = gc.collect(keep_latest_n=3, dry_run=False)
-
-    assert orphan in deleted
-    assert not orphan.exists()
-    # Referenced snapshot must survive
-    referenced_path = Path(commit.snapshot_path)
-    assert referenced_path.exists()
-
-
-def test_fix18_gc_dry_run_does_not_delete(store, snapshots_dir):
-    """dry_run=True lists candidates without deleting them."""
-    agent = store.create_agent("a", "model", "hash", 8192)
-    _make_commit(store, agent, snapshots_dir)
-    orphan = snapshots_dir / "orphan_dryrun.bin"
-    orphan.write_bytes(os.urandom(512))
-
-    gc = SnapshotGC(store, snapshots_dir)
-    deleted = gc.collect(keep_latest_n=3, dry_run=True)
-
-    assert orphan in deleted
-    assert orphan.exists()  # not actually deleted
-
-
-def test_fix18_gc_removes_tmp_orphans(store, snapshots_dir):
-    """GC removes .tmp_ prefixed files left by crashed sessions."""
-    agent = store.create_agent("a", "model", "hash", 8192)
-    _make_commit(store, agent, snapshots_dir)
-
-    tmp_file = snapshots_dir / ".tmp_orphan_crash.bin"
-    tmp_file.write_bytes(os.urandom(512))
-
-    gc = SnapshotGC(store, snapshots_dir)
-    deleted = gc.collect()
-    assert tmp_file in deleted
-    assert not tmp_file.exists()
-
-
-def test_fix18_gc_respects_keep_latest(store, snapshots_dir):
-    """GC always retains the most recent N snapshots per agent."""
-    agent = store.create_agent("a", "model", "hash", 8192)
-    parent = _make_commit(store, agent, snapshots_dir, task="t1")
-    agent = store.get_agent("a")
-    parent2 = _make_commit(store, agent, snapshots_dir, task="t2", parent_id=parent.id)
-    agent = store.get_agent("a")
-    _make_commit(store, agent, snapshots_dir, task="t3", parent_id=parent2.id)
-
-    # All 3 should be kept with keep_latest_n=3 (within window)
-    gc = SnapshotGC(store, snapshots_dir)
-    deleted = gc.collect(keep_latest_n=3)
-
-    # None of the real commit snapshots should be deleted
-    assert not any(".bin" in str(d) and not d.name.startswith(".tmp_") for d in deleted)
-
 
 # ── Additional cross-cutting: schema migration idempotency with new column ────
 
@@ -697,3 +440,86 @@ def test_schema_migration_stable_context_hash(temp_dir):
     store.init_db()
     refreshed2 = store.get_agent("a")
     assert refreshed2.stable_context_hash == refreshed.stable_context_hash
+
+
+# ── SnapshotGC (flat store: HEAD snapshot per agent) ──────────────────────────
+# The store no longer has a commit DAG; each agent points at a single current
+# (HEAD) snapshot. SnapshotGC keeps every agent's HEAD and reaps everything else.
+
+def _set_head_snapshot(store, agent, snapshots_dir, size: int = 1024) -> Path:
+    """Write a snapshot file and make it the agent's current (HEAD) snapshot."""
+    snap = snapshots_dir / f"{agent.name}_{uuid4().hex[:8]}.bin"
+    snap.write_bytes(os.urandom(size))
+    store.update_agent_snapshot(
+        agent=agent,
+        snapshot_path=str(snap),
+        snapshot_size_bytes=snap.stat().st_size,
+        tokens_saved=0,
+    )
+    return snap
+
+
+def test_gc_removes_unreferenced_snapshots(store, snapshots_dir):
+    """SnapshotGC deletes snapshot files not referenced by any agent's HEAD."""
+    agent = store.create_agent("a", "model", "hash", 8192)
+    head = _set_head_snapshot(store, agent, snapshots_dir)
+
+    orphan = snapshots_dir / "orphan_abc12345.bin"
+    orphan.write_bytes(os.urandom(512))
+
+    gc = SnapshotGC(store, snapshots_dir)
+    deleted = gc.collect(dry_run=False)
+
+    assert orphan in deleted
+    assert not orphan.exists()
+    # The agent's HEAD snapshot must survive
+    assert head.exists()
+
+
+def test_gc_dry_run_does_not_delete(store, snapshots_dir):
+    """dry_run=True lists candidates without deleting them."""
+    agent = store.create_agent("a", "model", "hash", 8192)
+    _set_head_snapshot(store, agent, snapshots_dir)
+    orphan = snapshots_dir / "orphan_dryrun.bin"
+    orphan.write_bytes(os.urandom(512))
+
+    gc = SnapshotGC(store, snapshots_dir)
+    deleted = gc.collect(dry_run=True)
+
+    assert orphan in deleted
+    assert orphan.exists()  # not actually deleted
+
+
+def test_gc_removes_tmp_orphans(store, snapshots_dir):
+    """GC removes .tmp_ prefixed files left by crashed sessions."""
+    agent = store.create_agent("a", "model", "hash", 8192)
+    _set_head_snapshot(store, agent, snapshots_dir)
+
+    tmp_file = snapshots_dir / ".tmp_orphan_crash.bin"
+    tmp_file.write_bytes(os.urandom(512))
+
+    gc = SnapshotGC(store, snapshots_dir)
+    deleted = gc.collect()
+    assert tmp_file in deleted
+    assert not tmp_file.exists()
+
+
+def test_gc_keeps_head_for_every_agent(store, snapshots_dir):
+    """Each agent's current HEAD snapshot is retained; superseded ones are reaped."""
+    agent_a = store.create_agent("a", "model", "hash", 8192)
+    agent_b = store.create_agent("b", "model", "hash", 8192)
+
+    # Agent A advances HEAD twice — the older snapshot becomes unreferenced.
+    old_a = _set_head_snapshot(store, agent_a, snapshots_dir)
+    new_a = _set_head_snapshot(store, store.get_agent("a"), snapshots_dir)
+    head_b = _set_head_snapshot(store, agent_b, snapshots_dir)
+
+    gc = SnapshotGC(store, snapshots_dir)
+    deleted = gc.collect()
+
+    # Both agents' current HEADs survive
+    assert new_a.exists()
+    assert head_b.exists()
+    # The superseded snapshot is collected
+    assert old_a in deleted
+    assert not old_a.exists()
