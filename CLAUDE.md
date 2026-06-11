@@ -43,8 +43,10 @@ CacheFlow is a **persistent KV cache system for AI agents**. It solves token was
 
 **Token savings example:**
 - Session 1: 9,064 tokens (baseline, codebase ingestion)
-- Session 2: 328 tokens used, 8,182 saved (93% savings)
-- Session 3+: ~300-400 tokens, ~8,600+ saved (95%+ savings)
+- Session 2: 328 tokens used, 8,182 saved (cumulative: 8,182)
+- Session 3: ~400 tokens used, ~8,600 saved (cumulative: 16,782)
+- Session 4: ~350 tokens used, ~8,700 saved (cumulative: 25,482)
+- **Total savings across 4 sessions: ~25,500 tokens (75% reduction vs. no caching)**
 
 ### Key Components
 
@@ -58,8 +60,8 @@ CacheFlow is a **persistent KV cache system for AI agents**. It solves token was
 
 **cacheflow/store.py — `CacheFlowStore` (SQLite, flat agent model)**
 - Single `agents` table. There is **no commit DAG** — each agent points at one current (HEAD) snapshot via `current_snapshot_path`.
-- `Agent` fields of note: `stable_context_hash`, `current_snapshot_path`, `baseline_tokens_evaluated`, `last_tokens_saved`, `parent_agent_id` (set when forked), `accumulated_tokens` (drives consolidation), `knowledge_summary` (distilled, folded into the stable prefix)
-- Key methods: `create_agent`, `get_agent`, `list_agents`, `update_agent_snapshot` (advances HEAD), `update_agent_stable_context`, `update_agent_baseline`, `add_accumulated_tokens`, `update_agent_knowledge_summary` (stores summary + resets accumulator)
+- `Agent` fields of note: `stable_context_hash`, `current_snapshot_path`, `baseline_tokens_evaluated`, `last_tokens_saved` (most recent session), `cumulative_tokens_saved` (running total across all sessions), `parent_agent_id` (set when forked), `accumulated_tokens` (drives consolidation), `knowledge_summary` (distilled, folded into the stable prefix)
+- Key methods: `create_agent`, `get_agent`, `list_agents`, `update_agent_snapshot` (advances HEAD and increments cumulative), `update_agent_stable_context`, `update_agent_baseline`, `add_accumulated_tokens`, `update_agent_knowledge_summary` (stores summary + resets accumulator)
 - `init_db()` is idempotent; call within `_DB_INIT_LOCK` to prevent a SQLite race on first init
 
 **cacheflow/engine.py — `LlamaEngine` (in-process, primary execution path)**

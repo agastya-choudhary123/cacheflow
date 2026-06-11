@@ -17,8 +17,9 @@ CacheFlow uses llama-cpp-python's native KV cache state serialization to save an
 | Prompt tokens evaluated | 7,630 | ~5 |
 | Prompt cost reduction | — | **~99%** |
 | Total session cost | 7,630 + output | ~5 + output |
+| Cumulative savings over 4 sessions | 4 × 7,630 = 30,520 | **~23,000 tokens saved (75%)** |
 
-The baseline prompt for this codebase is 7,630 tokens (system prompt + codebase). Every session after the first restores the KV snapshot and evaluates only the task suffix (~5–50 tokens). Output tokens are the same either way — caching eliminates prompt re-evaluation, not generation. Savings scale with codebase size.
+The baseline prompt for this codebase is 7,630 tokens (system prompt + codebase). Every session after the first restores the KV snapshot and evaluates only the task suffix (~5–50 tokens). Output tokens are the same either way — caching eliminates prompt re-evaluation, not generation. Over multiple sessions, cumulative token savings grow — `cf status` shows all three metrics: **baseline** (one-time cost), **cumulative saved** (total across all warm sessions), and **last session saved** (most recent only). Savings scale with codebase size.
 
 ## Quick Start
 
@@ -103,13 +104,13 @@ cf repl [--base-path PATH]
   Commands inside: run AGENT TASK | log AGENT | status [AGENT] | agents | fork PARENT CHILD | exit
 
 cf log AGENT [--base-path PATH]
-  Session history with token savings per run.
+  Session history with baseline, cumulative, and last-session token savings.
 
 cf agents [--base-path PATH]
   List all agents: name, model, context size, HEAD snapshot.
 
 cf status [--agent AGENT] [--base-path PATH]
-  Agent summary: total tokens used/saved, snapshot disk usage.
+  Agent metrics: baseline tokens (one-time cost), cumulative tokens saved (total across all sessions), last session saved.
 
 cf fork PARENT_AGENT CHILD_AGENT [--scope DESCRIPTION] [--base-path PATH]
   Fork from the parent's HEAD snapshot. Child inherits all cached knowledge.

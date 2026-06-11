@@ -279,8 +279,9 @@ def log(agent_name, base_path):
         click.echo(f"  Model: {agent.model_name}")
         click.echo(f"  Snapshot: {Path(agent.current_snapshot_path).name if agent.current_snapshot_path else 'none'}")
         click.echo(f"  Snapshot size: {agent.current_snapshot_size_bytes / (1024*1024):.1f} MB" if agent.current_snapshot_size_bytes else "  Snapshot size: N/A")
-        click.echo(f"  Last tokens saved: {agent.last_tokens_saved}")
         click.echo(f"  Baseline tokens: {agent.baseline_tokens_evaluated or 'N/A'}")
+        click.echo(f"  Cumulative tokens saved: {agent.cumulative_tokens_saved or 0}")
+        click.echo(f"  Last session saved: {agent.last_tokens_saved or 0}")
     except Exception as e:
         raise click.ClickException(str(e))
 
@@ -478,11 +479,16 @@ def status(agent_name, base_path):
         if not agent:
             raise click.ClickException(f"Agent '{agent_name}' not found")
 
+        baseline = agent.baseline_tokens_evaluated or 0
+        cumulative = agent.cumulative_tokens_saved or 0
+        last_session = agent.last_tokens_saved or 0
+
         click.echo(f"╭─ Status: {agent_name} ────────────────────╮")
         click.echo(f"│ Model: {agent.model_name:37} │")
         click.echo(f"│ Context size: {agent.ctx_size:34} │")
-        click.echo(f"│ Baseline tokens: {agent.baseline_tokens_evaluated or 'N/A':32} │")
-        click.echo(f"│ Last tokens saved: {agent.last_tokens_saved:29} │")
+        click.echo(f"│ Baseline tokens: {baseline:32} │")
+        click.echo(f"│ Cumulative saved: {cumulative:31} │")
+        click.echo(f"│ Last session saved: {last_session:28} │")
         click.echo(f"╰─────────────────────────────────────────────╯")
     except Exception as e:
         raise click.ClickException(str(e))

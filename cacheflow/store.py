@@ -33,6 +33,7 @@ class Agent(Base):
     current_snapshot_path = Column(String, nullable=True)  # path to .bin file
     current_snapshot_size_bytes = Column(Integer, nullable=False, default=0)
     last_tokens_saved = Column(Integer, nullable=False, default=0)
+    cumulative_tokens_saved = Column(Integer, nullable=False, default=0)  # total across all sessions
     parent_agent_id = Column(Uuid, ForeignKey("agents.id"), nullable=True)  # for forking
     # Running sum of tokens processed since the last consolidation; drives the
     # background Compressor's 70%-of-context threshold.
@@ -79,6 +80,7 @@ class CacheFlowStore:
                 ("current_snapshot_path", "ALTER TABLE agents ADD COLUMN current_snapshot_path TEXT"),
                 ("current_snapshot_size_bytes", "ALTER TABLE agents ADD COLUMN current_snapshot_size_bytes INTEGER DEFAULT 0"),
                 ("last_tokens_saved", "ALTER TABLE agents ADD COLUMN last_tokens_saved INTEGER DEFAULT 0"),
+                ("cumulative_tokens_saved", "ALTER TABLE agents ADD COLUMN cumulative_tokens_saved INTEGER DEFAULT 0"),
                 ("parent_agent_id", "ALTER TABLE agents ADD COLUMN parent_agent_id TEXT"),
                 ("stable_context_hash", "ALTER TABLE agents ADD COLUMN stable_context_hash TEXT"),
                 ("accumulated_tokens", "ALTER TABLE agents ADD COLUMN accumulated_tokens INTEGER DEFAULT 0"),
@@ -215,12 +217,13 @@ class CacheFlowStore:
         snapshot_size_bytes: int,
         tokens_saved: int,
     ) -> None:
-        """Update agent's current snapshot and metrics."""
+        """Update agent's current snapshot and metrics. Increments cumulative savings."""
         session = self._get_session()
         try:
             agent.current_snapshot_path = snapshot_path
             agent.current_snapshot_size_bytes = snapshot_size_bytes
             agent.last_tokens_saved = tokens_saved
+            agent.cumulative_tokens_saved = (agent.cumulative_tokens_saved or 0) + max(0, tokens_saved)
             session.merge(agent)
             session.commit()
         finally:
