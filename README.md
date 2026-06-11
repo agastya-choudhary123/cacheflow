@@ -14,12 +14,12 @@ CacheFlow uses llama-cpp-python's native KV cache state serialization to save an
 
 | | Without cache | With cache |
 |--|--------------|------------|
-| Prompt tokens evaluated | 7,630 | ~5 |
+| Prompt tokens evaluated | 9,064 | ~5 |
 | Prompt cost reduction | — | **~99%** |
-| Total session cost | 7,630 + output | ~5 + output |
-| Cumulative savings over 4 sessions | 4 × 7,630 = 30,520 | **~23,000 tokens saved (75%)** |
+| Total session cost | 9,064 + output | ~5 + output |
+| Cumulative savings over 4 sessions | 4 × 9,064 = 36,256 | **~25,000 tokens saved (70%)** |
 
-The baseline prompt for this codebase is 7,630 tokens (system prompt + codebase). Every session after the first restores the KV snapshot and evaluates only the task suffix (~5–50 tokens). Output tokens are the same either way — caching eliminates prompt re-evaluation, not generation. Over multiple sessions, cumulative token savings grow — `cf status` shows all three metrics: **baseline** (one-time cost), **cumulative saved** (total across all warm sessions), and **last session saved** (most recent only). Savings scale with codebase size.
+The baseline prompt for this codebase is 9,064 tokens (system prompt + codebase). Every session after the first restores the KV snapshot and evaluates only the task suffix (~5–50 tokens). Output tokens are the same either way — caching eliminates prompt re-evaluation, not generation. Over multiple sessions, cumulative token savings grow — `cf status` shows all three metrics: **baseline** (one-time cost), **cumulative saved** (total across all warm sessions), and **last session saved** (most recent only). Savings scale with codebase size.
 
 ## Quick Start
 
@@ -226,6 +226,7 @@ cacheflow/
 │   ├── gc.py                   # SnapshotGC: garbage-collect unreferenced .bin files
 │   ├── indexer.py              # CodeIndexer: codebase chunking + embedding
 │   ├── retriever.py            # CodeRetriever: semantic RAG for stable context
+│   ├── tools.py                # Tools for agentic loop: observe→act protocol
 │   ├── ollama.py               # Ollama model discovery and path resolution
 │   └── mcp_server.py           # MCP stdio server for IDE integration
 ├── tests/                      # Pytest suite
@@ -250,6 +251,7 @@ cacheflow/
 | `cacheflow/tokenizer.py` | `ModelTokenizer`: exact BPE token counts, `vocab_only=True` |
 | `cacheflow/gc.py` | `SnapshotGC`: clean up unreferenced snapshot files |
 | `cacheflow/indexer.py` / `retriever.py` | Semantic RAG: chunk, embed, and retrieve codebase context |
+| `cacheflow/tools.py` | Tools for agentic loop: observe→act protocol with filesystem/shell access |
 | `cacheflow/ollama.py` | Ollama model discovery and path resolution |
 | `cacheflow/mcp_server.py` | MCP stdio server for Claude Code / Cursor integration |
 
@@ -321,10 +323,10 @@ A shared `tests/conftest.py` autouse fixture patches `cacheflow.agent.get_tokeni
 - KV cache per slot: ~1–2 GB at 8192 context
 
 **Token efficiency (measured on this repo, 16384 ctx, qwen2.5-coder:7b):**
-- Baseline prompt: 7,630 tokens (system prompt + codebase)
+- Baseline prompt: 9,064 tokens (system prompt + codebase)
 - Follow-up sessions: ~5 prompt tokens evaluated (~99% prompt cost reduction)
 - Output tokens are the same either way — caching eliminates re-evaluation, not generation
-- Absolute prompt savings per session: ~7,625 tokens; scales with codebase size
+- Absolute prompt savings per session: ~9,000 tokens; scales with codebase size
 
 ## License
 
