@@ -1,8 +1,0 @@
-{
-  "model_path": "/Users/agastya/.ollama/models/blobs/sha256-60e05f2100071479f596b964f89f510f057ce397ea22f2833a0cfe029bfc2463",
-  "model_name": "qwen2.5-coder:7b",
-  "model_hash": "60e05f2100071479f596b964f89f510f057ce397ea22f2833a0cfe029bfc2463",
-  "ctx_size": 16384,
-  "n_gpu_layers": 99,
-  "slot_save_path": ".cacheflow/snapshots"
-}
