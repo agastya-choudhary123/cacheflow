@@ -125,11 +125,9 @@ def run_agentic(
                 session.agent_name, session.config.model_name,
                 session.config.model_hash, session.config.ctx_size,
             )
-        elif agent.model_hash != session.config.model_hash:
-            raise RuntimeError(
-                f"Agent '{session.agent_name}' was created with a different model "
-                "(hash mismatch). Create a new agent or update config to match."
-            )
+        # A model identity mismatch (e.g. after `cf model use`) is handled by
+        # session._restore_or_prime below, which forces a re-prime instead of
+        # restoring a snapshot written by a different model.
 
         session._acquire_lock()
         session.server = get_global_engine(

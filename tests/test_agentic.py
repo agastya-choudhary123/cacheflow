@@ -402,6 +402,36 @@ def test_run_agentic_hits_max_steps(temp_dir, config, store):
     assert result.final_answer is None
 
 
+def test_run_agentic_model_mismatch_forces_reprime(temp_dir, config, store):
+    """If the agent's stored model differs from the active config's model,
+    _restore_or_prime (the primitive run_agentic uses) must re-prime instead
+    of restoring the incompatible HEAD snapshot — same guard as run()."""
+    snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
+    snapshots_dir.mkdir(parents=True, exist_ok=True)
+    old_snap = snapshots_dir / "old.bin"
+    old_snap.write_bytes(os.urandom(256))
+
+    session = AgentSession("a", temp_dir)
+    agent = store.create_agent("a", "llama2:7b", "old-hash", 8192)
+    store.update_agent_snapshot(agent, str(old_snap), old_snap.stat().st_size, tokens_saved=0)
+    stable_prefix = session._build_stable_prefix(DEFAULT_SYSTEM_PROMPT, None)
+    store.update_agent_stable_context(agent, stable_prefix)
+
+    script = ['ACTION: finish\nARGS: {"answer": "done"}']
+    engine = _mock_engine_with_script(snapshots_dir, script)
+
+    with patch("cacheflow.reasoning_loop.get_global_engine", return_value=engine):
+        result = run_agentic(session, "test mismatch", DEFAULT_SYSTEM_PROMPT, max_steps=5)
+
+    engine.prime_slot.assert_called_once()
+    engine.restore_slot.assert_not_called()
+    assert result.completed is True
+
+    refreshed = store.get_agent("a")
+    assert refreshed.model_name == session.config.model_name
+    assert refreshed.model_hash == session.config.model_hash
+
+
 def test_agentic_preamble_suppresses_qwen3_thinking(temp_dir, store):
     cfg = CacheFlowConfig(
         base_path=temp_dir,

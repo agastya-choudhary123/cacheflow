@@ -177,6 +177,38 @@ def test_consolidate_stores_summary_and_resets_accumulator(store, config, temp_d
     assert mock_server.completion.called
 
 
+def test_consolidate_model_mismatch_forces_reprime(store, config, temp_dir):
+    """consolidate() must not restore a HEAD snapshot written by a different
+    model than the one currently active — same guard as run()/_restore_or_prime."""
+    snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
+    snapshots_dir.mkdir(parents=True, exist_ok=True)
+    snap = snapshots_dir / "head.bin"
+    snap.write_bytes(os.urandom(1024))
+
+    session = AgentSession("a", temp_dir)
+    agent = store.create_agent("a", "llama2:7b", "old-hash", 8192)
+    store.update_agent_snapshot(agent, str(snap), snap.stat().st_size, tokens_saved=0)
+    stable_prefix = session._build_stable_prefix(DEFAULT_SYSTEM_PROMPT, None)
+    store.update_agent_stable_context(agent, stable_prefix)
+    store.add_accumulated_tokens(agent, 9000)
+
+    mock_server = MagicMock()
+    mock_server.completion.return_value = {
+        "content": "Dense summary.", "tokens_evaluated": 10, "tokens_predicted": 6,
+    }
+
+    with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
+        summary = session.consolidate()
+
+    assert summary == "Dense summary."
+    mock_server.prime_slot.assert_called_once()
+    mock_server.restore_slot.assert_not_called()
+
+    refreshed = store.get_agent("a")
+    assert refreshed.model_name == config.model_name
+    assert refreshed.model_hash == config.model_hash
+
+
 def test_consolidate_noop_without_snapshot(store, temp_dir):
     """consolidate() is a safe no-op when the agent has never primed."""
     store.create_agent("a", "model", "hash", 8192)
