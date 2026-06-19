@@ -48,6 +48,7 @@ class SessionResult:
     snapshot_size_bytes: int
     duration_ms: int
     is_first_session: bool
+    tokens_per_sec: float = 0.0
 
 
 @dataclass
@@ -72,6 +73,7 @@ class AgentLoopResult:
     tokens_evaluated: int
     tokens_generated: int
     duration_ms: int
+    tokens_per_sec: float = 0.0
 
 
 class AgentSession:
@@ -280,7 +282,7 @@ class AgentSession:
         """Build the task-specific suffix that appends to the stable prefix."""
         is_qwen = "qwen" in self.config.model_name.lower()
         if is_qwen:
-            return f"<|im_start|>user\nTask: {task}<|im_end|>\n<|im_start|>assistant\n"
+            return f"<|im_start|>user\nTask: {task}<|im_end|>\n<|im_start|>assistant\n{self._think_prefill()}"
         else:
             return f"Task: {task}"
 
@@ -480,6 +482,7 @@ class AgentSession:
                 snapshot_size_bytes=snapshot_size_bytes,
                 duration_ms=total_duration_ms,
                 is_first_session=is_first_session,
+                tokens_per_sec=response_data.get("tokens_per_sec", 0.0),
             )
 
         finally:
@@ -530,8 +533,12 @@ class AgentSession:
             "After ACTION you will receive an OBSERVATION; use it to decide the next "
             "action. Available tools:\n"
             f"{tools_help()}\n"
-            "After editing or writing a code file, run syntax_check on it and fix "
-            "any reported error before continuing.\n"
+            "write_file/edit_file also run a logical-correctness check and may "
+            "return a LOGIC WARNING (e.g. unreachable code, duplicate definitions) "
+            "even when the edit succeeds. After editing or writing a code file, also "
+            "run syntax_check on it. Treat both SYNTAX ERROR and LOGIC WARNING as "
+            "things you must fix before continuing — the code must be both "
+            "syntactically AND logically correct.\n"
             "When the task is complete, use ACTION: finish with ARGS "
             '{"answer": "<final answer>"}.\n\n'
             f"Task: {task}"
@@ -540,9 +547,25 @@ class AgentSession:
         if is_qwen:
             return (
                 f"<|im_start|>user\n{instructions}<|im_end|>\n"
-                f"<|im_start|>assistant\n"
+                f"<|im_start|>assistant\n{self._think_prefill()}"
             )
         return f"\n\n{instructions}\n\n"
+
+    def _think_prefill(self) -> str:
+        """Force-close Qwen3's thinking block immediately on the assistant turn.
+
+        Qwen3 (unlike 2.5) defaults to emitting a `<think>...</think>` reasoning
+        block before any real content. In this loop each step has a small,
+        fixed `max_tokens_per_step` budget for the whole THOUGHT/ACTION/ARGS
+        turn — if thinking runs unchecked it can consume that entire budget
+        and the turn gets cut off before ACTION/ARGS ever appears, so
+        parse_action raises on every step. Pre-filling an empty think block is
+        the documented hard way to suppress it (more reliable than the
+        soft "/no_think" text hint).
+        """
+        if "qwen3" in self.config.model_name.lower():
+            return "<think>\n\n</think>\n\n"
+        return ""
 
     def _append_observation(self, convo: str, assistant_text: str, observation: str) -> str:
         """Close the assistant turn, add the observation, re-prime the assistant."""
@@ -551,7 +574,7 @@ class AgentSession:
             return (
                 convo + assistant_text
                 + f"<|im_end|>\n<|im_start|>user\nOBSERVATION: {observation}<|im_end|>\n"
-                + "<|im_start|>assistant\n"
+                + f"<|im_start|>assistant\n{self._think_prefill()}"
             )
         return convo + assistant_text + f"\nOBSERVATION: {observation}\n\n"
 
@@ -560,7 +583,7 @@ class AgentSession:
         task: str,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         max_steps: int = 12,
-        max_tokens_per_step: int = 512,
+        max_tokens_per_step: int = 2048,
         allow_writes: bool = False,
         allow_bash: bool = False,
         on_token: Optional[Callable[[str], None]] = None,
@@ -605,6 +628,7 @@ class AgentSession:
             steps: list[AgentStep] = []
             tokens_evaluated = 0
             tokens_generated = 0
+            gen_time_ms = 0
             final_answer: Optional[str] = None
             completed = False
 
@@ -618,6 +642,7 @@ class AgentSession:
                 )
                 tokens_evaluated += resp.get("tokens_evaluated", 0)
                 tokens_generated += resp.get("tokens_predicted", 0)
+                gen_time_ms += resp.get("gen_time_ms", 0)
                 # Keep the generated text VERBATIM (no strip/reformat): it is
                 # appended back into the next prompt, and any change would make the
                 # regenerated prompt diverge from the cached KV tokens, forcing a
@@ -627,10 +652,27 @@ class AgentSession:
                 try:
                     action = parse_action(content)
                 except ActionParseError as e:
-                    obs = (
-                        f"ERROR: {e}. Reply with exactly THOUGHT/ACTION/ARGS, "
-                        "where ARGS is a one-line JSON object."
-                    )
+                    if resp.get("truncated"):
+                        # The turn was cut off by max_tokens_per_step before any
+                        # stop string, not malformed by choice — e.g. write_file
+                        # content for a non-trivial file doesn't fit in the
+                        # budget. Telling the model to "reply in the same
+                        # format" just repeats the failure forever (see
+                        # run_agentic max-steps test history); steer it toward
+                        # a strategy that actually fits instead.
+                        obs = (
+                            "ERROR: your response was cut off by the per-step token "
+                            f"limit ({max_tokens_per_step} tokens) before ACTION/ARGS "
+                            "completed — the content you tried to write is too long "
+                            "for one step. Split it into multiple smaller edit_file "
+                            "or write_file calls (e.g. write a skeleton first, then "
+                            "append/edit pieces), and keep each ARGS JSON object short."
+                        )
+                    else:
+                        obs = (
+                            f"ERROR: {e}. Reply with exactly THOUGHT/ACTION/ARGS, "
+                            "where ARGS is a one-line JSON object."
+                        )
                     steps.append(AgentStep(content, "(parse_error)", {}, obs))
                     convo = self._append_observation(convo, content, obs)
                     continue
@@ -654,6 +696,7 @@ class AgentSession:
                 tokens_evaluated=tokens_evaluated,
                 tokens_generated=tokens_generated,
                 duration_ms=int((time.time() - start_time) * 1000),
+                tokens_per_sec=tokens_generated / max(gen_time_ms / 1000, 1e-6) if gen_time_ms else 0.0,
             )
         finally:
             self._release_lock()
@@ -669,7 +712,7 @@ class AgentSession:
         )
         is_qwen = "qwen" in self.config.model_name.lower()
         if is_qwen:
-            return f"<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n"
+            return f"<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n{self._think_prefill()}"
         return f"Task: {question}"
 
     def consolidate(self, summary_max_tokens: int = 500) -> Optional[str]:

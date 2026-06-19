@@ -77,7 +77,7 @@ def ensure_initialized(
             "No models found.\n\n"
             "To get started:\n"
             "  1. Install ollama: https://ollama.ai\n"
-            "  2. Pull a model: ollama pull qwen2.5-coder:7b\n"
+            "  2. Pull a model: ollama pull qwen3:8b\n"
             "  3. Then run: cf run <task>"
         )
 
@@ -194,6 +194,7 @@ def run(task, agent_name, system_prompt, max_tokens, stream, base_path):
         click.echo(f"Tokens saved: {result.tokens_saved}")
         click.echo(f"Snapshot size: {result.snapshot_size_bytes} bytes")
         click.echo(f"Duration: {result.duration_ms}ms")
+        click.echo(f"Decode speed: {result.tokens_per_sec:.1f} tok/s")
         click.echo(f"Is first session: {result.is_first_session}")
         if not streamed["started"]:
             click.echo()
@@ -208,11 +209,12 @@ def run(task, agent_name, system_prompt, max_tokens, stream, base_path):
 @click.option("--agent", "agent_name", default="main", help="Agent name (default: main)")
 @click.option("--system-prompt", default=DEFAULT_SYSTEM_PROMPT, help="Custom system prompt")
 @click.option("--max-steps", default=12, help="Max observe→act iterations")
+@click.option("--max-tokens-per-step", default=2048, help="Max tokens generated per step (raise for large file writes)")
 @click.option("--auto", is_flag=True, help="Allow file writes/edits (write_file, edit_file)")
 @click.option("--allow-bash", is_flag=True, help="Allow shell command execution (run_bash)")
 @click.option("--stream/--no-stream", default=True, help="Stream model output as it generates")
 @click.option("--base-path", default=".", help="Project root")
-def agent(task, agent_name, system_prompt, max_steps, auto, allow_bash, stream, base_path):
+def agent(task, agent_name, system_prompt, max_steps, max_tokens_per_step, auto, allow_bash, stream, base_path):
     """Run an agentic task: the model reads/edits files and runs commands in a loop.
 
     Read tools are always available. File edits require --auto; shell commands
@@ -230,6 +232,7 @@ def agent(task, agent_name, system_prompt, max_steps, auto, allow_bash, stream, 
             task,
             system_prompt=system_prompt,
             max_steps=max_steps,
+            max_tokens_per_step=max_tokens_per_step,
             allow_writes=auto,
             allow_bash=allow_bash,
             on_token=on_token if stream else None,
@@ -245,6 +248,7 @@ def agent(task, agent_name, system_prompt, max_steps, auto, allow_bash, stream, 
         click.echo(f"Tokens evaluated: {result.tokens_evaluated}")
         click.echo(f"Tokens generated: {result.tokens_generated}")
         click.echo(f"Duration: {result.duration_ms}ms")
+        click.echo(f"Decode speed: {result.tokens_per_sec:.1f} tok/s")
         click.echo()
         click.echo("Tool calls:")
         for i, step in enumerate(result.steps, 1):

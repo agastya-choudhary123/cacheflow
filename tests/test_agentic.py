@@ -70,6 +70,64 @@ def test_parse_action_bad_json_raises():
         parse_action("ACTION: read_file\nARGS: {not valid json}")
 
 
+def test_parse_action_strips_think_block():
+    text = (
+        "<think>maybe I should use ACTION: write_file with ARGS: {\"bad\": 1}</think>\n"
+        'THOUGHT: read it\nACTION: read_file\nARGS: {"path": "a.py"}'
+    )
+    action = parse_action(text)
+    assert action.tool == "read_file"
+    assert action.args == {"path": "a.py"}
+
+
+def test_parse_action_ignores_trailing_prose_after_args():
+    # A reasoning model that doesn't stop cleanly might ramble after the JSON;
+    # a naive greedy regex would grab everything up to the last '}' it sees.
+    text = (
+        'ACTION: write_file\nARGS: {"path": "a.py", "content": "x = {1: 2}\\n"}\n'
+        "Note: this snippet uses a dict literal}"
+    )
+    action = parse_action(text)
+    assert action.tool == "write_file"
+    assert action.args == {"path": "a.py", "content": "x = {1: 2}\n"}
+
+
+def test_parse_action_unclosed_args_raises():
+    with pytest.raises(ActionParseError):
+        parse_action('ACTION: write_file\nARGS: {"path": "a.py"')
+
+
+def test_parse_action_repairs_literal_newlines_in_content():
+    # Small local models routinely emit real multi-line code with literal
+    # newlines inside the JSON string instead of escaping them as \n — that
+    # is invalid JSON per spec and used to make the whole action unparsable.
+    raw = (
+        'ACTION: write_file\n'
+        'ARGS: {"path": "a.py", "content": "def f():\n    return 1\n"}'
+    )
+    action = parse_action(raw)
+    assert action.tool == "write_file"
+    assert action.args["content"] == "def f():\n    return 1\n"
+
+
+def test_parse_action_repairs_stray_backslashes():
+    # Windows paths / regex / docstrings often contain backslashes that
+    # aren't valid JSON escapes (\U, \d, ...) and used to blow up json.loads.
+    raw = (
+        'ACTION: edit_file\n'
+        'ARGS: {"path": "a.py", "search": "x", "replace": "C:\\Users\\qux and \\d+"}'
+    )
+    action = parse_action(raw)
+    assert action.tool == "edit_file"
+    assert action.args["replace"] == "C:\\Users\\qux and \\d+"
+
+
+def test_parse_action_preserves_valid_escapes():
+    raw = 'ACTION: write_file\nARGS: {"path": "a.py", "content": "line1\\nline2\\t!"}'
+    action = parse_action(raw)
+    assert action.args["content"] == "line1\nline2\t!"
+
+
 # ── tools + workspace boundary ────────────────────────────────────────────────
 
 def test_read_file_within_workspace(temp_dir):
@@ -190,6 +248,79 @@ def test_syntax_check_json(temp_dir):
     assert execute(Action("syntax_check", {"path": "bad.json"}, ""), ctx).startswith("SYNTAX ERROR")
 
 
+def test_syntax_check_catches_unreachable_code(temp_dir):
+    # The exact failure mode reproduced live against qwen3:8b: edit_file with
+    # a too-narrow search re-included a return, leaving the original next
+    # line as dead code. Syntactically valid, logically wrong.
+    (temp_dir / "dead.py").write_text(
+        "def add(a, b):\n    return a + b\n\n"
+        "def subtract(a, b):\n    return a - b\n    return a + b\n"
+    )
+    ctx = ToolContext(base_path=temp_dir)
+    obs = execute(Action("syntax_check", {"path": "dead.py"}, ""), ctx)
+    assert obs.startswith("LOGIC WARNING")
+    assert "unreachable" in obs
+
+
+def test_syntax_check_catches_duplicate_def(temp_dir):
+    (temp_dir / "dup.py").write_text(
+        "def f(x):\n    return x\n\ndef f(x):\n    return x + 1\n"
+    )
+    ctx = ToolContext(base_path=temp_dir)
+    obs = execute(Action("syntax_check", {"path": "dup.py"}, ""), ctx)
+    assert obs.startswith("LOGIC WARNING")
+    assert "defined twice" in obs
+
+
+def test_syntax_check_allows_property_setter_pattern(temp_dir):
+    # @property / @x.setter legitimately reuse the same name — must not warn.
+    (temp_dir / "prop.py").write_text(
+        "class C:\n"
+        "    @property\n"
+        "    def x(self):\n        return self._x\n\n"
+        "    @x.setter\n"
+        "    def x(self, value):\n        self._x = value\n"
+    )
+    ctx = ToolContext(base_path=temp_dir)
+    obs = execute(Action("syntax_check", {"path": "prop.py"}, ""), ctx)
+    assert obs.startswith("OK")
+
+
+def test_write_file_warns_on_dead_code(temp_dir):
+    ctx = ToolContext(base_path=temp_dir, allow_writes=True)
+    content = "def f():\n    return 1\n    return 2\n"
+    obs = execute(Action("write_file", {"path": "a.py", "content": content}, ""), ctx)
+    assert obs.startswith("OK")
+    assert "LOGIC WARNING" in obs and "unreachable" in obs
+
+
+def test_edit_file_warns_on_introduced_dead_code(temp_dir):
+    (temp_dir / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    ctx = ToolContext(base_path=temp_dir, allow_writes=True)
+    obs = execute(
+        Action(
+            "edit_file",
+            {
+                "path": "calc.py",
+                "search": "def add(a, b):",
+                "replace": "def add(a, b):\n    return a + b\n\ndef subtract(a, b):\n    return a - b",
+            },
+            "",
+        ),
+        ctx,
+    )
+    assert obs.startswith("OK")
+    assert "LOGIC WARNING" in obs and "unreachable" in obs
+
+
+def test_edit_file_no_warning_for_clean_edit(temp_dir):
+    (temp_dir / "ok.py").write_text("x = 1\n")
+    ctx = ToolContext(base_path=temp_dir, allow_writes=True)
+    obs = execute(Action("edit_file", {"path": "ok.py", "search": "x = 1", "replace": "x = 2"}, ""), ctx)
+    assert obs.startswith("OK")
+    assert "LOGIC WARNING" not in obs
+
+
 def test_syntax_check_unknown_type_not_checked(temp_dir):
     (temp_dir / "notes.txt").write_text("anything goes")
     ctx = ToolContext(base_path=temp_dir)
@@ -268,6 +399,29 @@ def test_run_agentic_hits_max_steps(temp_dir, config, store):
     assert result.completed is False
     assert len(result.steps) == 3
     assert result.final_answer is None
+
+
+def test_agentic_preamble_suppresses_qwen3_thinking(temp_dir, store):
+    cfg = CacheFlowConfig(
+        base_path=temp_dir,
+        model_path="/path/to/model.gguf",
+        model_name="qwen3:8b",
+        model_hash="abc123def456",
+        ctx_size=8192,
+        n_gpu_layers=99,
+        slot_save_path=temp_dir / ".cacheflow/snapshots",
+    )
+    save_config(cfg)
+    session = AgentSession("a", temp_dir)
+    preamble = session._build_agentic_preamble("do the thing")
+    assert preamble.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+
+
+def test_agentic_preamble_no_think_prefill_for_qwen2(temp_dir, config, store):
+    session = AgentSession("a", temp_dir)
+    preamble = session._build_agentic_preamble("do the thing")
+    assert preamble.endswith("<|im_start|>assistant\n")
+    assert "<think>" not in preamble
 
 
 def test_run_agentic_recovers_from_malformed_action(temp_dir, config, store):

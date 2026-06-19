@@ -29,7 +29,7 @@ pip install -e ".[dev]"
 
 # 2. Install and run ollama (auto-detected by CacheFlow)
 brew install ollama
-ollama pull qwen2.5-coder:7b
+ollama pull qwen3:8b
 ollama serve
 
 # 3. Run your first task (auto-initializes project, prompts to pick a model)
@@ -292,7 +292,10 @@ The server uses stdio transport, compatible with IDE config files (e.g. `claude_
 - `llama-cpp-python` (GPU acceleration requires a Metal/CUDA build)
 - A GGUF model file — any llama.cpp-compatible model works; Qwen models get automatic ChatML formatting
 
-Recommended: `ollama pull qwen2.5-coder:7b` — CacheFlow auto-discovers ollama models on init.
+Recommended: `ollama pull qwen3:8b` — CacheFlow auto-discovers ollama models on init. Qwen3's thinking mode is
+automatically suppressed for the agentic tool-use loop (`run_agentic`/`cf agent`) by pre-filling an empty
+`<think></think>` block on each assistant turn, so the loop's small per-step token budget isn't eaten by hidden
+reasoning before it can emit ACTION/ARGS.
 
 ## Installation
 

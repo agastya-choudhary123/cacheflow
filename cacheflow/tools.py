@@ -14,6 +14,7 @@ read-only and safe.
 
 from __future__ import annotations
 
+import ast
 import difflib
 import json
 import re
@@ -141,9 +142,10 @@ def _write_file(args: dict, ctx: ToolContext) -> str:
     old = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
     existed = path.is_file()
     path.write_text(content, encoding="utf-8")
+    warning = _check_warning(path, content)
     if not existed:
-        return f"OK: created {args['path']} ({len(content)} chars)"
-    return f"OK: overwrote {args['path']}\n{_unified_diff(old, content, args['path'])}"
+        return f"OK: created {args['path']} ({len(content)} chars)" + warning
+    return f"OK: overwrote {args['path']}\n{_unified_diff(old, content, args['path'])}" + warning
 
 
 def _edit_file(args: dict, ctx: ToolContext) -> str:
@@ -173,7 +175,8 @@ def _edit_file(args: dict, ctx: ToolContext) -> str:
     new_text = text.replace(search, replace) if replace_all else text.replace(search, replace, 1)
     path.write_text(new_text, encoding="utf-8")
     n = count if replace_all else 1
-    return f"OK: edited {args['path']} ({n} replacement{'s' if n != 1 else ''})\n{_unified_diff(text, new_text, args['path'])}"
+    warning = _check_warning(path, new_text)
+    return f"OK: edited {args['path']} ({n} replacement{'s' if n != 1 else ''})\n{_unified_diff(text, new_text, args['path'])}" + warning
 
 
 def _closest_line_hint(text: str, search: str) -> str:
@@ -185,11 +188,91 @@ def _closest_line_hint(text: str, search: str) -> str:
     return f" Closest line in file: {best[0].strip()!r}" if best else ""
 
 
-def _syntax_check(args: dict, ctx: ToolContext) -> str:
-    """Parse a file to catch syntax errors after an edit. Never executes code.
+_TERMINATING_STMTS = (ast.Return, ast.Raise, ast.Break, ast.Continue)
 
-    `compile()` only compiles to bytecode (no imports, no side effects), so this is
-    safe to run unattended — it lets the loop verify its own edits and self-correct.
+
+def _find_unreachable_code(tree: ast.AST) -> list[str]:
+    """Flag statements that follow a return/raise/break/continue in the same
+    block — they can never execute. This is exactly the shape of bug an
+    under-scoped `edit_file` search/replace tends to introduce: the
+    replacement re-includes a `return` and the original next line (now dead)
+    survives untouched right after it. Syntactically valid; logically wrong.
+    """
+    issues = []
+    for node in ast.walk(tree):
+        for field in ("body", "orelse", "finalbody"):
+            stmts = getattr(node, field, None)
+            if not isinstance(stmts, list):
+                continue
+            for i, stmt in enumerate(stmts[:-1]):
+                if isinstance(stmt, _TERMINATING_STMTS):
+                    nxt = stmts[i + 1]
+                    kind = type(stmt).__name__.lower()
+                    issues.append(
+                        f"line {nxt.lineno} is unreachable (follows a '{kind}' on line {stmt.lineno})"
+                    )
+                    break  # one report per block is enough
+    return issues
+
+
+def _find_duplicate_defs(tree: ast.AST) -> list[str]:
+    """Flag a function/class redefined in the same scope — usually means an
+    edit duplicated a definition instead of replacing it. Skips decorated
+    defs (`@property`/`@x.setter`/`@overload` legitimately reuse a name).
+    """
+    issues = []
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if not isinstance(body, list):
+            continue
+        seen: dict[str, int] = {}
+        for stmt in body:
+            if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if stmt.decorator_list:
+                continue
+            if stmt.name in seen:
+                issues.append(
+                    f"'{stmt.name}' is defined twice (line {seen[stmt.name]} and line {stmt.lineno}) "
+                    "— likely a duplicate left by an edit rather than an intentional redefinition"
+                )
+            else:
+                seen[stmt.name] = stmt.lineno
+    return issues
+
+
+def _check_python_issues(text: str) -> list[str]:
+    """Best-effort logical-correctness checks for Python source, beyond mere
+    parseability. Returns an empty list if the text doesn't even parse —
+    that's `syntax_check`'s job to report, not this one's.
+    """
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    return _find_unreachable_code(tree) + _find_duplicate_defs(tree)
+
+
+def _check_warning(path: Path, text: str) -> str:
+    """Run logical-correctness checks after a write/edit and format any
+    findings as an inline warning, so the agent sees them immediately instead
+    of only if it remembers to call syntax_check separately afterward.
+    """
+    if path.suffix.lower() != ".py":
+        return ""
+    issues = _check_python_issues(text)
+    if not issues:
+        return ""
+    bullets = "\n".join(f"  - {i}" for i in issues)
+    return f"\nLOGIC WARNING: {len(issues)} likely issue(s) introduced by this edit:\n{bullets}"
+
+
+def _syntax_check(args: dict, ctx: ToolContext) -> str:
+    """Parse a file to catch syntax errors, plus basic logical-correctness
+    checks (unreachable code, duplicate definitions) for Python. Never
+    executes code — `compile()` only compiles to bytecode (no imports, no
+    side effects) — so this is safe to run unattended and lets the loop
+    verify its own edits and self-correct.
     """
     path = _resolve_in_workspace(ctx, args["path"])
     if not path.is_file():
@@ -200,9 +283,13 @@ def _syntax_check(args: dict, ctx: ToolContext) -> str:
     if suffix == ".py":
         try:
             compile(text, str(path), "exec")
-            return f"OK: {args['path']} is valid Python"
         except SyntaxError as e:
             return f"SYNTAX ERROR: {args['path']}:{e.lineno}: {e.msg}"
+        issues = _check_python_issues(text)
+        if issues:
+            bullets = "\n".join(f"  - {i}" for i in issues)
+            return f"LOGIC WARNING: {args['path']} parses but has {len(issues)} likely issue(s):\n{bullets}"
+        return f"OK: {args['path']} is valid Python"
     if suffix == ".json":
         try:
             json.loads(text)
@@ -263,26 +350,98 @@ def execute(action: Action, ctx: ToolContext) -> str:
 
 # ── protocol parser ───────────────────────────────────────────────────────────
 
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _ACTION_RE = re.compile(r"ACTION:\s*(?P<tool>[a-z_]+)", re.IGNORECASE)
-_ARGS_RE = re.compile(r"ARGS:\s*(?P<json>\{.*\})", re.DOTALL)
+_ARGS_RE = re.compile(r"ARGS:\s*")
+
+
+_VALID_JSON_ESCAPES = set('"\\/bfnrtu')
+_RAW_CONTROL_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def _extract_balanced_json(text: str, start: int) -> str:
+    """Scan forward from `start` (which must be at a '{') for the matching '}',
+    respecting string quoting/escapes so braces inside string values don't
+    confuse the count. Returns a repaired JSON substring, ready for json.loads.
+
+    A naive greedy regex (`\\{.*\\}`) would instead grab everything up to the
+    LAST '}' anywhere later in the text — including any trailing prose the
+    model rambles after the action (a real failure mode for reasoning models
+    that don't always stop cleanly), silently corrupting the parsed args.
+
+    Repair, not just extraction, matters here: for `write_file`/`edit_file`
+    the string values ARE source code, and small local models routinely emit
+    that code with literal (unescaped) newlines/tabs, or stray backslashes
+    from Windows paths, regexes, or docstrings (`C:\\Users`, `\\d+`) — all
+    illegal inside a strict JSON string and otherwise enough to make
+    json.loads reject the entire action on a single bad character.
+    """
+    if start >= len(text) or text[start] != "{":
+        raise ActionParseError("ARGS is not followed by a JSON object")
+    depth = 0
+    in_string = False
+    escape = False
+    out: list[str] = []
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                out.append(ch)
+                escape = False
+                continue
+            if ch == "\\":
+                nxt = text[i + 1] if i + 1 < len(text) else ""
+                if nxt in _VALID_JSON_ESCAPES:
+                    out.append(ch)
+                    escape = True
+                else:
+                    out.append("\\\\")  # repair a stray backslash (path/regex/etc.)
+                continue
+            if ch == '"':
+                in_string = False
+                out.append(ch)
+                continue
+            if ch in _RAW_CONTROL_ESCAPES:
+                out.append(_RAW_CONTROL_ESCAPES[ch])
+                continue
+            out.append(ch)
+            continue
+        # outside a string: structural JSON, track braces/quotes as-is
+        out.append(ch)
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return "".join(out)
+    raise ActionParseError("ARGS JSON object is not closed (unbalanced braces)")
 
 
 def parse_action(text: str) -> Action:
     """Parse a model turn into an Action, or raise ActionParseError.
 
     Tolerant of surrounding prose: it locates the ACTION/ARGS lines anywhere in
-    the output and JSON-decodes the args object.
+    the output and JSON-decodes the args object. Reasoning models (e.g. Qwen3
+    with thinking mode) may prefix the turn with a `<think>...</think>` block;
+    that block is stripped before scanning so stray "ACTION:"/"ARGS:"-looking
+    text inside the model's internal reasoning can't be mistaken for the real
+    action.
     """
-    m_tool = _ACTION_RE.search(text)
+    stripped = _THINK_RE.sub("", text)
+
+    m_tool = _ACTION_RE.search(stripped)
     if not m_tool:
         raise ActionParseError("no ACTION: line found")
     tool = m_tool.group("tool").lower()
 
-    m_args = _ARGS_RE.search(text)
     args: dict = {}
+    m_args = _ARGS_RE.search(stripped, m_tool.end())
     if m_args:
+        json_text = _extract_balanced_json(stripped, m_args.end())
         try:
-            args = json.loads(m_args.group("json"))
+            args = json.loads(json_text)
         except json.JSONDecodeError as e:
             raise ActionParseError(f"ARGS is not valid JSON: {e}")
     if not isinstance(args, dict):

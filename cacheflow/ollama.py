@@ -1,8 +1,17 @@
 """Ollama integration: detect installed models and get their paths."""
 
+import json
 import subprocess
 from pathlib import Path
 from typing import Optional, List
+
+# Ollama lays manifests out as manifests/<registry>/<namespace>/<model>/<tag>,
+# e.g. manifests/registry.ollama.ai/library/qwen2.5-coder/7b. Default registry
+# pulls (no explicit host/namespace, e.g. `ollama pull qwen3:8b`) always land
+# under registry.ollama.ai/library — that's the only root actually present on
+# a normal install, so it's the one we scan.
+_DEFAULT_REGISTRY = "registry.ollama.ai"
+_DEFAULT_NAMESPACE = "library"
 
 
 def get_ollama_models_dir() -> Path:
@@ -17,22 +26,21 @@ def list_ollama_models() -> List[str]:
     Returns:
         List of model names (e.g., ['qwen2.5-coder:7b', 'mistral:7b'])
     """
-    models_dir = get_ollama_models_dir()
-
-    if not models_dir.exists():
+    library_dir = get_ollama_models_dir() / "manifests" / _DEFAULT_REGISTRY / _DEFAULT_NAMESPACE
+    if not library_dir.exists():
         return []
 
     models = []
-    # Ollama stores manifests in manifests/library/
-    manifests_dir = models_dir / "manifests" / "library"
-
-    if manifests_dir.exists():
-        for model_dir in manifests_dir.iterdir():
-            if model_dir.is_dir():
-                # Model name is directory name, check for latest version
-                latest_file = model_dir / "latest"
-                if latest_file.exists():
-                    models.append(model_dir.name)
+    for model_dir in library_dir.iterdir():
+        if not model_dir.is_dir():
+            continue
+        # Each file under the model dir is a tag (e.g. "7b", "latest"), not
+        # just "latest" — the old code only ever matched models pulled
+        # without a tag, which silently hid every `name:tag` install (the
+        # normal case: `ollama pull qwen2.5-coder:7b`, `ollama pull qwen3:8b`).
+        for tag_file in model_dir.iterdir():
+            if tag_file.is_file():
+                models.append(f"{model_dir.name}:{tag_file.name}")
 
     return sorted(models)
 
@@ -48,26 +56,24 @@ def get_ollama_model_path(model_name: str) -> Optional[Path]:
         Path to .gguf file, or None if not found
     """
     models_dir = get_ollama_models_dir()
+    name, _, tag = model_name.partition(":")
+    tag = tag or "latest"
 
-    if not models_dir.exists():
+    manifest_path = models_dir / "manifests" / _DEFAULT_REGISTRY / _DEFAULT_NAMESPACE / name / tag
+    if not manifest_path.is_file():
         return None
 
-    # Ollama stores blobs in blobs/sha256-<hash>
-    # The manifest points to which blob to use
-    # For simplicity, look for .gguf files in the models directory structure
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
 
-    # First try: direct model name as directory
-    model_dir = models_dir / "models" / model_name
-    if model_dir.exists():
-        for gguf_file in model_dir.rglob("*.gguf"):
-            return gguf_file
-
-    # Fallback: search all .gguf files in blobs
-    blobs_dir = models_dir / "blobs"
-    if blobs_dir.exists():
-        for gguf_file in blobs_dir.glob("sha256-*"):
-            if gguf_file.is_file():
-                return gguf_file
+    for layer in manifest.get("layers", []):
+        if layer.get("mediaType") == "application/vnd.ollama.image.model":
+            digest = layer.get("digest", "")
+            blob = models_dir / "blobs" / digest.replace(":", "-")
+            if blob.is_file():
+                return blob
 
     return None
 

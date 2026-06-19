@@ -186,9 +186,11 @@ class LlamaEngine:
                 content = result["choices"][0]["text"]
                 total_prompt_tokens = result["usage"]["prompt_tokens"]
                 completion_tokens = result["usage"]["completion_tokens"]
+                finish_reason = result["choices"][0].get("finish_reason")
             else:
                 parts: list[str] = []
                 completion_tokens = 0
+                finish_reason = None
                 for chunk in self.model.create_completion(
                     prompt=prompt,
                     max_tokens=max_tokens,
@@ -205,20 +207,29 @@ class LlamaEngine:
                     if piece:
                         parts.append(piece)
                         on_token(piece)
+                    # finish_reason is only populated on the terminal chunk.
+                    finish_reason = chunk["choices"][0].get("finish_reason") or finish_reason
                 content = "".join(parts)
                 total_prompt_tokens = len(prompt_tokens)
             gen_s = time.time() - gen_start
+            tokens_per_sec = completion_tokens / max(gen_s, 1e-6)
 
             logger.debug(
-                "completion: prompt=%d cached=%d reused=%d evaluated=%d gen=%d in %.2fs (%.1f tok/s)",
+                "completion: prompt=%d cached=%d reused=%d evaluated=%d gen=%d in %.2fs (%.1f tok/s) finish=%s",
                 len(prompt_tokens), n_cached_before, lcp, tokens_evaluated,
-                completion_tokens, gen_s, completion_tokens / max(gen_s, 1e-6),
+                completion_tokens, gen_s, tokens_per_sec, finish_reason,
             )
 
             return {
                 "content": content,
                 "tokens_evaluated": tokens_evaluated,
                 "tokens_predicted": completion_tokens,
+                # "length" means max_tokens was hit before the model reached a
+                # stop string — i.e. the output (often a JSON arg string mid
+                # file-write) may be truncated rather than complete.
+                "truncated": finish_reason == "length",
+                "gen_time_ms": int(gen_s * 1000),
+                "tokens_per_sec": tokens_per_sec,
                 "usage": {
                     "prompt_tokens": total_prompt_tokens,
                     "completion_tokens": completion_tokens,
