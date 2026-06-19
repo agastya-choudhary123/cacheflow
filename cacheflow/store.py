@@ -210,6 +210,24 @@ class CacheFlowStore:
         finally:
             session.close()
 
+    def update_agent_model(self, agent: Agent, model_name: str, model_hash: str) -> None:
+        """Re-point an agent at a new model after a forced re-prime.
+
+        Called when the active model changes (e.g. via `cf model use`) and an
+        agent's stored model_name no longer matches the config's. After the
+        re-prime in agent.py, the agent's KV cache (and baseline) belong to the
+        new model, so the stored identity must follow it — otherwise every
+        subsequent session would keep detecting a "mismatch" forever.
+        """
+        session = self._get_session()
+        try:
+            agent.model_name = model_name
+            agent.model_hash = model_hash
+            session.merge(agent)
+            session.commit()
+        finally:
+            session.close()
+
     def update_agent_snapshot(
         self,
         agent: Agent,

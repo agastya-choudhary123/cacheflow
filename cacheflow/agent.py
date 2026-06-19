@@ -338,15 +338,6 @@ class AgentSession:
                     self.config.model_hash,
                     self.config.ctx_size,
                 )
-            else:
-                if agent.model_hash != self.config.model_hash:
-                    raise RuntimeError(
-                        f"Agent '{self.agent_name}' was created with model {agent.model_name} "
-                        f"(hash: {agent.model_hash[:8]}...) but config specifies {self.config.model_name} "
-                        f"(hash: {self.config.model_hash[:8]}...). "
-                        "Token baselines are model-specific and cannot be transferred. "
-                        "Create a new agent or update config to match."
-                    )
 
             # Step b: Acquire KV cache slot
             self._acquire_lock()
@@ -374,7 +365,15 @@ class AgentSession:
             current_hash = _hash_context(stable_prefix)
             context_changed = (agent.stable_context_hash != current_hash)
 
-            if is_first_session or context_changed:
+            # The agent's stored snapshot was written by whatever model was active
+            # when it was last primed. Snapshots are raw KV-cache bytes tied to that
+            # model's tokenizer/vocab/hidden dims — restoring them into a different
+            # model (e.g. after `cf model use` swaps the active model) would corrupt
+            # state or crash. Treat a model identity mismatch exactly like a
+            # stable_context_hash mismatch: force a re-prime instead of restoring.
+            model_changed = (agent.model_name != self.config.model_name)
+
+            if is_first_session or context_changed or model_changed:
                 prime_start = time.time()
                 self.server.prime_slot(stable_prefix, slot_id=self.slot_id)
                 prime_time_ms = int((time.time() - prime_start) * 1000)
@@ -389,7 +388,7 @@ class AgentSession:
             # Only save when we actually re-primed: on the restore path the HEAD
             # snapshot already exists on disk and is byte-identical to what save_slot
             # would write, so saving again is pure redundant I/O (~503 MB write).
-            primed = is_first_session or context_changed
+            primed = is_first_session or context_changed or model_changed
             save_time_ms = 0
             save_result = None
             if primed:
@@ -422,11 +421,21 @@ class AgentSession:
             tokens_this_session = tokens_in + tokens_out
 
             # Persist stable_context_hash whenever it changes (64-byte hash, not multi-MB text)
-            if context_changed or is_first_session:
+            if context_changed or is_first_session or model_changed:
                 self.store.update_agent_stable_context(agent, stable_prefix)
                 agent.stable_context_hash = current_hash
 
-            if is_first_session or agent.baseline_tokens_evaluated is None:
+            if model_changed:
+                # The agent's KV cache (and any baseline computed against the old
+                # model) is now stale — the re-prime above just rebuilt it under
+                # the new model, so re-point the agent's stored identity at it.
+                # Without this, every future session would keep detecting this
+                # same "mismatch" and re-priming forever.
+                self.store.update_agent_model(agent, self.config.model_name, self.config.model_hash)
+                agent.model_name = self.config.model_name
+                agent.model_hash = self.config.model_hash
+
+            if is_first_session or model_changed or agent.baseline_tokens_evaluated is None:
                 tokens_saved = 0
                 baseline = total_prompt_tokens if total_prompt_tokens > 0 else tokens_in
                 self.store.update_agent_baseline(agent, baseline)
@@ -498,8 +507,13 @@ class AgentSession:
         current_hash = _hash_context(stable_prefix)
         is_first = agent.current_snapshot_path is None
         context_changed = agent.stable_context_hash != current_hash
+        # See run(): a stored HEAD snapshot was written by whichever model was
+        # active at the time. If the active model has since changed (e.g. via
+        # `cf model use`), restoring that snapshot into the new model would
+        # corrupt state — force a re-prime instead, exactly like a context change.
+        model_changed = agent.model_name != self.config.model_name
 
-        if is_first or context_changed:
+        if is_first or context_changed or model_changed:
             self.server.prime_slot(stable_prefix, slot_id=self.slot_id)
             save_result = self.server.save_slot(slot_id=self.slot_id)
             saved_filename = save_result.get("filename", "")
@@ -516,6 +530,10 @@ class AgentSession:
                 )
                 self.store.update_agent_stable_context(agent, stable_prefix)
                 agent.stable_context_hash = current_hash
+            if model_changed:
+                self.store.update_agent_model(agent, self.config.model_name, self.config.model_hash)
+                agent.model_name = self.config.model_name
+                agent.model_hash = self.config.model_hash
         else:
             self.server.restore_slot(
                 Path(agent.current_snapshot_path).name, slot_id=self.slot_id
@@ -603,11 +621,9 @@ class AgentSession:
                     self.agent_name, self.config.model_name,
                     self.config.model_hash, self.config.ctx_size,
                 )
-            elif agent.model_hash != self.config.model_hash:
-                raise RuntimeError(
-                    f"Agent '{self.agent_name}' was created with a different model "
-                    "(hash mismatch). Create a new agent or update config to match."
-                )
+            # Model mismatch (different active model than when this agent was last
+            # primed) is handled by _restore_or_prime below, which forces a
+            # re-prime instead of restoring a snapshot written by a different model.
 
             self._acquire_lock()
             self.server = get_global_engine(
@@ -745,13 +761,26 @@ class AgentSession:
                     DEFAULT_SYSTEM_PROMPT, agent.knowledge_summary
                 )
                 current_hash = _hash_context(stable_prefix)
+                # See run()/_restore_or_prime(): never restore a snapshot written
+                # by a different model than the one currently active.
+                model_changed = agent.model_name != self.config.model_name
 
                 # Restore the codebase KV if it still matches; otherwise prime fresh.
-                if agent.stable_context_hash == current_hash and agent.current_snapshot_path:
+                if (
+                    agent.stable_context_hash == current_hash
+                    and agent.current_snapshot_path
+                    and not model_changed
+                ):
                     snapshot_filename = Path(agent.current_snapshot_path).name
                     self.server.restore_slot(snapshot_filename, slot_id=self.slot_id)
                 else:
                     self.server.prime_slot(stable_prefix, slot_id=self.slot_id)
+                    if model_changed:
+                        self.store.update_agent_model(
+                            agent, self.config.model_name, self.config.model_hash
+                        )
+                        agent.model_name = self.config.model_name
+                        agent.model_hash = self.config.model_hash
 
                 response = self.server.completion(
                     prompt=stable_prefix + self._build_consolidation_suffix(),

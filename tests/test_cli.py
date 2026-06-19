@@ -469,3 +469,86 @@ class TestStatusCommand:
 
         assert result.exit_code == 0
         assert "Status: custom" in result.output
+
+
+class TestModelCommand:
+    """Test the `cf model list` / `cf model use` command group."""
+
+    def test_model_list_marks_active(self, runner, temp_dir, config):
+        """`cf model list` should mark the currently-configured model."""
+        other_model = temp_dir / "other-model.gguf"
+        other_model.write_bytes(b"GGUF" + os.urandom(64))
+
+        with patch("cacheflow.cli._discover_models", return_value=[
+            ("qwen2.5-coder:7b  [ollama]", "qwen2.5-coder:7b", "/path/to/model.gguf"),
+            (other_model.name, other_model.stem, str(other_model)),
+        ]):
+            result = runner.invoke(cli, ["model", "list", "--base-path", str(temp_dir)])
+
+        assert result.exit_code == 0, result.output
+        assert "* qwen2.5-coder:7b" in result.output
+        assert other_model.name in result.output
+        assert "Active: qwen2.5-coder:7b" in result.output
+
+    def test_model_list_no_models_found(self, runner, temp_dir, config):
+        """`cf model list` should error clearly when nothing is discovered."""
+        with patch("cacheflow.cli._discover_models", return_value=[]):
+            result = runner.invoke(cli, ["model", "list", "--base-path", str(temp_dir)])
+
+        assert result.exit_code != 0
+        assert "no models found" in result.output.lower()
+
+    def test_model_use_switches_config(self, runner, temp_dir, config):
+        """`cf model use` should rewrite config.json's model fields."""
+        new_model = temp_dir / "new-model.gguf"
+        new_model.write_bytes(b"GGUF" + os.urandom(1024))
+
+        with patch("cacheflow.cli._discover_models", return_value=[
+            ("qwen2.5-coder:7b  [ollama]", "qwen2.5-coder:7b", "/path/to/model.gguf"),
+            (new_model.name, new_model.stem, str(new_model)),
+        ]), patch("cacheflow.cli.stop_global_engine") as mock_stop:
+            result = runner.invoke(
+                cli, ["model", "use", new_model.stem, "--base-path", str(temp_dir)]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "Switched active model" in result.output
+        mock_stop.assert_called_once()
+
+        from cacheflow.config import load_config
+        updated = load_config(temp_dir)
+        assert updated.model_name == new_model.stem
+        assert updated.model_path == str(new_model)
+
+    def test_model_use_already_active_is_noop(self, runner, temp_dir, config):
+        """Switching to the already-active model should be a no-op, not an error."""
+        with patch("cacheflow.cli._discover_models", return_value=[
+            ("qwen2.5-coder:7b  [ollama]", "qwen2.5-coder:7b", "/path/to/model.gguf"),
+        ]):
+            result = runner.invoke(
+                cli, ["model", "use", "qwen2.5-coder:7b", "--base-path", str(temp_dir)]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "Already using" in result.output
+
+    def test_model_use_unknown_model_errors(self, runner, temp_dir, config):
+        """`cf model use` should error clearly for an unrecognized name/path."""
+        with patch("cacheflow.cli._discover_models", return_value=[
+            ("qwen2.5-coder:7b  [ollama]", "qwen2.5-coder:7b", "/path/to/model.gguf"),
+        ]):
+            result = runner.invoke(
+                cli, ["model", "use", "does-not-exist", "--base-path", str(temp_dir)]
+            )
+
+        assert result.exit_code != 0
+        assert "not found" in result.output.lower()
+
+    def test_model_use_requires_init(self, runner, temp_dir):
+        """`cf model use` should fail clearly if the project was never initialized."""
+        result = runner.invoke(
+            cli, ["model", "use", "anything", "--base-path", str(temp_dir)]
+        )
+
+        assert result.exit_code != 0
+        assert "cf init" in result.output.lower() or "no cacheflow config" in result.output.lower()
