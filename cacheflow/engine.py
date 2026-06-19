@@ -67,6 +67,23 @@ class LlamaEngine:
             # prefix match reuse the KV and evaluate only the new tokens — the
             # whole point of CacheFlow — at the cost of ~18% decode throughput.
             flash_attn=False,
+            # Library default is 512/512. The cold-start prime evaluates the
+            # entire codebase prefix (often several thousand tokens) in one
+            # call; a larger logical batch (n_batch) lets llama.cpp submit more
+            # tokens per ggml graph build, and a matching physical batch
+            # (n_ubatch) lets the backend execute them in fewer, bigger forward
+            # passes — both raise prefill tok/s specifically on the cold/prime
+            # path where there's no cached KV to fall back on. Decode (token-
+            # by-token generation) still processes 1 token at a time regardless
+            # of these settings, so this doesn't touch the flash_attn-off
+            # decode-throughput tradeoff noted above.
+            n_batch=2048,
+            n_ubatch=2048,
+            # use_mmap (library default True) and use_mlock (default False) are
+            # already the right choice for fast cold start: mmap pages weights
+            # in lazily instead of blocking on a full synchronous read, and
+            # mlock would force the whole file into RAM upfront before any
+            # work could start. Left unset intentionally — not overridden here.
             verbose=False,
         )
 

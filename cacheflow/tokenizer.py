@@ -23,9 +23,25 @@ class ModelTokenizer:
     Uses vocab_only=True so only the vocabulary/BPE tables are loaded —
     no weights, no KV cache, typically ~50-100 MB vs 4-7 GB for full model.
     Falls back to minimal n_ctx if the installed version predates vocab_only.
+
+    The actual vocab_only Llama load is deferred to the first `encode`/
+    `count` call instead of happening in `__init__`. `get_tokenizer()` is
+    called eagerly in `AgentSession._setup()`, which used to mean every
+    `AgentSession` construction blocked on this second model load before
+    `run()` even started. Since the tokenizer isn't needed until the agent
+    actually builds the stable context / chunks files, deferring the load
+    here removes that blocking work from the front of the cold path without
+    changing any caller-visible behavior (still exact counts, still cached
+    per model_path via the registry in `get_tokenizer`).
     """
 
     def __init__(self, model_path: str) -> None:
+        self._model_path = model_path
+        self._model = None
+
+    def _ensure_loaded(self) -> None:
+        if self._model is not None:
+            return
         try:
             from llama_cpp import Llama
         except ImportError:
@@ -36,14 +52,14 @@ class ModelTokenizer:
 
         try:
             self._model = Llama(
-                model_path=model_path,
+                model_path=self._model_path,
                 vocab_only=True,
                 verbose=False,
             )
         except TypeError:
             # Older llama-cpp-python without vocab_only parameter
             self._model = Llama(
-                model_path=model_path,
+                model_path=self._model_path,
                 n_ctx=128,
                 n_gpu_layers=0,
                 verbose=False,
@@ -51,6 +67,7 @@ class ModelTokenizer:
 
     def encode(self, text: str) -> list[int]:
         """Return the exact token IDs for text."""
+        self._ensure_loaded()
         return list(self._model.tokenize(text.encode("utf-8", errors="replace")))
 
     def count(self, text: str) -> int:

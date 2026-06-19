@@ -17,8 +17,6 @@ from cacheflow.config import load_config, CacheFlowConfig
 from cacheflow.store import CacheFlowStore, Agent, _hash_context
 from cacheflow.engine import LlamaEngine, get_global_engine
 from cacheflow.compressor import Compressor
-from cacheflow.indexer import CodeIndexer
-from cacheflow.retriever import CodeRetriever
 from cacheflow.tokenizer import ModelTokenizer, get_tokenizer
 from cacheflow.slot_pool import SlotPool, SlotLease
 from cacheflow.gc import SnapshotGC
@@ -97,6 +95,11 @@ class AgentSession:
         self.store = CacheFlowStore(db_path)
         with _DB_INIT_LOCK:
             self.store.init_db()
+        # get_tokenizer() returns a ModelTokenizer handle, but the underlying
+        # vocab-only Llama load is itself deferred until the first .count()/
+        # .encode() call (see ModelTokenizer below) — so this is cheap, and
+        # AgentSession construction no longer blocks on a model load before
+        # it's actually needed.
         self._tokenizer = get_tokenizer(self.config.model_path)
 
     def _acquire_lock(self) -> None:
