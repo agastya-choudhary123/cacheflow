@@ -13,6 +13,7 @@ from cacheflow.store import CacheFlowStore
 from cacheflow.tools import (
     ToolContext, Action, parse_action, execute, ActionParseError,
 )
+from cacheflow.reasoning_loop import run_agentic, _build_agentic_preamble
 
 
 @pytest.fixture
@@ -373,8 +374,8 @@ def test_run_agentic_dispatches_tool_then_finishes(temp_dir, config, store):
     engine = _mock_engine_with_script(snapshots_dir, script)
 
     session = AgentSession("a", temp_dir)
-    with patch("cacheflow.agent.get_global_engine", return_value=engine):
-        result = session.run_agentic("read target.txt", max_steps=5)
+    with patch("cacheflow.reasoning_loop.get_global_engine", return_value=engine):
+        result = run_agentic(session, "read target.txt", DEFAULT_SYSTEM_PROMPT, max_steps=5)
 
     assert result.completed is True
     assert result.final_answer == "it says SECRET_VALUE"
@@ -393,8 +394,8 @@ def test_run_agentic_hits_max_steps(temp_dir, config, store):
     engine = _mock_engine_with_script(snapshots_dir, never_finishes)
 
     session = AgentSession("a", temp_dir)
-    with patch("cacheflow.agent.get_global_engine", return_value=engine):
-        result = session.run_agentic("loop forever", max_steps=3)
+    with patch("cacheflow.reasoning_loop.get_global_engine", return_value=engine):
+        result = run_agentic(session, "loop forever", DEFAULT_SYSTEM_PROMPT, max_steps=3)
 
     assert result.completed is False
     assert len(result.steps) == 3
@@ -413,13 +414,13 @@ def test_agentic_preamble_suppresses_qwen3_thinking(temp_dir, store):
     )
     save_config(cfg)
     session = AgentSession("a", temp_dir)
-    preamble = session._build_agentic_preamble("do the thing")
+    preamble = _build_agentic_preamble(session, "do the thing")
     assert preamble.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
 
 
 def test_agentic_preamble_no_think_prefill_for_qwen2(temp_dir, config, store):
     session = AgentSession("a", temp_dir)
-    preamble = session._build_agentic_preamble("do the thing")
+    preamble = _build_agentic_preamble(session, "do the thing")
     assert preamble.endswith("<|im_start|>assistant\n")
     assert "<think>" not in preamble
 
@@ -435,8 +436,8 @@ def test_run_agentic_recovers_from_malformed_action(temp_dir, config, store):
     engine = _mock_engine_with_script(snapshots_dir, script)
 
     session = AgentSession("a", temp_dir)
-    with patch("cacheflow.agent.get_global_engine", return_value=engine):
-        result = session.run_agentic("test recovery", max_steps=5)
+    with patch("cacheflow.reasoning_loop.get_global_engine", return_value=engine):
+        result = run_agentic(session, "test recovery", DEFAULT_SYSTEM_PROMPT, max_steps=5)
 
     assert result.completed is True
     assert result.final_answer == "recovered"
