@@ -6,6 +6,7 @@ import atexit
 import click
 
 from cacheflow.agent import AgentSession, DEFAULT_SYSTEM_PROMPT, fork_agent
+from cacheflow.reasoning_loop import run_agentic
 from cacheflow.config import CacheFlowConfig, compute_model_hash, save_config, load_config, register_project
 from cacheflow.server import stop_global_server
 from cacheflow.engine import stop_global_engine
@@ -228,7 +229,8 @@ def agent(task, agent_name, system_prompt, max_steps, max_tokens_per_step, auto,
         def on_token(piece: str) -> None:
             click.echo(piece, nl=False)
 
-        result = session.run_agentic(
+        result = run_agentic(
+            session,
             task,
             system_prompt=system_prompt,
             max_steps=max_steps,
