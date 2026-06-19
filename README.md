@@ -95,13 +95,25 @@ cf init [--ctx-size SIZE] [--n-gpu-layers N] [--base-path PATH]
   Initialize CacheFlow. Discovers installed models and prompts to pick one.
   Locks ctx_size immutably. Rarely needed — cf run auto-runs this.
 
+cf model list [--base-path PATH]
+  List discovered models (ollama + raw GGUF); marks the active one.
+
+cf model use NAME_OR_PATH [--base-path PATH]
+  Switch the active model. Existing agents are not deleted — their next
+  session detects the model-identity mismatch and re-primes (never restores
+  a snapshot written by a different model, which would corrupt KV state).
+
 cf run TASK [--agent AGENT] [--max-tokens N] [--system-prompt TEXT] [--stream/--no-stream]
-  Run a task. Restores the agent's snapshot if available; auto-inits on first use.
+  Run a single-shot task. Restores the agent's snapshot if available; auto-inits on first use.
   Prints: tokens used, tokens saved, snapshot size, duration. Streams by default.
+
+cf agent TASK [--agent AGENT] [--max-steps N] [--max-tokens-per-step N] [--auto] [--allow-bash] [--stream/--no-stream]
+  Run a multi-step agentic task (observe → act → observe) via cacheflow/reasoning_loop.py.
+  Read tools are always available; --auto gates file writes/edits, --allow-bash gates shell commands.
 
 cf repl [--base-path PATH]
   Interactive REPL with the model kept hot between tasks.
-  Commands inside: run AGENT TASK | log AGENT | status [AGENT] | agents | fork PARENT CHILD | exit
+  Commands inside: run AGENT TASK | log AGENT | status [AGENT] | agents | fork PARENT CHILD | model list | model use NAME | exit
 
 cf log AGENT [--base-path PATH]
   Session history with baseline, cumulative, and last-session token savings.
@@ -140,6 +152,12 @@ The warm path **does not re-save** the snapshot — the HEAD on disk is already 
 
 If the codebase changes (detected via a SHA-256 hash of the stable prefix), the KV cache is erased and re-primed from scratch. This prevents silent breakage where stale bytes don't match the restored snapshot.
 
+The same re-prime path also fires on a **model swap** (`cf model use`): an agent's stored `model_name` is compared against the active config, and a mismatch forces a re-prime instead of restoring — a snapshot is raw KV bytes tied to the model that produced it, so restoring it under a different model would corrupt state.
+
+### Agentic Loop vs. KV Engine
+
+`cacheflow/reasoning_loop.py` owns the agentic tool-calling loop (`run_agentic`, used by `cf agent`) — tool-protocol parsing, dispatch to `read_file`/`edit_file`/`write_file`/`grep`/`run_bash`/etc., and step/stop-condition bookkeeping. It is deliberately decoupled from `AgentSession`: it only calls the primitives an external harness would have access to (`session._acquire_lock`/`_release_lock`, `session._restore_or_prime`, `session.server.completion()`). `AgentSession` itself stays scoped to the KV-cache-facing surface — `run()`, prime/restore/save, stable-prefix building, HEAD tracking, and `consolidate()`.
+
 ### Per-Sequence Snapshots (format v4)
 
 Snapshots use a compact binary format (`CFKV`, version 4) defined in `llama_server_custom.py`. Instead of `model.save_state()` — which serializes the **entire** `n_ctx` buffer (e.g. 16384 tokens) regardless of occupancy — v4 serializes only the live KV via `llama_state_seq_get_data`. A 9k-token prime no longer writes the full 16384-ctx buffer, shrinking both the save write and the restore read. Restore splices the sequence back in with `llama_state_seq_set_data` after clearing the KV. Older v3 (full-state) snapshots remain readable; agents upgrade transparently on their next prime.
@@ -177,8 +195,8 @@ Each session restores only the codebase KV, so knowledge the model picks up whil
 ```
 ┌─────────────────────────────────────────────────┐
 │                  CacheFlow CLI                   │
-│  init | run | repl | log | agents | status |     │
-│  fork | mcp-server                               │
+│  init | model | run | agent | repl | log |       │
+│  agents | status | fork | mcp-server             │
 └──────────────────────┬──────────────────────────┘
                        │
          ┌─────────────┴────────────┐
@@ -215,6 +233,7 @@ cacheflow/
 ├── cacheflow/
 │   ├── cli.py                  # Entry point; all CLI commands
 │   ├── agent.py                # Core loop: restore/prime → save → complete → record HEAD
+│   ├── reasoning_loop.py       # Agentic tool-calling loop (observe→act), decoupled from AgentSession internals
 │   ├── engine.py               # In-process LlamaEngine (primary execution path)
 │   ├── server.py               # Optional HTTP shim: LlamaServer subprocess + client
 │   ├── llama_server_custom.py  # Flask shim + v4 snapshot format + CooperativeSlotManager
@@ -243,8 +262,9 @@ cacheflow/
 | File | Purpose |
 |------|---------|
 | `cacheflow/agent.py` | Core `AgentSession.run()` — restore/prime → save → complete → record HEAD |
+| `cacheflow/reasoning_loop.py` | Agentic tool-calling loop (`run_agentic`, used by `cf agent`); only touches `AgentSession` through its KV-cache primitives |
 | `cacheflow/engine.py` | In-process `LlamaEngine`; `get_global_engine()` singleton |
-| `cacheflow/cli.py` | All CLI commands; model discovery via ollama/GGUF search |
+| `cacheflow/cli.py` | All CLI commands; model discovery via ollama/GGUF search; `cf model list`/`cf model use` |
 | `cacheflow/server.py` + `llama_server_custom.py` | Optional HTTP shim; the latter owns the v4 snapshot format and `CooperativeSlotManager` |
 | `cacheflow/store.py` | SQLite flat store (agent + HEAD snapshot) operations |
 | `cacheflow/slot_pool.py` | Multi-agent slot allocation and LRU eviction |
@@ -297,6 +317,12 @@ automatically suppressed for the agentic tool-use loop (`run_agentic`/`cf agent`
 `<think></think>` block on each assistant turn, so the loop's small per-step token budget isn't eaten by hidden
 reasoning before it can emit ACTION/ARGS.
 
+**Known limitation — non-Qwen models and `cf run`:** `_build_task_suffix`/`_build_stable_prefix` (`cacheflow/agent.py`)
+only apply ChatML formatting when `"qwen" in model_name`. Swapping to a non-Qwen model via `cf model use` (verified
+with `llama3.1:8b`) works correctly — no crash, no corrupted KV — but single-shot `cf run` responses can ramble,
+since the model gets a bare `"Task: ..."` suffix with no instruct-template stop boundary. `cf agent`'s tool-observation
+framing is less affected. Generalizing the template selection per model family is a known follow-up.
+
 ## Installation
 
 ```bash
@@ -316,7 +342,7 @@ pytest -xvs                             # Stop on first failure, verbose
 
 A shared `tests/conftest.py` autouse fixture patches `cacheflow.agent.get_tokenizer` with a lightweight fake, so constructing an `AgentSession` in unit tests never loads a real model. Mock `get_global_engine()` (or `get_global_server()` for the HTTP shim) to avoid running a real model; tests needing specific token counts patch `get_tokenizer` inline to override the default fake.
 
-**Test modules:** `test_agent.py`, `test_cli.py`, `test_store.py`, `test_config.py`, `test_compressor.py`, `test_rag_integration.py`, `test_indexer.py`, `test_multi_agent.py`, `test_fixes.py` (regressions incl. snapshot format + `SnapshotGC`), `test_stress.py`, `test_server_smoke.py`, `test_system_questions*.py`.
+**Test modules:** `test_agent.py` (incl. model-swap re-prime guard), `test_agentic.py` (the `reasoning_loop.py` tool loop), `test_cli.py` (incl. `cf model list`/`use`), `test_store.py`, `test_config.py`, `test_compressor.py` (incl. model-swap during `consolidate()`), `test_rag_integration.py`, `test_indexer.py`, `test_multi_agent.py`, `test_fixes.py` (regressions incl. snapshot format + `SnapshotGC`), `test_stress.py`, `test_server_smoke.py`, `test_system_questions*.py`.
 
 ## Performance
 

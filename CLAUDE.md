@@ -20,8 +20,11 @@ pytest -v                        # Verbose output
 **Run the CLI:**
 ```bash
 cf init                              # Initialize a project with a model
+cf model list                        # List discovered models; marks the active one
+cf model use NAME_OR_PATH            # Switch the active model (forces re-prime, never restore, on mismatch)
 cf run "Your task here"              # Run a task with agent 'main'
 cf run "Task" --agent research       # Run with named agent
+cf agent "Task" --auto               # Multi-step agentic task (read/edit/bash via reasoning_loop.py)
 cf log main                          # Show session history for an agent
 cf agents                            # List all agents and their stats
 cf status --agent main               # Show one agent's current state
@@ -53,19 +56,29 @@ CacheFlow is a **persistent KV cache system for AI agents**. It solves token was
 **cacheflow/agent.py — `AgentSession`**
 - Main loop: load config → acquire slot → restore-or-prime → (save) → complete → record HEAD
 - Computes `stable_context` hash; detects codebase changes and re-primes if needed
-- Tokenizes via `get_tokenizer()` (exact, vocab-only model) — see tokenizer.py
+- Also detects a **model swap** (`agent.model_name`/`model_hash` vs. `self.config.model_name`/`model_hash`) and forces a re-prime instead of restoring — a snapshot is raw KV bytes tied to a specific model's tokenizer/vocab/hidden dims, so restoring it under a different model would corrupt state. This `model_changed` guard lives in three places: `run()`, the shared `_restore_or_prime()` primitive, and `consolidate()`; on mismatch each calls `store.update_agent_model()` to re-point the agent's stored identity after the re-prime.
+- Tokenizes via `get_tokenizer()` (exact, vocab-only model, lazily loaded on first `encode()`/`count()` call — see tokenizer.py)
 - Accumulates `agent.accumulated_tokens` and spawns the `Compressor` background consolidation when it hits the 70%-of-context threshold
 - Owns the module-level `_DB_INIT_LOCK` used to serialize first-time DB init
-- Methods: `run(task)` → `SessionResult`
+- Methods: `run(task)` → `SessionResult`; `_restore_or_prime(agent, system_prompt)` is the shared restore/prime/model-mismatch primitive used by both `run()` and `reasoning_loop.run_agentic()`
+- The agentic tool-calling loop itself (`AgentStep`/`AgentLoopResult`, preamble building, observation appending, `run_agentic`) lives in `cacheflow/reasoning_loop.py`, not here — see below
+- `_build_task_suffix`/`_build_stable_prefix` only apply ChatML formatting (`<|im_start|>`/`<|im_end|>`) `if "qwen" in model_name.lower()`; other model families fall back to a bare `"Task: {task}"` suffix with no instruct template (known gap, can cause rambling output in `cf run` on non-Qwen models — verified non-crashing, just under-templated)
+
+**cacheflow/reasoning_loop.py — `run_agentic` (agentic tool-calling loop)**
+- Owns the entire observe→act→observe loop used by `cf agent`: tool-protocol preamble, THOUGHT/ACTION/ARGS parsing and dispatch (via `cacheflow.tools`), and step/stop-condition bookkeeping (`max_steps`, the `finish` action)
+- Deliberately decoupled from `AgentSession` internals: only calls `session._acquire_lock()`/`_release_lock()`, `session._restore_or_prime()`, and `session.server.completion()` — the same surface an external harness would have. `AgentSession`/`LlamaEngine` never reach back into this module; the dependency is one-directional
+- The codebase KV stays hot in one slot for the whole loop so every step prefix-matches the cached prefix and only evaluates the new observation + generated action
+- A model-identity mismatch is handled by the `session._restore_or_prime()` call inside `run_agentic` (forces re-prime), not by a separate check in this module
 
 **cacheflow/store.py — `CacheFlowStore` (SQLite, flat agent model)**
 - Single `agents` table. There is **no commit DAG** — each agent points at one current (HEAD) snapshot via `current_snapshot_path`.
 - `Agent` fields of note: `stable_context_hash`, `current_snapshot_path`, `baseline_tokens_evaluated`, `last_tokens_saved` (most recent session), `cumulative_tokens_saved` (running total across all sessions), `parent_agent_id` (set when forked), `accumulated_tokens` (drives consolidation), `knowledge_summary` (distilled, folded into the stable prefix)
-- Key methods: `create_agent`, `get_agent`, `list_agents`, `update_agent_snapshot` (advances HEAD and increments cumulative), `update_agent_stable_context`, `update_agent_baseline`, `add_accumulated_tokens`, `update_agent_knowledge_summary` (stores summary + resets accumulator)
+- Key methods: `create_agent`, `get_agent`, `list_agents`, `update_agent_snapshot` (advances HEAD and increments cumulative), `update_agent_stable_context`, `update_agent_baseline`, `add_accumulated_tokens`, `update_agent_knowledge_summary` (stores summary + resets accumulator), `update_agent_model` (re-points an agent's stored `model_name`/`model_hash` after a forced re-prime on model swap)
 - `init_db()` is idempotent; call within `_DB_INIT_LOCK` to prevent a SQLite race on first init
 
 **cacheflow/engine.py — `LlamaEngine` (in-process, primary execution path)**
 - Runs the model **in the same process** as the agent via llama-cpp-python — no subprocess, no HTTP. This avoids the macOS HTTP decode throttle (~10x slowdown) and reloading the model per `cf run`.
+- `Llama(...)` is constructed with explicit `n_batch=2048, n_ubatch=2048` (vs. the library default 512/512) to speed cold-prefill TTFT; `flash_attn=False` is load-bearing for prefix-match correctness and is left untouched
 - Global singleton via `get_global_engine()`; shares one model across all agents
 - Cooperative `CooperativeSlotManager` time-multiplexes up to 8 agents onto the one model, swapping KV state on context switch
 - Same method surface as the HTTP client (`prime_slot`/`restore_slot`/`save_slot`/`completion`) so they're interchangeable
@@ -155,11 +168,12 @@ This prevents silent breakage where stale cached knowledge doesn't match updated
 ## Testing
 
 **Test structure:**
-- `test_agent.py` — Core session flow, prefix-matching
-- `test_cli.py` — CLI commands, initialization, agent management
+- `test_agent.py` — Core session flow, prefix-matching, model-swap re-prime guard
+- `test_agentic.py` — `reasoning_loop.run_agentic` tool loop, incl. model-swap re-prime guard
+- `test_cli.py` — CLI commands, initialization, agent management, `cf model list`/`cf model use`
 - `test_store.py` — Flat-store operations (agents, HEAD snapshot updates)
 - `test_config.py` — Config load/save, immutable context size
-- `test_compressor.py` — Background consolidation logic
+- `test_compressor.py` — Background consolidation logic, incl. model-swap during `consolidate()`
 - `test_rag_integration.py` / `test_indexer.py` — Semantic retrieval, indexing
 - `test_multi_agent.py` — Concurrent agents, slot pool, forking
 - `test_fixes.py` — Regression tests incl. snapshot format and `SnapshotGC`
@@ -194,12 +208,13 @@ cf mcp-server --dashboard-url http://custom.url:9000  # Custom backend URL
 
 ## Key Files to Know
 
-- **cacheflow/cli.py** — Entry point; command registration, model discovery, initialization
-- **cacheflow/agent.py** — Core `AgentSession.run()` loop (restore/prime → save → complete → record HEAD)
-- **cacheflow/store.py** — SQLite schema and flat-store (agent + HEAD snapshot) operations
+- **cacheflow/cli.py** — Entry point; command registration, model discovery, initialization, `cf model list`/`cf model use`; REPL `log`/`status`/`agents`/`model` commands share helpers (`_print_agent_log`, `_print_agent_status`, `_print_agents_list`) with the top-level CLI instead of duplicating them
+- **cacheflow/agent.py** — Core `AgentSession.run()` loop (restore/prime → save → complete → record HEAD); also `_restore_or_prime()`, the shared restore/prime/model-mismatch primitive used by `reasoning_loop.run_agentic`
+- **cacheflow/reasoning_loop.py** — The agentic tool-calling loop (`run_agentic`, used by `cf agent`); decoupled from `AgentSession` internals, only touches its KV-cache-facing primitives
+- **cacheflow/store.py** — SQLite schema and flat-store (agent + HEAD snapshot) operations, incl. `update_agent_model`
 - **cacheflow/engine.py** — In-process `LlamaEngine` (primary execution path); `get_global_engine()`
 - **cacheflow/server.py** + **llama_server_custom.py** — Optional HTTP shim; the latter owns the v4 snapshot format and `CooperativeSlotManager`
-- **cacheflow/tokenizer.py** — Exact token counting via a vocab-only Llama (`get_tokenizer`)
+- **cacheflow/tokenizer.py** — Exact token counting via a vocab-only Llama (`get_tokenizer`); the vocab-only model is lazily loaded on first `encode()`/`count()` call, not at `AgentSession` construction
 - **cacheflow/slot_pool.py** — Multi-agent slot allocation and LRU eviction
 - **cacheflow/gc.py** — `SnapshotGC`: reaps snapshots not referenced by any agent HEAD
 - **cacheflow/mcp_server.py** — MCP stdio server (proxies to an external REST backend)
