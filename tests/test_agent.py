@@ -326,3 +326,58 @@ def test_codebase_injection_first_session(agent_session, temp_dir):
         "Codebase:" in p or "main.py" in p or "utils.py" in p or "Analyze this codebase" in p
         for p in all_prompts
     )
+
+
+def test_model_mismatch_forces_reprime_not_restore(agent_session, temp_dir):
+    """An agent whose stored model_name differs from the active config's model
+    must re-prime instead of restoring its (incompatible) HEAD snapshot.
+
+    Snapshots are raw KV-cache bytes tied to the model that produced them;
+    restoring across models would corrupt state. The agent.py guard must treat
+    this exactly like a stable_context_hash mismatch and force prime_slot.
+    """
+    store = agent_session.store
+
+    # Agent was last primed under a *different* model than the active config
+    # (agent_session.config.model_name == "qwen2.5-coder:7b", see fixture).
+    agent = store.create_agent("test-agent", "llama2:7b", "old-hash-000", 8192)
+
+    snapshot_path = temp_dir / ".cacheflow" / "snapshots" / "initial.bin"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_path.write_bytes(os.urandom(1024))
+    store.update_agent_snapshot(
+        agent=agent, snapshot_path=str(snapshot_path), snapshot_size_bytes=1024, tokens_saved=0,
+    )
+    store.update_agent_baseline(agent, 100)
+    # Make stable_context_hash match what _build_stable_prefix will compute, so
+    # the ONLY thing that should force a re-prime here is the model mismatch.
+    stable_prefix = agent_session._build_stable_prefix(DEFAULT_SYSTEM_PROMPT, None)
+    store.update_agent_stable_context(agent, stable_prefix)
+
+    mock_server = MagicMock()
+    mock_server.completion.return_value = {
+        "content": "Done.",
+        "tokens_evaluated": 40,
+        "tokens_predicted": 20,
+        "usage": {"prompt_tokens": 100},
+    }
+    snapshot_file = temp_dir / ".cacheflow" / "snapshots" / "snapshot.bin"
+    snapshot_file.write_bytes(os.urandom(2048))
+    mock_server.save_slot.return_value = {
+        "filename": "snapshot.bin", "save_time_ms": 100, "size_bytes": 2048,
+    }
+
+    with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
+        result = agent_session.run(
+            task="Test task", system_prompt=DEFAULT_SYSTEM_PROMPT, max_tokens=512,
+        )
+
+    mock_server.prime_slot.assert_called_once()
+    mock_server.restore_slot.assert_not_called()
+    assert result.is_first_session is False
+
+    # After the forced re-prime, the agent's stored identity must follow the
+    # new model — otherwise every future session would re-prime forever.
+    refreshed = store.get_agent("test-agent")
+    assert refreshed.model_name == agent_session.config.model_name
+    assert refreshed.model_hash == agent_session.config.model_hash

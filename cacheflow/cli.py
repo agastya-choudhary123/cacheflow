@@ -147,6 +147,126 @@ def init(ctx_size, n_gpu_layers, base_path):
         raise click.ClickException(str(e))
 
 
+@cli.group()
+def model():
+    """Inspect or switch the active model without hand-editing config.json."""
+    pass
+
+
+@model.command("list")
+@click.option("--base-path", default=".", help="Project root")
+def model_list(base_path):
+    """List all discovered models, marking the one currently active."""
+    try:
+        base_path = Path(base_path)
+        models = _discover_models()
+
+        if not models:
+            raise click.ClickException(
+                "No models found.\n\n"
+                "To get started:\n"
+                "  1. Install ollama: https://ollama.ai\n"
+                "  2. Pull a model: ollama pull qwen3:8b"
+            )
+
+        active_name = None
+        config_file = base_path / ".cacheflow" / "config.json"
+        if config_file.exists():
+            active_name = load_config(base_path).model_name
+
+        click.echo("Available models:\n")
+        for label, model_name, _ in models:
+            marker = "* " if model_name == active_name else "  "
+            click.echo(f"{marker}{label}")
+        click.echo()
+        if active_name:
+            click.echo(f"Active: {active_name}")
+        else:
+            click.echo("No active model configured yet. Run 'cf init' or 'cf model use <name>'.")
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+
+@model.command("use")
+@click.argument("name_or_path")
+@click.option("--base-path", default=".", help="Project root")
+def model_use(name_or_path, base_path):
+    """Switch the active model. Updates config.json; existing agents re-prime
+    (rather than restore) on their next session since their KV snapshots were
+    written by the old model and are not compatible with the new one.
+    """
+    try:
+        base_path = Path(base_path)
+        config_file = base_path / ".cacheflow" / "config.json"
+
+        if not config_file.exists():
+            raise click.ClickException(
+                "No CacheFlow config found. Run 'cf init' first."
+            )
+
+        current_config = load_config(base_path)
+
+        # Resolve name_or_path against discovered models first (by display name or
+        # model_name), then fall back to treating it as a literal filesystem path.
+        models = _discover_models()
+        match = next(
+            (m for m in models if m[1] == name_or_path or m[2] == name_or_path),
+            None,
+        )
+
+        if match is not None:
+            _, model_name, model_path = match
+        elif Path(name_or_path).exists():
+            model_path = str(Path(name_or_path))
+            model_name = Path(model_path).stem
+        else:
+            available = "\n".join(f"  - {m[1]}" for m in models)
+            raise click.ClickException(
+                f"Model '{name_or_path}' not found.\n\n"
+                f"Available models:\n{available}\n\n"
+                "Or pass a literal path to a .gguf file."
+            )
+
+        if model_name == current_config.model_name and model_path == current_config.model_path:
+            click.echo(f"Already using {model_name}. No change.")
+            return
+
+        click.echo(f"Hashing model (first 10 MB)...")
+        model_hash = compute_model_hash(model_path)
+
+        new_config = CacheFlowConfig(
+            base_path=base_path,
+            model_path=model_path,
+            model_name=model_name,
+            model_hash=model_hash,
+            ctx_size=current_config.ctx_size,
+            n_gpu_layers=current_config.n_gpu_layers,
+            slot_save_path=current_config.slot_save_path,
+        )
+        save_config(new_config)
+
+        # The global engine is a process-wide singleton keyed by nothing — once
+        # created it keeps running the model it was first loaded with. This only
+        # matters for long-lived processes (chiefly `cf repl`); a fresh `cf run`
+        # invocation is a new process and picks up the new config.json naturally.
+        # Stopping it here ensures the next get_global_engine() call (whichever
+        # process makes it next) reloads with the new model_path instead of
+        # silently continuing to serve the old one.
+        stop_global_engine()
+
+        click.echo(f"✓ Switched active model to {model_name}")
+        click.echo(f"  Model: {model_path}")
+        click.echo(
+            "  Existing agents will re-prime (not restore) on their next session: "
+            "their KV snapshots were written by the previous model and are not "
+            "compatible with this one."
+        )
+    except click.ClickException:
+        raise
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+
 @cli.command()
 @click.argument("task")
 @click.option("--agent", "agent_name", default="main", help="Agent name (default: main)")
@@ -263,6 +383,21 @@ def agent(task, agent_name, system_prompt, max_steps, max_tokens_per_step, auto,
         raise click.ClickException(str(e))
 
 
+def _print_agent_log(store: CacheFlowStore, agent_name: str) -> None:
+    """Print last-session metrics for one agent. Shared by `cf log` and the REPL."""
+    agent = store.get_agent(agent_name)
+    if not agent:
+        raise click.ClickException(f"Agent '{agent_name}' not found")
+
+    click.echo(f"Agent: {agent.name}")
+    click.echo(f"  Model: {agent.model_name}")
+    click.echo(f"  Snapshot: {Path(agent.current_snapshot_path).name if agent.current_snapshot_path else 'none'}")
+    click.echo(f"  Snapshot size: {agent.current_snapshot_size_bytes / (1024*1024):.1f} MB" if agent.current_snapshot_size_bytes else "  Snapshot size: N/A")
+    click.echo(f"  Baseline tokens: {agent.baseline_tokens_evaluated or 'N/A'}")
+    click.echo(f"  Cumulative tokens saved: {agent.cumulative_tokens_saved or 0}")
+    click.echo(f"  Last session saved: {agent.last_tokens_saved or 0}")
+
+
 @cli.command()
 @click.argument("agent_name")
 @click.option("--base-path", default=".", help="Project root")
@@ -276,20 +411,32 @@ def log(agent_name, base_path):
             raise click.ClickException("No database found. Run 'cacheflow run' first to create a session.")
 
         store = CacheFlowStore(db_path)
-        agent = store.get_agent(agent_name)
-
-        if not agent:
-            raise click.ClickException(f"Agent '{agent_name}' not found")
-
-        click.echo(f"Agent: {agent.name}")
-        click.echo(f"  Model: {agent.model_name}")
-        click.echo(f"  Snapshot: {Path(agent.current_snapshot_path).name if agent.current_snapshot_path else 'none'}")
-        click.echo(f"  Snapshot size: {agent.current_snapshot_size_bytes / (1024*1024):.1f} MB" if agent.current_snapshot_size_bytes else "  Snapshot size: N/A")
-        click.echo(f"  Baseline tokens: {agent.baseline_tokens_evaluated or 'N/A'}")
-        click.echo(f"  Cumulative tokens saved: {agent.cumulative_tokens_saved or 0}")
-        click.echo(f"  Last session saved: {agent.last_tokens_saved or 0}")
+        _print_agent_log(store, agent_name)
+    except click.ClickException:
+        raise
     except Exception as e:
         raise click.ClickException(str(e))
+
+
+def _print_agents_list(store: CacheFlowStore, base_path: Path) -> None:
+    """Print the one-line-per-agent summary. Shared by `cf agents` and the REPL."""
+    agent_list = store.list_agents()
+
+    if not agent_list:
+        click.echo(f"Agents in {base_path}:")
+        click.echo()
+        click.echo("(no agents)")
+        return
+
+    click.echo(f"Agents in {base_path}:")
+    click.echo()
+
+    for agent in agent_list:
+        has_snapshot = "✓" if agent.current_snapshot_path else "✗"
+        tokens_saved = agent.last_tokens_saved if agent.current_snapshot_path else 0
+        click.echo(
+            f"{agent.name} | model: {agent.model_name} | snapshot: {has_snapshot} | saved: {tokens_saved}"
+        )
 
 
 @cli.command()
@@ -304,23 +451,9 @@ def agents(base_path):
             raise click.ClickException("Database not found. Run 'cacheflow run' first to initialize the project.")
 
         store = CacheFlowStore(db_path)
-        agent_list = store.list_agents()
-
-        if not agent_list:
-            click.echo(f"Agents in {base_path}:")
-            click.echo()
-            click.echo("(no agents)")
-            return
-
-        click.echo(f"Agents in {base_path}:")
-        click.echo()
-
-        for agent in agent_list:
-            has_snapshot = "✓" if agent.current_snapshot_path else "✗"
-            tokens_saved = agent.last_tokens_saved if agent.current_snapshot_path else 0
-            click.echo(
-                f"{agent.name} | model: {agent.model_name} | snapshot: {has_snapshot} | saved: {tokens_saved}"
-            )
+        _print_agents_list(store, base_path)
+    except click.ClickException:
+        raise
     except Exception as e:
         raise click.ClickException(str(e))
 
@@ -393,10 +526,12 @@ def repl(base_path):
                 if user_input == "help":
                     click.echo("Commands:")
                     click.echo("  run AGENT TASK              Run a task with an agent")
-                    click.echo("  log AGENT [--limit N]       Show agent commit history")
-                    click.echo("  status [--agent AGENT]      Show agent status")
+                    click.echo("  log AGENT                   Show agent's last-session metrics")
+                    click.echo("  status [AGENT]              Show agent status (default: main)")
                     click.echo("  agents                      List all agents")
-                    click.echo("  fork PARENT CHILD [--scope] Fork an agent")
+                    click.echo("  fork PARENT CHILD           Fork an agent")
+                    click.echo("  model list                  List discovered models")
+                    click.echo("  model use NAME_OR_PATH      Switch the active model")
                     click.echo("  exit/quit                   Exit REPL")
                     click.echo()
                     continue
@@ -417,42 +552,37 @@ def repl(base_path):
                     click.echo(f"Response preview: {result.response[:200]}...\n")
 
                 elif cmd == "log" and len(parts) >= 2:
-                    agent_name = parts[1]
-                    agent = store.get_agent(agent_name)
-                    if agent:
-                        click.echo(f"\nAgent: {agent_name}")
-                        click.echo(f"  Model: {agent.model_name}")
-                        click.echo(f"  Last tokens saved: {agent.last_tokens_saved}")
-                        click.echo(f"  Baseline tokens: {agent.baseline_tokens_evaluated or 'N/A'}")
-                    else:
-                        click.echo(f"Agent '{agent_name}' not found")
+                    # Delegates to the same display logic as `cf log`, so the REPL
+                    # never drifts out of sync with the top-level command's fields.
+                    click.echo()
+                    _print_agent_log(store, parts[1])
                     click.echo()
 
                 elif cmd == "status":
                     agent_name = parts[1] if len(parts) > 1 else "main"
-                    agent = store.get_agent(agent_name)
-                    if agent:
-                        click.echo(f"\nStatus: {agent_name}")
-                        click.echo(f"  Model: {agent.model_name}")
-                        click.echo(f"  Last tokens saved: {agent.last_tokens_saved}")
-                        click.echo(f"  Baseline: {agent.baseline_tokens_evaluated or 'N/A'}")
-                    else:
-                        click.echo(f"Agent '{agent_name}' not found")
+                    _print_agent_status(store, agent_name)
                     click.echo()
 
                 elif cmd == "agents":
-                    agents = store.list_agents()
-                    click.echo(f"\nAgents:")
-                    for agent in agents:
-                        click.echo(f"  {agent.name}")
+                    _print_agents_list(store, base_path)
                     click.echo()
 
                 elif cmd == "fork" and len(parts) >= 3:
                     parent = parts[1]
                     child = parts[2]
-                    from cacheflow.agent import fork_agent
                     new_agent = fork_agent(parent, child, base_path)
                     click.echo(f"✓ Forked '{parent}' → '{child}'\n")
+
+                elif cmd == "model" and len(parts) >= 2:
+                    sub = parts[1].split(None, 1)
+                    if sub and sub[0] == "list":
+                        ctx = click.Context(model_list)
+                        ctx.invoke(model_list, base_path=str(base_path))
+                    elif sub and sub[0] == "use" and len(sub) > 1:
+                        ctx = click.Context(model_use)
+                        ctx.invoke(model_use, name_or_path=sub[1].strip(), base_path=str(base_path))
+                    else:
+                        click.echo("Usage: model list | model use NAME_OR_PATH\n")
 
                 else:
                     click.echo(f"Unknown command: {cmd}\n")
@@ -465,6 +595,25 @@ def repl(base_path):
 
     except Exception as e:
         raise click.ClickException(str(e))
+
+
+def _print_agent_status(store: CacheFlowStore, agent_name: str) -> None:
+    """Print the boxed status view for one agent. Shared by `cf status` and the REPL."""
+    agent = store.get_agent(agent_name)
+    if not agent:
+        raise click.ClickException(f"Agent '{agent_name}' not found")
+
+    baseline = agent.baseline_tokens_evaluated or 0
+    cumulative = agent.cumulative_tokens_saved or 0
+    last_session = agent.last_tokens_saved or 0
+
+    click.echo(f"╭─ Status: {agent_name} ────────────────────╮")
+    click.echo(f"│ Model: {agent.model_name:37} │")
+    click.echo(f"│ Context size: {agent.ctx_size:34} │")
+    click.echo(f"│ Baseline tokens: {baseline:32} │")
+    click.echo(f"│ Cumulative saved: {cumulative:31} │")
+    click.echo(f"│ Last session saved: {last_session:28} │")
+    click.echo(f"╰─────────────────────────────────────────────╯")
 
 
 @cli.command()
@@ -480,22 +629,9 @@ def status(agent_name, base_path):
             raise click.ClickException("No database found. Run 'cacheflow run' first to create a session.")
 
         store = CacheFlowStore(db_path)
-        agent = store.get_agent(agent_name)
-
-        if not agent:
-            raise click.ClickException(f"Agent '{agent_name}' not found")
-
-        baseline = agent.baseline_tokens_evaluated or 0
-        cumulative = agent.cumulative_tokens_saved or 0
-        last_session = agent.last_tokens_saved or 0
-
-        click.echo(f"╭─ Status: {agent_name} ────────────────────╮")
-        click.echo(f"│ Model: {agent.model_name:37} │")
-        click.echo(f"│ Context size: {agent.ctx_size:34} │")
-        click.echo(f"│ Baseline tokens: {baseline:32} │")
-        click.echo(f"│ Cumulative saved: {cumulative:31} │")
-        click.echo(f"│ Last session saved: {last_session:28} │")
-        click.echo(f"╰─────────────────────────────────────────────╯")
+        _print_agent_status(store, agent_name)
+    except click.ClickException:
+        raise
     except Exception as e:
         raise click.ClickException(str(e))
 
