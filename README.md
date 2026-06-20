@@ -107,9 +107,12 @@ cf run TASK [--agent AGENT] [--max-tokens N] [--system-prompt TEXT] [--stream/--
   Run a single-shot task. Restores the agent's snapshot if available; auto-inits on first use.
   Prints: tokens used, tokens saved, snapshot size, duration. Streams by default.
 
-cf agent TASK [--agent AGENT] [--max-steps N] [--max-tokens-per-step N] [--auto] [--allow-bash] [--stream/--no-stream]
+cf agent TASK [--agent AGENT] [--max-steps N] [--max-tokens-per-step N] [--auto] [--allow-bash]
+          [--sandbox/--no-sandbox] [--test-cmd CMD] [--stream/--no-stream]
   Run a multi-step agentic task (observe → act → observe) via cacheflow/reasoning_loop.py.
   Read tools are always available; --auto gates file writes/edits, --allow-bash gates shell commands.
+  Mutating runs are sandboxed in an isolated git worktree by default (--no-sandbox to disable);
+  --test-cmd runs a command inside the sandbox and only merges back if it passes.
 
 cf repl [--base-path PATH]
   Interactive REPL with the model kept hot between tasks.
@@ -126,9 +129,6 @@ cf status [--agent AGENT] [--base-path PATH]
 
 cf fork PARENT_AGENT CHILD_AGENT [--scope DESCRIPTION] [--base-path PATH]
   Fork from the parent's HEAD snapshot. Child inherits all cached knowledge.
-
-cf mcp-server [--dashboard-url URL] [--base-path PATH]
-  Launch the MCP server (stdio) for Claude Code / Cursor / Copilot integration.
 ```
 
 ## How It Works: Technical
@@ -153,6 +153,14 @@ The warm path **does not re-save** the snapshot — the HEAD on disk is already 
 If the codebase changes (detected via a SHA-256 hash of the stable prefix), the KV cache is erased and re-primed from scratch. This prevents silent breakage where stale bytes don't match the restored snapshot.
 
 The same re-prime path also fires on a **model swap** (`cf model use`): an agent's stored `model_name` is compared against the active config, and a mismatch forces a re-prime instead of restoring — a snapshot is raw KV bytes tied to the model that produced it, so restoring it under a different model would corrupt state.
+
+### Per-Model Instruction Templating
+
+`cacheflow/templates.py` picks each loaded model's *own* instruction-template family — `ChatML`, `Llama3`, `Mistral`, `Gemma`, or `Phi3` — instead of hand-rolling ChatML for Qwen only and leaving everything else untemplated. `detect_template()` prefers sniffing distinctive tokens out of the GGUF's own embedded `tokenizer.chat_template` (the most reliable signal, since it comes from the model file itself), falls back to matching the model name, and falls back to `ChatML` for unknown models. Families with no dedicated system role (Mistral, Gemma) fold the system prompt into the first user turn instead of dropping it. `AgentSession._get_template()` caches the detected template per session.
+
+### Sandboxed Agentic Execution
+
+`cf agent --auto`/`--allow-bash` runs up to `--max-steps` unsupervised tool calls. Without isolation, a bad `edit_file` or a destructive `run_bash` command would mutate the real working tree with no undo. `cacheflow/sandbox.py`'s `GitWorktreeSandbox` isolates this in a throwaway `git worktree` (shares the repo's object store, so creation is near-instant — no container daemon, no file copying) on a disposable `cacheflow/sandbox-*` branch. The agent reads/writes/runs entirely inside that worktree; nothing touches the real tree until the run is committed and merged back, and `--test-cmd` can gate that merge on a test command passing inside the sandbox. Failed or un-merged runs leave their branch in place for manual inspection instead of losing the work. Sandboxing is on by default whenever `--auto`/`--allow-bash` is set; `--no-sandbox` opts out.
 
 ### Agentic Loop vs. KV Engine
 
@@ -196,7 +204,7 @@ Each session restores only the codebase KV, so knowledge the model picks up whil
 ┌─────────────────────────────────────────────────┐
 │                  CacheFlow CLI                   │
 │  init | model | run | agent | repl | log |       │
-│  agents | status | fork | mcp-server             │
+│  agents | status | fork                          │
 └──────────────────────┬──────────────────────────┘
                        │
          ┌─────────────┴────────────┐
@@ -247,7 +255,8 @@ cacheflow/
 │   ├── retriever.py            # CodeRetriever: semantic RAG for stable context
 │   ├── tools.py                # Tools for agentic loop: observe→act protocol
 │   ├── ollama.py               # Ollama model discovery and path resolution
-│   └── mcp_server.py           # MCP stdio server for IDE integration
+│   ├── templates.py            # Per-model instruction templating (ChatML/Llama3/Mistral/Gemma/Phi3)
+│   └── sandbox.py              # GitWorktreeSandbox: isolated, test-gated agentic execution
 ├── tests/                      # Pytest suite
 ├── pyproject.toml              # Package metadata, dependencies, cf entrypoint
 └── .cacheflow/                 # Created at runtime per project
@@ -273,22 +282,8 @@ cacheflow/
 | `cacheflow/indexer.py` / `retriever.py` | Semantic RAG: chunk, embed, and retrieve codebase context |
 | `cacheflow/tools.py` | Tools for agentic loop: observe→act protocol with filesystem/shell access |
 | `cacheflow/ollama.py` | Ollama model discovery and path resolution |
-| `cacheflow/mcp_server.py` | MCP stdio server for Claude Code / Cursor integration |
-
-## MCP Server Integration
-
-CacheFlow provides an **MCP (Model Context Protocol) server** (`cacheflow/mcp_server.py`) over the stdio transport, for integration with Claude Code, Cursor, Copilot, and other AI tools.
-
-Registered tools: `run_agent_task`, `query_snapshots`, `get_snapshot_summary`, `get_dashboard_data`, `get_agent_dag`, `list_agents`.
-
-> ⚠️ These tool implementations currently proxy to a REST backend at `--dashboard-url`. That HTTP backend is **not part of this repository**, so tools that depend on it will fail until a backend is supplied. `cf mcp-server` still launches the stdio transport itself.
-
-```bash
-cf mcp-server                                          # stdio transport
-cf mcp-server --dashboard-url http://custom.url:9000   # custom backend URL
-```
-
-The server uses stdio transport, compatible with IDE config files (e.g. `claude_desktop_config.json` for Claude Code, `cline_mcp_config.json` for Cline).
+| `cacheflow/templates.py` | Per-model instruction templating: `detect_template()` picks ChatML/Llama3/Mistral/Gemma/Phi3 |
+| `cacheflow/sandbox.py` | `GitWorktreeSandbox`: isolates `cf agent --auto`/`--allow-bash`, merges back only on success |
 
 ## Design Decisions
 
@@ -310,18 +305,14 @@ The server uses stdio transport, compatible with IDE config files (e.g. `claude_
 
 - Python 3.10+
 - `llama-cpp-python` (GPU acceleration requires a Metal/CUDA build)
-- A GGUF model file — any llama.cpp-compatible model works; Qwen models get automatic ChatML formatting
+- A GGUF model file — any llama.cpp-compatible model works; `cacheflow/templates.py` detects the right instruction
+  template (ChatML, Llama 3, Mistral, Gemma, or Phi-3) from the model's own GGUF metadata or name, falling back to
+  ChatML for unrecognized models
 
 Recommended: `ollama pull qwen3:8b` — CacheFlow auto-discovers ollama models on init. Qwen3's thinking mode is
 automatically suppressed for the agentic tool-use loop (`run_agentic`/`cf agent`) by pre-filling an empty
 `<think></think>` block on each assistant turn, so the loop's small per-step token budget isn't eaten by hidden
 reasoning before it can emit ACTION/ARGS.
-
-**Known limitation — non-Qwen models and `cf run`:** `_build_task_suffix`/`_build_stable_prefix` (`cacheflow/agent.py`)
-only apply ChatML formatting when `"qwen" in model_name`. Swapping to a non-Qwen model via `cf model use` (verified
-with `llama3.1:8b`) works correctly — no crash, no corrupted KV — but single-shot `cf run` responses can ramble,
-since the model gets a bare `"Task: ..."` suffix with no instruct-template stop boundary. `cf agent`'s tool-observation
-framing is less affected. Generalizing the template selection per model family is a known follow-up.
 
 ## Installation
 
@@ -342,7 +333,7 @@ pytest -xvs                             # Stop on first failure, verbose
 
 A shared `tests/conftest.py` autouse fixture patches `cacheflow.agent.get_tokenizer` with a lightweight fake, so constructing an `AgentSession` in unit tests never loads a real model. Mock `get_global_engine()` (or `get_global_server()` for the HTTP shim) to avoid running a real model; tests needing specific token counts patch `get_tokenizer` inline to override the default fake.
 
-**Test modules:** `test_agent.py` (incl. model-swap re-prime guard), `test_agentic.py` (the `reasoning_loop.py` tool loop), `test_cli.py` (incl. `cf model list`/`use`), `test_store.py`, `test_config.py`, `test_compressor.py` (incl. model-swap during `consolidate()`), `test_rag_integration.py`, `test_indexer.py`, `test_multi_agent.py`, `test_fixes.py` (regressions incl. snapshot format + `SnapshotGC`), `test_stress.py`, `test_server_smoke.py`, `test_system_questions*.py`.
+**Test modules:** `test_agent.py` (incl. model-swap re-prime guard), `test_agentic.py` (the `reasoning_loop.py` tool loop), `test_cli.py` (incl. `cf model list`/`use`), `test_store.py`, `test_config.py`, `test_compressor.py` (incl. model-swap during `consolidate()`), `test_rag_integration.py`, `test_indexer.py`, `test_multi_agent.py`, `test_fixes.py` (regressions incl. snapshot format + `SnapshotGC`), `test_stress.py`, `test_server_smoke.py`, `test_system_questions*.py`, `test_templates.py` (per-model template detection), `test_sandbox.py` (`GitWorktreeSandbox` against a real temp git repo), `test_cli_sandbox.py` (`cf agent`'s sandbox wiring).
 
 ## Performance
 
