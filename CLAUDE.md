@@ -24,13 +24,14 @@ cf model list                        # List discovered models; marks the active 
 cf model use NAME_OR_PATH            # Switch the active model (forces re-prime, never restore, on mismatch)
 cf run "Your task here"              # Run a task with agent 'main'
 cf run "Task" --agent research       # Run with named agent
-cf agent "Task" --auto               # Multi-step agentic task (read/edit/bash via reasoning_loop.py)
+cf agent "Task" --auto               # Multi-step agentic task (read/edit/bash via reasoning_loop.py); sandboxed by default
+cf agent "Task" --auto --test-cmd "pytest"  # Only merge sandbox changes back if tests pass
+cf agent "Task" --auto --no-sandbox  # Edit the real tree directly, no isolation
 cf log main                          # Show session history for an agent
 cf agents                            # List all agents and their stats
 cf status --agent main               # Show one agent's current state
 cf fork main research                # Fork a child agent from an agent's HEAD
 cf repl                              # Interactive REPL (model stays hot between tasks)
-cf mcp-server                        # Launch MCP server for IDE integration
 ```
 
 ## Architecture Overview
@@ -62,7 +63,7 @@ CacheFlow is a **persistent KV cache system for AI agents**. It solves token was
 - Owns the module-level `_DB_INIT_LOCK` used to serialize first-time DB init
 - Methods: `run(task)` → `SessionResult`; `_restore_or_prime(agent, system_prompt)` is the shared restore/prime/model-mismatch primitive used by both `run()` and `reasoning_loop.run_agentic()`
 - The agentic tool-calling loop itself (`AgentStep`/`AgentLoopResult`, preamble building, observation appending, `run_agentic`) lives in `cacheflow/reasoning_loop.py`, not here — see below
-- `_build_task_suffix`/`_build_stable_prefix` only apply ChatML formatting (`<|im_start|>`/`<|im_end|>`) `if "qwen" in model_name.lower()`; other model families fall back to a bare `"Task: {task}"` suffix with no instruct template (known gap, can cause rambling output in `cf run` on non-Qwen models — verified non-crashing, just under-templated)
+- `_build_task_suffix`/`_build_stable_prefix` wrap every turn via `self._get_template()` (`cacheflow/templates.py`), which picks the active model's *own* instruction-template family — Llama 3, Mistral, Gemma, Phi-3, or ChatML — instead of hand-rolling ChatML for Qwen only and leaving every other model untemplated
 
 **cacheflow/reasoning_loop.py — `run_agentic` (agentic tool-calling loop)**
 - Owns the entire observe→act→observe loop used by `cf agent`: tool-protocol preamble, THOUGHT/ACTION/ARGS parsing and dispatch (via `cacheflow.tools`), and step/stop-condition bookkeeping (`max_steps`, the `finish` action)
@@ -109,10 +110,6 @@ CacheFlow is a **persistent KV cache system for AI agents**. It solves token was
 - `CodeRetriever`: retrieves top-K relevant chunks given a task, feeds to agent's system prompt
 - Used on first session to seed stable_context efficiently
 
-**cacheflow/mcp_server.py — MCP integration**
-- Exposes CacheFlow as MCP (Model Context Protocol) tools over stdio for Claude Code / Cursor / Copilot
-- Note: the tool implementations currently call a REST backend at `--dashboard-url`; that dashboard server is not part of this repo, so MCP tools that hit it are non-functional until a backend is provided. `cf mcp-server` still starts the stdio transport.
-
 ### Multi-Agent Concurrency
 
 - **SlotPool** allocates 1 slot per agent; up to 8 concurrent agents
@@ -133,6 +130,21 @@ When agent runs:
 This prevents silent breakage where stale cached knowledge doesn't match updated code.
 
 ## Design Patterns & Key Decisions
+
+### Per-Model-Family Instruction Templating
+- `cacheflow/templates.py` defines a `ChatTemplate` (system/user wrap formats, assistant open/close, generation stop token) per family: `CHATML`, `LLAMA3`, `MISTRAL`, `GEMMA`, `PHI3`.
+- `detect_template(model_name, metadata)` picks one: first by sniffing distinctive tokens (e.g. `<|start_header_id|>`, `[INST]`, `<start_of_turn>`) out of the GGUF's own embedded `tokenizer.chat_template` (exposed by llama-cpp-python as `Llama.metadata`) — the most reliable signal since it comes from the model file itself; then by matching the model name; then falling back to `CHATML`.
+- `AgentSession._get_template()` calls this once per session (lazily, after `self.server` is set so model metadata is available) and caches the result on `self._template`. `_build_stable_prefix`/`_build_task_suffix`/`_build_consolidation_suffix` (agent.py) and `_build_agentic_preamble`/`_append_observation` (reasoning_loop.py) all wrap turns through it instead of hand-rolled ChatML markers.
+- Families without a dedicated system role (`MISTRAL`, `GEMMA`, `supports_system=False`) fold the system prompt into the first user turn rather than dropping it.
+- `reasoning_loop.run_agentic`'s generation `stop=` list uses `template.stop_token` instead of a hardcoded `<|im_end|>`, so the multi-turn loop terminates assistant turns correctly for every family.
+
+### Sandboxed Agentic Execution (git worktree, not containers)
+- `cacheflow/sandbox.py` — `GitWorktreeSandbox`. `cf agent --auto`/`--allow-bash` runs up to `max_steps` unsupervised tool calls directly against the real tree by default elsewhere in the stack (`tools.py`'s `_run_bash`/`_write_file`/`_edit_file` have no isolation of their own); a bad edit or destructive shell command had no undo.
+- Rejected full containerization (Docker/gVisor) for this: this is a local, single-user, single-model tool — a container daemon may not be installed and per-task container start is far from instant. `git worktree` gets equivalent isolation near-instantly because it shares the repo's object store (no blob copying), and it's already a hard dependency (`_collect_source_files` already shells out to `git ls-files`).
+- Flow (wired in `cli.py`'s `agent` command, defaulting on whenever `--auto`/`--allow-bash` is set, off for read-only runs, escape hatch `--no-sandbox`): create a worktree off HEAD on a throwaway `cacheflow/sandbox-*` branch → `reasoning_loop.run_agentic(..., workspace_path=worktree_path)` runs every tool call inside it (`session.base_path`, used for KV-cache config/store/snapshots, is untouched) → `commit_changes()` snapshots whatever the agent changed → optionally `run_tests(test_cmd)` inside the worktree → `merge_back()` only if there's something to merge and (when given) tests passed.
+- On test failure or merge conflict, the sandbox branch is deliberately left in place (not discarded) so the work is inspectable/manually mergeable instead of silently lost; only `merge_back()` or explicit `discard()` deletes it.
+- The dirty-working-tree precheck excludes `.cacheflow/` via a git pathspec (`:!.cacheflow`) regardless of `.gitignore`, since CacheFlow's own sqlite db/WAL files churn on every session and would otherwise spuriously trip the check.
+- Requires a clean git working tree (sans `.cacheflow/`) to enter; raises `SandboxError` with an actionable message otherwise rather than guessing how to reconcile with in-progress uncommitted work.
 
 ### Per-Sequence Snapshots (format v4)
 - Snapshot format is defined in `llama_server_custom.py` (`_write_snapshot`/`_read_snapshot`), magic `CFKV`, current version **4**.
@@ -180,6 +192,9 @@ This prevents silent breakage where stale cached knowledge doesn't match updated
 - `test_stress.py` — Concurrency/eviction stress
 - `test_server_smoke.py` — Server subprocess health
 - `test_system_questions*.py` — End-to-end knowledge-recall checks
+- `test_templates.py` — `detect_template`/`ChatTemplate` family detection and wrapping (metadata sniff, name fallback, ChatML default)
+- `test_sandbox.py` — `GitWorktreeSandbox` against a real temp git repo (isolation, commit/merge, dirty-tree rejection, discard)
+- `test_cli_sandbox.py` — `cf agent`'s sandbox wiring (default-on/off, `--test-cmd` gating, `--no-sandbox`), with `run_agentic` mocked
 
 **Mocking patterns:**
 - `tests/conftest.py` has an **autouse** fixture that patches `cacheflow.agent.get_tokenizer` with a fake tokenizer, so constructing `AgentSession` never loads a real model. Tests needing specific counts patch it inline to override.
@@ -190,20 +205,6 @@ This prevents silent breakage where stale cached knowledge doesn't match updated
 **Running a subset:**
 ```bash
 pytest tests/test_agent.py::test_first_session_primes_and_saves -xvs
-```
-
-## MCP Server Integration
-
-The MCP (Model Context Protocol) server (`cacheflow/mcp_server.py`) exposes CacheFlow as MCP tools over the stdio transport, for integration with Claude Code, Cursor, Copilot, etc.
-
-**Registered MCP tools:** `run_agent_task`, `query_snapshots`, `get_snapshot_summary`, `get_dashboard_data`, `get_agent_dag`, `list_agents`.
-
-> ⚠️ Caveat: these tool implementations currently proxy to a REST backend at `--dashboard-url`. That dashboard/HTTP backend is **not part of this repo** right now, so any tool that depends on it will fail until a backend is supplied. `cf mcp-server` still launches the stdio transport itself.
-
-**Starting the MCP server:**
-```bash
-cf mcp-server                   # stdio transport (default backend URL: http://127.0.0.1:8080)
-cf mcp-server --dashboard-url http://custom.url:9000  # Custom backend URL
 ```
 
 ## Key Files to Know
@@ -217,7 +218,8 @@ cf mcp-server --dashboard-url http://custom.url:9000  # Custom backend URL
 - **cacheflow/tokenizer.py** — Exact token counting via a vocab-only Llama (`get_tokenizer`); the vocab-only model is lazily loaded on first `encode()`/`count()` call, not at `AgentSession` construction
 - **cacheflow/slot_pool.py** — Multi-agent slot allocation and LRU eviction
 - **cacheflow/gc.py** — `SnapshotGC`: reaps snapshots not referenced by any agent HEAD
-- **cacheflow/mcp_server.py** — MCP stdio server (proxies to an external REST backend)
+- **cacheflow/templates.py** — Per-model-family instruction templating (`detect_template`); sniffs the GGUF's embedded chat_template, falls back to model name, falls back to ChatML
+- **cacheflow/sandbox.py** — `GitWorktreeSandbox`: isolates `cf agent --auto`/`--allow-bash` in a throwaway git worktree, merged back into the real tree only on request (e.g. after `--test-cmd` passes)
 - **pyproject.toml** — Package metadata, dependencies, CLI entrypoint
 
 ## Development Notes

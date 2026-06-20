@@ -385,6 +385,36 @@ def test_run_agentic_dispatches_tool_then_finishes(temp_dir, config, store):
     assert result.tokens_evaluated == 20  # 2 steps * 10
 
 
+def test_run_agentic_uses_workspace_path_for_tools_not_session_base_path(temp_dir, config, store):
+    """`workspace_path` (e.g. a sandbox worktree) should be where tools actually
+    read/write, decoupled from `session.base_path` which keeps driving config/store."""
+    snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
+    snapshots_dir.mkdir(parents=True, exist_ok=True)
+
+    sandbox_dir = temp_dir / "sandbox"
+    sandbox_dir.mkdir()
+    (sandbox_dir / "target.txt").write_text("SANDBOX_VALUE")
+    # same-named file in the real tree has different contents -- proves the
+    # tool read from workspace_path, not session.base_path
+    (temp_dir / "target.txt").write_text("REAL_TREE_VALUE")
+
+    script = [
+        'THOUGHT: read it\nACTION: read_file\nARGS: {"path": "target.txt"}',
+        'THOUGHT: done\nACTION: finish\nARGS: {"answer": "done"}',
+    ]
+    engine = _mock_engine_with_script(snapshots_dir, script)
+
+    session = AgentSession("a", temp_dir)
+    with patch("cacheflow.reasoning_loop.get_global_engine", return_value=engine):
+        result = run_agentic(
+            session, "read target.txt", DEFAULT_SYSTEM_PROMPT, max_steps=5,
+            workspace_path=sandbox_dir,
+        )
+
+    assert "SANDBOX_VALUE" in result.steps[0].observation
+    assert "REAL_TREE_VALUE" not in result.steps[0].observation
+
+
 def test_run_agentic_hits_max_steps(temp_dir, config, store):
     snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
     snapshots_dir.mkdir(parents=True, exist_ok=True)

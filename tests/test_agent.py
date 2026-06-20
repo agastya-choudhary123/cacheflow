@@ -185,6 +185,51 @@ def test_default_system_prompt():
     assert "codebase" in DEFAULT_SYSTEM_PROMPT.lower()
 
 
+def _session_for_model(temp_dir, model_name):
+    (temp_dir / ".cacheflow").mkdir(parents=True, exist_ok=True)
+    cfg = CacheFlowConfig(
+        base_path=temp_dir,
+        model_path="/path/to/model.gguf",
+        model_name=model_name,
+        model_hash="abc123def456",
+        ctx_size=8192,
+        n_gpu_layers=99,
+        slot_save_path=temp_dir / ".cacheflow/snapshots",
+    )
+    save_config(cfg)
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.count.return_value = 100
+    with patch("cacheflow.agent.get_tokenizer", return_value=mock_tokenizer):
+        return AgentSession("test-agent", temp_dir)
+
+
+def test_llama3_model_gets_native_template_not_bare_task(temp_dir):
+    """Non-Qwen models used to fall back to a bare 'Task: ...' suffix with no
+    chat structure at all. They should now get their own family's native
+    wrapping, same as Qwen always has."""
+    session = _session_for_model(temp_dir, "llama-3.1-8b-instruct")
+    suffix = session._build_task_suffix("do the thing")
+    assert suffix == (
+        "<|start_header_id|>user<|end_header_id|>\n\nTask: do the thing<|eot_id|>"
+        "<|start_header_id|>assistant<|end_header_id|>\n\n"
+    )
+
+
+def test_mistral_model_folds_system_into_first_user_turn(temp_dir):
+    """Mistral's template has no system role; the system prompt must still
+    reach the model, folded into the first user turn rather than dropped."""
+    session = _session_for_model(temp_dir, "mistral-7b-instruct-v0.3")
+    prefix = session._build_stable_prefix("SYS PROMPT", None)
+    assert prefix.startswith("[INST] SYS PROMPT")
+    assert prefix.endswith(" [/INST]")
+
+
+def test_unknown_model_falls_back_to_chatml_not_bare_task(temp_dir):
+    session = _session_for_model(temp_dir, "some-custom-finetune-v2")
+    suffix = session._build_task_suffix("do the thing")
+    assert suffix.startswith("<|im_start|>user\nTask: do the thing<|im_end|>\n")
+
+
 def test_session_result_dataclass():
     """Test SessionResult dataclass."""
     result = SessionResult(

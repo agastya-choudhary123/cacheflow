@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Callable
 
 from cacheflow.tools import ToolContext, parse_action, execute, tools_help, ActionParseError
@@ -75,25 +76,18 @@ def _build_agentic_preamble(session: "AgentSession", task: str) -> str:
         '{"answer": "<final answer>"}.\n\n'
         f"Task: {task}"
     )
-    is_qwen = "qwen" in session.config.model_name.lower()
-    if is_qwen:
-        return (
-            f"<|im_start|>user\n{instructions}<|im_end|>\n"
-            f"<|im_start|>assistant\n{session._think_prefill()}"
-        )
-    return f"\n\n{instructions}\n\n"
+    template = session._get_template()
+    return f"{template.wrap_user(instructions)}{template.assistant_open}{session._think_prefill()}"
 
 
 def _append_observation(session: "AgentSession", convo: str, assistant_text: str, observation: str) -> str:
     """Close the assistant turn, add the observation, re-prime the assistant."""
-    is_qwen = "qwen" in session.config.model_name.lower()
-    if is_qwen:
-        return (
-            convo + assistant_text
-            + f"<|im_end|>\n<|im_start|>user\nOBSERVATION: {observation}<|im_end|>\n"
-            + f"<|im_start|>assistant\n{session._think_prefill()}"
-        )
-    return convo + assistant_text + f"\nOBSERVATION: {observation}\n\n"
+    template = session._get_template()
+    return (
+        convo + assistant_text + template.assistant_close
+        + template.wrap_user(f"OBSERVATION: {observation}")
+        + template.assistant_open + session._think_prefill()
+    )
 
 
 def run_agentic(
@@ -105,6 +99,7 @@ def run_agentic(
     allow_writes: bool = False,
     allow_bash: bool = False,
     on_token: Optional[Callable[[str], None]] = None,
+    workspace_path: Optional[Path] = None,
 ) -> AgentLoopResult:
     """Run a multi-step agentic task: observe -> act -> observe over the codebase.
 
@@ -116,6 +111,15 @@ def run_agentic(
     cached prefix and only evaluates the new observation + generated action.
     Read tools are always available; mutating tools and bash are gated behind
     `allow_writes` / `allow_bash`.
+
+    `workspace_path`, if given, is where the tools actually read/write/run --
+    e.g. an isolated `cacheflow.sandbox.GitWorktreeSandbox` checkout — while
+    `session.base_path` (the real project root) keeps driving the KV-cache
+    bookkeeping (config, store, snapshots). It defaults to `session.base_path`
+    so callers that don't sandbox see no change in behavior. The codebase the
+    model was primed with is the real tree's tracked files at HEAD, which is
+    exactly what a freshly created worktree checks out, so the two stay in
+    sync at the start of the loop.
     """
     start_time = time.time()
     try:
@@ -139,12 +143,13 @@ def run_agentic(
 
         stable_prefix = session._restore_or_prime(agent, system_prompt)
         ctx = ToolContext(
-            base_path=session.base_path,
+            base_path=workspace_path or session.base_path,
             allow_writes=allow_writes,
             allow_bash=allow_bash,
         )
 
         convo = _build_agentic_preamble(session, task)
+        stop_tokens = ["OBSERVATION:", session._get_template().stop_token]
         steps: list[AgentStep] = []
         tokens_evaluated = 0
         tokens_generated = 0
@@ -158,7 +163,7 @@ def run_agentic(
                 slot_id=session.slot_id,
                 max_tokens=max_tokens_per_step,
                 on_token=on_token,
-                stop=["OBSERVATION:", "<|im_end|>"],
+                stop=stop_tokens,
             )
             tokens_evaluated += resp.get("tokens_evaluated", 0)
             tokens_generated += resp.get("tokens_predicted", 0)

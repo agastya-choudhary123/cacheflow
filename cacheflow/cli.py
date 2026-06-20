@@ -12,6 +12,7 @@ from cacheflow.server import stop_global_server
 from cacheflow.engine import stop_global_engine
 from cacheflow.store import CacheFlowStore
 from cacheflow.ollama import list_ollama_models, get_ollama_model_path, ollama_is_installed
+from cacheflow.sandbox import GitWorktreeSandbox, SandboxError
 
 # Register cleanup on exit
 atexit.register(stop_global_server)
@@ -334,12 +335,32 @@ def run(task, agent_name, system_prompt, max_tokens, stream, base_path):
 @click.option("--auto", is_flag=True, help="Allow file writes/edits (write_file, edit_file)")
 @click.option("--allow-bash", is_flag=True, help="Allow shell command execution (run_bash)")
 @click.option("--stream/--no-stream", default=True, help="Stream model output as it generates")
+@click.option(
+    "--sandbox/--no-sandbox", default=None,
+    help=(
+        "Run mutating steps in an isolated git worktree instead of the real tree, "
+        "merging back only on success. Defaults to on whenever --auto/--allow-bash "
+        "is set (off otherwise, since there's nothing to isolate for a read-only run)."
+    ),
+)
+@click.option(
+    "--test-cmd", default=None,
+    help="Command to run inside the sandbox before merging back (e.g. 'pytest'). "
+         "Only used with --sandbox; without it, sandboxed changes are committed and "
+         "merged unconditionally.",
+)
 @click.option("--base-path", default=".", help="Project root")
-def agent(task, agent_name, system_prompt, max_steps, max_tokens_per_step, auto, allow_bash, stream, base_path):
+def agent(task, agent_name, system_prompt, max_steps, max_tokens_per_step, auto, allow_bash,
+          stream, sandbox, test_cmd, base_path):
     """Run an agentic task: the model reads/edits files and runs commands in a loop.
 
     Read tools are always available. File edits require --auto; shell commands
     require --allow-bash. The codebase stays cached across every step.
+
+    When mutating tools are enabled, the loop runs in an isolated git worktree by
+    default (see --sandbox) so a bad edit or destructive shell command can't touch
+    the real tree; the worktree is merged back (or, with --test-cmd, merged only if
+    tests pass) once the loop finishes.
     """
     try:
         base_path = Path(base_path)
@@ -348,6 +369,15 @@ def agent(task, agent_name, system_prompt, max_steps, max_tokens_per_step, auto,
 
         def on_token(piece: str) -> None:
             click.echo(piece, nl=False)
+
+        use_sandbox = sandbox if sandbox is not None else (auto or allow_bash)
+
+        if use_sandbox and (auto or allow_bash):
+            _run_agentic_sandboxed(
+                session, task, system_prompt, max_steps, max_tokens_per_step,
+                auto, allow_bash, on_token if stream else None, base_path, test_cmd,
+            )
+            return
 
         result = run_agentic(
             session,
@@ -359,28 +389,79 @@ def agent(task, agent_name, system_prompt, max_steps, max_tokens_per_step, auto,
             allow_bash=allow_bash,
             on_token=on_token if stream else None,
         )
-
-        click.echo()
-        click.echo()
-        click.echo("✓ Agentic session complete")
-        click.echo()
-        click.echo(f"Agent: {result.agent_name}")
-        click.echo(f"Task: {result.task}")
-        click.echo(f"Steps: {len(result.steps)} (completed: {result.completed})")
-        click.echo(f"Tokens evaluated: {result.tokens_evaluated}")
-        click.echo(f"Tokens generated: {result.tokens_generated}")
-        click.echo(f"Duration: {result.duration_ms}ms")
-        click.echo(f"Decode speed: {result.tokens_per_sec:.1f} tok/s")
-        click.echo()
-        click.echo("Tool calls:")
-        for i, step in enumerate(result.steps, 1):
-            obs_preview = step.observation.replace("\n", " ")[:80]
-            click.echo(f"  {i}. {step.tool} {step.args} -> {obs_preview}")
-        click.echo()
-        click.echo("Final answer:")
-        click.echo(result.final_answer or "(no finish action — hit max steps)")
+        _print_agentic_result(result)
     except Exception as e:
         raise click.ClickException(str(e))
+
+
+def _print_agentic_result(result) -> None:
+    click.echo()
+    click.echo()
+    click.echo("✓ Agentic session complete")
+    click.echo()
+    click.echo(f"Agent: {result.agent_name}")
+    click.echo(f"Task: {result.task}")
+    click.echo(f"Steps: {len(result.steps)} (completed: {result.completed})")
+    click.echo(f"Tokens evaluated: {result.tokens_evaluated}")
+    click.echo(f"Tokens generated: {result.tokens_generated}")
+    click.echo(f"Duration: {result.duration_ms}ms")
+    click.echo(f"Decode speed: {result.tokens_per_sec:.1f} tok/s")
+    click.echo()
+    click.echo("Tool calls:")
+    for i, step in enumerate(result.steps, 1):
+        obs_preview = step.observation.replace("\n", " ")[:80]
+        click.echo(f"  {i}. {step.tool} {step.args} -> {obs_preview}")
+    click.echo()
+    click.echo("Final answer:")
+    click.echo(result.final_answer or "(no finish action — hit max steps)")
+
+
+def _run_agentic_sandboxed(
+    session, task, system_prompt, max_steps, max_tokens_per_step,
+    auto, allow_bash, on_token, base_path, test_cmd,
+) -> None:
+    """Run the agentic loop inside an isolated git worktree, merging back on success.
+
+    See cacheflow.sandbox.GitWorktreeSandbox for why a worktree (not a container or
+    a plain copy) is used. The sandbox branch is left in place whenever the run
+    isn't merged (test failure, merge conflict, or nothing changed wasn't an issue
+    but the test failed) so no work is silently lost.
+    """
+    sandbox = GitWorktreeSandbox(base_path)
+    with sandbox as workspace_path:
+        click.echo(f"Sandboxed run on branch '{sandbox.branch}' ({workspace_path})")
+        result = run_agentic(
+            session,
+            task,
+            system_prompt=system_prompt,
+            max_steps=max_steps,
+            max_tokens_per_step=max_tokens_per_step,
+            allow_writes=auto,
+            allow_bash=allow_bash,
+            on_token=on_token,
+            workspace_path=workspace_path,
+        )
+        _print_agentic_result(result)
+
+        changed = sandbox.commit_changes()
+        if not changed:
+            click.echo("\nNo file changes to merge.")
+            sandbox.discard()
+            return
+
+        if test_cmd:
+            click.echo(f"\nRunning test command in sandbox: {test_cmd}")
+            test_result = sandbox.run_tests(test_cmd)
+            click.echo(test_result.output)
+            if not test_result.passed:
+                click.echo(
+                    f"\n✗ Tests failed -- changes were NOT merged. Inspect/merge "
+                    f"manually from branch '{sandbox.branch}'."
+                )
+                return
+
+        sandbox.merge_back()
+        click.echo(f"\n✓ Sandbox changes merged into the working tree (branch '{sandbox.branch}').")
 
 
 def _print_agent_log(store: CacheFlowStore, agent_name: str) -> None:
@@ -632,23 +713,6 @@ def status(agent_name, base_path):
         _print_agent_status(store, agent_name)
     except click.ClickException:
         raise
-    except Exception as e:
-        raise click.ClickException(str(e))
-
-
-@cli.command()
-@click.option(
-    "--dashboard-url",
-    default="http://127.0.0.1:8080",
-    help="URL of the dashboard server (default: http://127.0.0.1:8080)",
-)
-@click.option("--base-path", default=".", help="Project root")
-def mcp_server(dashboard_url, base_path):
-    """Launch MCP (Model Context Protocol) server for Claude Code integration."""
-    try:
-        from cacheflow.mcp_server import run_mcp_server
-        base_path = Path(base_path)
-        run_mcp_server(base_path, dashboard_url)
     except Exception as e:
         raise click.ClickException(str(e))
 

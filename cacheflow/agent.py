@@ -20,6 +20,7 @@ from cacheflow.compressor import Compressor
 from cacheflow.tokenizer import ModelTokenizer, get_tokenizer
 from cacheflow.slot_pool import SlotPool, SlotLease
 from cacheflow.gc import SnapshotGC
+from cacheflow.templates import ChatTemplate, detect_template
 
 
 DEFAULT_SYSTEM_PROMPT = """You are an expert software engineer with deep knowledge of the codebase you've been given access to. You help with coding tasks efficiently and precisely. When you complete a task, briefly summarize what you did and what you learned about the codebase."""
@@ -58,6 +59,7 @@ class AgentSession:
         self.slot_lease: Optional[SlotLease] = None
         self.slot_id: Optional[int] = None
         self._tokenizer: Optional[ModelTokenizer] = None
+        self._template: Optional[ChatTemplate] = None
         self._setup()
 
     def _setup(self) -> None:
@@ -226,6 +228,21 @@ class AgentSession:
             return ""
         return "Codebase:\n" + "".join(parts)
 
+    def _get_template(self) -> ChatTemplate:
+        """Detect and cache the active model's native instruction-template family.
+
+        Sniffs the GGUF's own embedded chat_template (via the loaded engine's
+        model metadata) when available, otherwise falls back to the model
+        name; see cacheflow.templates.detect_template.
+        """
+        if self._template is None:
+            metadata = None
+            if self.server is not None:
+                metadata = getattr(self.server, "model", None)
+                metadata = getattr(metadata, "metadata", None)
+            self._template = detect_template(self.config.model_name, metadata)
+        return self._template
+
     def _build_stable_prefix(self, system_prompt: str, knowledge_summary: Optional[str] = None) -> str:
         """Build the stable KV prefix: system prompt + codebase, WITHOUT the task.
 
@@ -236,30 +253,28 @@ class AgentSession:
         """
         budget_tokens = int(self.config.ctx_size * 0.6)
         context = self._build_stable_context(budget_tokens=budget_tokens)
-        is_qwen = "qwen" in self.config.model_name.lower()
+        template = self._get_template()
 
         summary = (knowledge_summary or "").strip()
         summary_block = (
             f"Consolidated knowledge from previous sessions:\n{summary}\n" if summary else ""
         )
+        user_body = "".join(p for p in (context, summary_block) if p)
 
-        if is_qwen:
-            blocks = f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-            user_parts = "".join(p for p in (context, summary_block) if p)
-            if user_parts:
-                blocks += f"<|im_start|>user\n{user_parts}<|im_end|>\n"
+        if template.supports_system:
+            blocks = template.wrap_system(system_prompt)
+            if user_body:
+                blocks += template.wrap_user(user_body)
             return blocks
-        else:
-            tail = "".join(f"{p}\n\n" for p in (context, summary_block) if p)
-            return f"{system_prompt}\n\n{tail}" if tail else f"{system_prompt}\n\n"
+        # Family has no dedicated system role (e.g. Mistral, Gemma) -- fold the
+        # system prompt into the first user turn instead of dropping it.
+        combined = f"{system_prompt}\n\n{user_body}" if user_body else system_prompt
+        return template.wrap_user(combined)
 
     def _build_task_suffix(self, task: str) -> str:
         """Build the task-specific suffix that appends to the stable prefix."""
-        is_qwen = "qwen" in self.config.model_name.lower()
-        if is_qwen:
-            return f"<|im_start|>user\nTask: {task}<|im_end|>\n<|im_start|>assistant\n{self._think_prefill()}"
-        else:
-            return f"Task: {task}"
+        template = self._get_template()
+        return f"{template.wrap_user(f'Task: {task}')}{template.assistant_open}{self._think_prefill()}"
 
     def _ingest_codebase_progressively(self, system_prompt: str) -> None:
         """Feed the entire codebase into the model across multiple passes."""
@@ -540,10 +555,8 @@ class AgentSession:
             "architectural patterns, and known risks. Be specific and terse. "
             "Do not include preamble."
         )
-        is_qwen = "qwen" in self.config.model_name.lower()
-        if is_qwen:
-            return f"<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n{self._think_prefill()}"
-        return f"Task: {question}"
+        template = self._get_template()
+        return f"{template.wrap_user(question)}{template.assistant_open}{self._think_prefill()}"
 
     def consolidate(self, summary_max_tokens: int = 500) -> Optional[str]:
         """Distill the agent's learned knowledge into a persistent summary.
