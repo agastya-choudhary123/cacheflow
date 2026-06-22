@@ -13,6 +13,8 @@ from cacheflow.engine import stop_global_engine
 from cacheflow.store import CacheFlowStore
 from cacheflow.ollama import list_ollama_models, get_ollama_model_path, ollama_is_installed
 from cacheflow.sandbox import GitWorktreeSandbox, SandboxError
+from cacheflow.thinking_store import ThinkingStore
+from cacheflow.knowledge_store import KnowledgeStore
 
 # Register cleanup on exit
 atexit.register(stop_global_server)
@@ -713,6 +715,202 @@ def status(agent_name, base_path):
         _print_agent_status(store, agent_name)
     except click.ClickException:
         raise
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+
+@cli.group()
+def thinking():
+    """Query and manage cached thinking blocks."""
+    pass
+
+
+@thinking.command("query")
+@click.argument("problem")
+@click.option("--role", default=None, help="Role filter (implementer/reviewer/tester)")
+@click.option("--base-path", default=".", help="Project root")
+def thinking_query(problem, role, base_path):
+    """Query for cached thinking blocks."""
+    try:
+        base_path = Path(base_path)
+        db_path = base_path / ".cacheflow" / "thinking.db"
+
+        store = ThinkingStore(str(db_path))
+        thinking_block, confidence, action = store.query(problem, role=role)
+
+        if thinking_block:
+            click.echo(f"Found thinking block (confidence: {confidence:.2f}, action: {action})")
+            click.echo()
+            click.echo(thinking_block[:500])  # Preview
+        else:
+            click.echo("No cached thinking block found.")
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+
+@thinking.command("submit")
+@click.option("--problem-hash", required=True, help="Problem hash")
+@click.option("--codebase-hash", required=True, help="Codebase hash")
+@click.option("--thinking-file", type=click.File("r"), required=True, help="Path to thinking block file")
+@click.option("--role", default=None, help="Role (implementer/reviewer/tester)")
+@click.option("--problem-type", default=None, help="Problem type")
+@click.option("--base-path", default=".", help="Project root")
+def thinking_submit(problem_hash, codebase_hash, thinking_file, role, problem_type, base_path):
+    """Submit a thinking block to the cache."""
+    try:
+        base_path = Path(base_path)
+        db_path = base_path / ".cacheflow" / "thinking.db"
+
+        thinking_block = thinking_file.read()
+        store = ThinkingStore(str(db_path))
+        store.submit(
+            thinking_block,
+            problem_hash=problem_hash,
+            codebase_hash=codebase_hash,
+            role=role,
+            problem_type=problem_type,
+            source_agent="claude",
+        )
+        click.echo(f"✓ Submitted thinking block ({len(thinking_block)} chars)")
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+
+@thinking.command("list")
+@click.option("--older-than-days", default=None, type=int, help="Filter by age")
+@click.option("--limit", default=20, type=int, help="Max entries to show")
+@click.option("--base-path", default=".", help="Project root")
+def thinking_list(older_than_days, limit, base_path):
+    """List cached thinking blocks."""
+    try:
+        base_path = Path(base_path)
+        db_path = base_path / ".cacheflow" / "thinking.db"
+
+        store = ThinkingStore(str(db_path))
+        blocks = store.list_blocks(older_than_days=older_than_days, limit=limit)
+
+        if not blocks:
+            click.echo("No thinking blocks found.")
+            return
+
+        click.echo(f"Cached thinking blocks ({len(blocks)}):\n")
+        for block in blocks:
+            click.echo(f"  ID: {block['id']} | Role: {block['role']} | Type: {block['problem_type']}")
+            click.echo(f"     Created: {block['created_at']} | Tokens: {block['token_count']}")
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+
+@thinking.command("gc")
+@click.option("--older-than-days", default=60, type=int, help="Delete blocks older than N days")
+@click.option("--base-path", default=".", help="Project root")
+def thinking_gc(older_than_days, base_path):
+    """Garbage collect old thinking blocks."""
+    try:
+        base_path = Path(base_path)
+        db_path = base_path / ".cacheflow" / "thinking.db"
+
+        store = ThinkingStore(str(db_path))
+        deleted = store.garbage_collect(older_than_days=older_than_days)
+        click.echo(f"✓ Deleted {deleted} thinking blocks older than {older_than_days} days")
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+
+@cli.group()
+def knowledge():
+    """Query and manage code understanding summaries."""
+    pass
+
+
+@knowledge.command("query")
+@click.argument("region")
+@click.option("--role", default=None, help="Role filter (implementer/reviewer/tester)")
+@click.option("--region-hash", required=True, help="Hash of region contents")
+@click.option("--base-path", default=".", help="Project root")
+def knowledge_query(region, role, region_hash, base_path):
+    """Query for knowledge summaries for a region."""
+    try:
+        base_path = Path(base_path)
+        db_path = base_path / ".cacheflow" / "knowledge.db"
+
+        store = KnowledgeStore(str(db_path))
+        summary = store.query(region, current_region_hash=region_hash, role=role)
+
+        if summary:
+            click.echo(f"Found knowledge summary for {region}:")
+            click.echo()
+            click.echo(summary)
+        else:
+            click.echo(f"No knowledge summary found for {region}.")
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+
+@knowledge.command("submit")
+@click.argument("region")
+@click.option("--region-hash", required=True, help="Hash of region contents")
+@click.option("--role", default=None, help="Role (implementer/reviewer/tester)")
+@click.option("--summary-file", type=click.File("r"), required=True, help="Path to summary file (or - for stdin)")
+@click.option("--source-agent", default="claude", help="Source agent")
+@click.option("--base-path", default=".", help="Project root")
+def knowledge_submit(region, region_hash, role, summary_file, source_agent, base_path):
+    """Submit a knowledge summary for a region."""
+    try:
+        base_path = Path(base_path)
+        db_path = base_path / ".cacheflow" / "knowledge.db"
+
+        summary = summary_file.read()
+        store = KnowledgeStore(str(db_path))
+        entry_id = store.submit(
+            region=region,
+            summary=summary,
+            source_agent=source_agent,
+            region_hash=region_hash,
+            role=role,
+        )
+        click.echo(f"✓ Submitted knowledge summary (ID: {entry_id}, {len(summary)} chars)")
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+
+@knowledge.command("list")
+@click.option("--region", default=None, help="Filter by region")
+@click.option("--limit", default=20, type=int, help="Max entries to show")
+@click.option("--base-path", default=".", help="Project root")
+def knowledge_list(region, limit, base_path):
+    """List knowledge summaries."""
+    try:
+        base_path = Path(base_path)
+        db_path = base_path / ".cacheflow" / "knowledge.db"
+
+        store = KnowledgeStore(str(db_path))
+        entries = store.list_entries(region=region, limit=limit)
+
+        if not entries:
+            click.echo("No knowledge entries found.")
+            return
+
+        click.echo(f"Knowledge entries ({len(entries)}):\n")
+        for entry in entries:
+            click.echo(f"  ID: {entry['id']} | Region: {entry['region']} | Role: {entry['role']}")
+            click.echo(f"     Source: {entry['source_agent']} | Created: {entry['created_at']}")
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+
+@knowledge.command("gc")
+@click.option("--older-than-days", default=60, type=int, help="Delete entries older than N days")
+@click.option("--base-path", default=".", help="Project root")
+def knowledge_gc(older_than_days, base_path):
+    """Garbage collect old knowledge entries."""
+    try:
+        base_path = Path(base_path)
+        db_path = base_path / ".cacheflow" / "knowledge.db"
+
+        store = KnowledgeStore(str(db_path))
+        deleted = store.garbage_collect(older_than_days=older_than_days)
+        click.echo(f"✓ Deleted {deleted} knowledge entries older than {older_than_days} days")
     except Exception as e:
         raise click.ClickException(str(e))
 
