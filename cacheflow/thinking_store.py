@@ -10,6 +10,9 @@ from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 
 
+_embedding_model = None  # Global cache for embedding model
+
+
 class ThinkingStore:
     """Store and retrieve cached thinking blocks with semantic search."""
 
@@ -66,6 +69,17 @@ class ThinkingStore:
         conn.commit()
         conn.close()
 
+    def _get_embedding_model(self):
+        """Lazy-load and cache the embedding model globally."""
+        global _embedding_model
+        if _embedding_model is None:
+            try:
+                from sentence_transformers import SentenceTransformer
+                _embedding_model = SentenceTransformer("intfloat/e5-mistral-7b-instruct")
+            except Exception:
+                _embedding_model = False  # Mark as unavailable
+        return _embedding_model if _embedding_model is not False else None
+
     def submit(
         self,
         thinking_block: str,
@@ -74,15 +88,15 @@ class ThinkingStore:
         **metadata,
     ) -> None:
         """Store a thinking block with metadata and embedding."""
-        try:
-            from sentence_transformers import SentenceTransformer
-
-            model = SentenceTransformer("intfloat/e5-mistral-7b-instruct")
-            embedding = model.encode(thinking_block)
-            embedding_blob = pickle.dumps(embedding)
-        except Exception:
-            # Fallback: store without embedding if model unavailable
-            embedding_blob = None
+        embedding_blob = None
+        model = self._get_embedding_model()
+        if model:
+            try:
+                embedding = model.encode(thinking_block)
+                embedding_blob = pickle.dumps(embedding)
+            except Exception:
+                # Fallback: store without embedding if encoding fails
+                embedding_blob = None
 
         conn = sqlite3.connect(self.db_path)
         conn.execute(
@@ -129,10 +143,11 @@ class ThinkingStore:
         if exact_hit:
             return exact_hit, 1.0, "use_directly"
 
-        try:
-            from sentence_transformers import SentenceTransformer
+        model = self._get_embedding_model()
+        if not model:
+            return None, 0, "re_think"
 
-            model = SentenceTransformer("intfloat/e5-mistral-7b-instruct")
+        try:
             embedding = model.encode(problem_description)
         except Exception:
             return None, 0, "re_think"

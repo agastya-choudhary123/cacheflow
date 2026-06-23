@@ -552,3 +552,72 @@ class TestModelCommand:
 
         assert result.exit_code != 0
         assert "cf init" in result.output.lower() or "no cacheflow config" in result.output.lower()
+
+
+class TestInstallCommand:
+    """Test the `cf install` command."""
+
+    def test_install_creates_skill_files_and_hook(self, runner, temp_dir):
+        result = runner.invoke(cli, ["install", "--base-path", str(temp_dir)])
+
+        assert result.exit_code == 0, result.output
+        assert "created" in result.output
+        assert (temp_dir / ".claude" / "skills" / "cacheflow-knowledge.md").exists()
+        assert (temp_dir / ".cursor" / "rules" / "cacheflow-knowledge.mdc").exists()
+        assert (temp_dir / ".codex" / "cacheflow-knowledge.md").exists()
+        assert (temp_dir / ".claude" / "settings.json").exists()
+
+    def test_install_is_idempotent(self, runner, temp_dir):
+        runner.invoke(cli, ["install", "--base-path", str(temp_dir)])
+        result = runner.invoke(cli, ["install", "--base-path", str(temp_dir)])
+
+        assert result.exit_code == 0, result.output
+        assert "unchanged" in result.output
+
+
+class TestThinkingCaptureBlockCommand:
+    """Test the `cf thinking capture-block` PostToolUse hook entry point."""
+
+    def test_captures_thinking_block_from_transcript(self, runner, temp_dir):
+        import json
+
+        transcript = temp_dir / "transcript.jsonl"
+        entries = [
+            {"message": {"role": "user", "content": "implement retry logic"}},
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "thinking": "Use exponential backoff..."}],
+                },
+                "sessionId": "sess-1",
+            },
+        ]
+        transcript.write_text("\n".join(json.dumps(e) for e in entries))
+
+        payload = json.dumps({"transcript_path": str(transcript)})
+        result = runner.invoke(
+            cli, ["thinking", "capture-block", "--base-path", str(temp_dir)], input=payload
+        )
+
+        assert result.exit_code == 0, result.output
+
+        from cacheflow.thinking_store import ThinkingStore
+        store = ThinkingStore(str(temp_dir / ".cacheflow" / "thinking.db"))
+        blocks = store.list_blocks()
+        assert len(blocks) == 1
+        assert blocks[0]["problem_type"] == "implement"
+
+    def test_missing_transcript_path_is_noop(self, runner, temp_dir):
+        result = runner.invoke(
+            cli, ["thinking", "capture-block", "--base-path", str(temp_dir)], input="{}"
+        )
+
+        assert result.exit_code == 0, result.output
+
+    def test_malformed_stdin_does_not_raise(self, runner, temp_dir):
+        """A hook failure must never surface to the agent it's attached to."""
+        result = runner.invoke(
+            cli, ["thinking", "capture-block", "--base-path", str(temp_dir)], input="not json"
+        )
+
+        assert result.exit_code == 0, result.output

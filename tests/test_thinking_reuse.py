@@ -3,6 +3,7 @@
 import pytest
 import sqlite3
 import tempfile
+import hashlib
 from pathlib import Path
 from cacheflow.thinking_store import ThinkingStore
 from cacheflow.knowledge_store import KnowledgeStore
@@ -46,9 +47,10 @@ class TestThinkingStore:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ThinkingStore(str(Path(tmpdir) / "thinking.db"))
             thinking = "Review code for security issues"
+            problem_hash = store._hash_problem(thinking)
 
             store.submit(
-                thinking, problem_hash="hash1", codebase_hash="code1", role="reviewer", problem_type="review"
+                thinking, problem_hash=problem_hash, codebase_hash="code1", role="reviewer", problem_type="review"
             )
 
             # Query without role should find it
@@ -267,6 +269,33 @@ class TestKnowledgeStore:
             entries = store.list_entries(region="cacheflow/engine.py")
             assert len(entries) == 2
             assert all(e["region"] == "cacheflow/engine.py" for e in entries)
+
+
+class TestKnowledgeStaleness:
+    """Staleness against a real file on disk, mirroring guide section 7's
+    'write entry -> mutate the region's file -> confirm query excludes it'.
+    """
+
+    def test_query_excludes_entry_after_file_mutation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = KnowledgeStore(str(Path(tmpdir) / "knowledge.db"))
+
+            region_file = Path(tmpdir) / "module.py"
+            region_file.write_text("def foo(): return 1\n")
+
+            def hash_file(p: Path) -> str:
+                return hashlib.sha256(p.read_bytes()).hexdigest()
+
+            region = str(region_file)
+            original_hash = hash_file(region_file)
+            store.submit(region, "Summary of foo()", "claude", region_hash=original_hash)
+
+            # Still matches before any mutation.
+            assert store.query(region, current_region_hash=hash_file(region_file)) == "Summary of foo()"
+
+            # Mutate the file -- hash recomputed at query time no longer matches.
+            region_file.write_text("def foo(): return 2\n")
+            assert store.query(region, current_region_hash=hash_file(region_file)) is None
 
 
 class TestIntegration:

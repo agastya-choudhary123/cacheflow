@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import atexit
+import json
 
 import click
 
@@ -15,6 +16,8 @@ from cacheflow.ollama import list_ollama_models, get_ollama_model_path, ollama_i
 from cacheflow.sandbox import GitWorktreeSandbox, SandboxError
 from cacheflow.thinking_store import ThinkingStore
 from cacheflow.knowledge_store import KnowledgeStore
+from cacheflow import hooks as thinking_hooks
+from cacheflow import installer
 
 # Register cleanup on exit
 atexit.register(stop_global_server)
@@ -120,6 +123,12 @@ def ensure_initialized(
     store = CacheFlowStore(db_path)
     store.init_db()
 
+    # Create the thinking/knowledge dbs now rather than lazily on first
+    # `cf thinking`/`cf knowledge` call, so a fresh `cf init` leaves the
+    # project fully ready for the capture-block hook on its very first turn.
+    ThinkingStore(str(base_path / ".cacheflow" / "thinking.db"))
+    KnowledgeStore(str(base_path / ".cacheflow" / "knowledge.db"))
+
     try:
         register_project(base_path.resolve(), db_path.resolve())
     except Exception:
@@ -146,6 +155,29 @@ def init(ctx_size, n_gpu_layers, base_path):
     try:
         base_path = Path(base_path)
         ensure_initialized(base_path, ctx_size=ctx_size, n_gpu_layers=n_gpu_layers)
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+
+@cli.command()
+@click.option("--base-path", default=".", help="Project root")
+def install(base_path):
+    """Install the knowledge-sharing skill/rule files (Claude Code, Cursor,
+    Codex) and wire the PostToolUse hook that captures extended thinking
+    blocks. Safe to run repeatedly -- unchanged targets are left as-is.
+    """
+    try:
+        base_path = Path(base_path)
+        results = installer.install(base_path)
+        hook_result = installer.install_hook(base_path)
+
+        click.echo("Skill/rule files:")
+        for rel_path, action in results:
+            marker = {"created": "+", "updated": "~", "unchanged": "="}[action]
+            click.echo(f"  {marker} {rel_path} ({action})")
+
+        click.echo()
+        click.echo(f"PostToolUse hook (.claude/settings.json): {hook_result}")
     except Exception as e:
         raise click.ClickException(str(e))
 
@@ -799,6 +831,52 @@ def thinking_list(older_than_days, limit, base_path):
             click.echo(f"     Created: {block['created_at']} | Tokens: {block['token_count']}")
     except Exception as e:
         raise click.ClickException(str(e))
+
+
+@thinking.command("capture-block")
+@click.option("--base-path", default=".", help="Project root")
+def thinking_capture_block(base_path):
+    """Claude Code PostToolUse hook entry point: reads the hook payload from
+    stdin, pulls any extended-thinking blocks out of the turn's transcript,
+    and submits them to the thinking pool. Best-effort -- never raises, since
+    a hook failure must not block the agent it's attached to.
+    """
+    import sys
+
+    try:
+        base_path = Path(base_path)
+        payload = json.loads(sys.stdin.read() or "{}")
+        transcript_path = payload.get("transcript_path")
+        if not transcript_path:
+            return
+
+        blocks = thinking_hooks.extract_thinking_blocks_from_transcript(transcript_path)
+        if not blocks:
+            return
+
+        codebase_hash = thinking_hooks.compute_repo_hash(base_path)
+        delta = thinking_hooks.compute_git_delta(base_path)
+        db_path = base_path / ".cacheflow" / "thinking.db"
+        store = ThinkingStore(str(db_path))
+
+        for block in blocks:
+            task_description = block.get("task_description") or ""
+            problem_hash = store._hash_problem(task_description + codebase_hash) if task_description else None
+            if not problem_hash:
+                continue
+            store.submit(
+                block["thinking"],
+                problem_hash=problem_hash,
+                codebase_hash=codebase_hash,
+                problem_type=thinking_hooks.classify_task(task_description),
+                task_description=task_description,
+                delta=delta,
+                source_agent="claude",
+                session_id=block.get("session_id"),
+            )
+    except Exception:
+        # Never let a hook failure surface to the agent it's attached to.
+        pass
 
 
 @thinking.command("gc")
