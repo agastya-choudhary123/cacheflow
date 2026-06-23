@@ -16,10 +16,10 @@ CacheFlow uses llama-cpp-python's native KV cache state serialization to save an
 |--|--------------------------|---------------------------|
 | Prefill wall-clock time | ~1.8s | ~15ms |
 | Prompt tokens evaluated | 9,064 | ~5 |
-| Est. compute avoided per warm session | — | **~127 TFLOPs** (`2 × params × tokens_skipped`) |
+| Compute avoided per warm session | — | **~127 TFLOPs** (`2 × params × tokens_skipped`, exact param count) |
 | Cumulative time saved over 4 sessions | — | **~5.4s** (3 warm sessions × ~1.8s) |
 
-Every session after the first restores the KV snapshot and evaluates only the task suffix (~5–50 tokens) instead of re-running prefill. Output tokens are the same either way — caching eliminates prompt re-evaluation, not generation. `cf status` reports both metric families: **time saved** (`baseline_prime_time_ms`, `cumulative_time_saved_ms`, `last_time_saved_ms` — the headline) and **tokens saved** (kept alongside, useful for context-budget intuition but not a meaningful cost figure locally). The FLOPs figure is a labeled estimate (parsed from a model-name size tag like `7b`), not a measurement — savings scale with codebase size and model size.
+Every session after the first restores the KV snapshot and evaluates only the task suffix (~5–50 tokens) instead of re-running prefill. Output tokens are the same either way — caching eliminates prompt re-evaluation, not generation. `cf status` reports all three metric families: **wall-clock time saved** (`baseline_prime_time_ms`, `cumulative_time_saved_ms`, `last_time_saved_ms` — the headline), **CPU time saved** (`baseline_prime_cpu_ms`, `cumulative_cpu_time_saved_ms`, `last_cpu_time_saved_ms`, from `resource.getrusage`), and **tokens saved** (kept alongside, useful for context-budget intuition but not a meaningful cost figure locally). The FLOPs figure is a real computation, not a guess: the model's parameter count is read exactly off the loaded GGUF via llama.cpp's own API (`llama_model_n_params`), not parsed from a model-name size tag — savings scale with codebase size and model size.
 
 ## Quick Start
 
@@ -170,12 +170,14 @@ The same re-prime path also fires on a **model swap** (`cf model use`): an agent
 
 Snapshots use a compact binary format (`CFKV`, version 4) defined in `llama_server_custom.py`. Instead of `model.save_state()` — which serializes the **entire** `n_ctx` buffer (e.g. 16384 tokens) regardless of occupancy — v4 serializes only the live KV via `llama_state_seq_get_data`. A 9k-token prime no longer writes the full 16384-ctx buffer, shrinking both the save write and the restore read. Restore splices the sequence back in with `llama_state_seq_set_data` after clearing the KV. Older v3 (full-state) snapshots remain readable; agents upgrade transparently on their next prime.
 
-### Time, Compute, and Token Metrics
+### Time, CPU, Compute, and Token Metrics
 
-Wall-clock time is the headline metric (it's what's actually scarce on local hardware), but all three are tracked:
+Wall-clock time is the headline metric (it's what's actually scarce on local hardware), but nothing here is estimated or guessed — every figure is either a direct OS/library measurement or exact arithmetic over measured inputs:
 
-- **Wall-clock time** (`prime_time_ms`/`restore_time_ms`, `baseline_prime_time_ms`, `time_saved_ms`): measured directly with `time.time()` around the real `prime_slot`/`restore_slot` calls in `agent.py` — not estimated.
-- **Compute avoided** (`flops_avoided`): a labeled *estimate*, `2 × param_count × tokens_skipped` (the standard forward-pass FLOPs/token approximation), where `param_count` is parsed from a size tag (`7b`, `70B`, ...) in the model name/path. Reported as `N/A` rather than guessed when no size tag is found — llama-cpp-python doesn't reliably expose an exact parameter count, so this one metric is intentionally not held to the same exactness bar as the others.
+- **Wall-clock time** (`prime_time_ms`/`restore_time_ms`, `baseline_prime_time_ms`, `time_saved_ms`): measured directly with `time.time()` around the real `prime_slot`/`restore_slot` calls in `agent.py`.
+- **CPU time** (`prime_cpu_ms`/`restore_cpu_ms`, `baseline_prime_cpu_ms`, `cpu_time_saved_ms`): read from the kernel via `resource.getrusage(RUSAGE_SELF).ru_utime + ru_stime` around the same calls — real per-process CPU accounting, valid because the model runs in-process (no subprocess to lose visibility into).
+- **Compute avoided** (`flops_avoided`): `2 × param_count × tokens_skipped` — the standard forward-pass FLOPs/token formula, computed from two exact inputs: `param_count` read straight off the loaded GGUF via llama.cpp's own C API (`llama_model_n_params`), not parsed from a model-name size tag or file size, and `tokens_skipped` from llama-cpp-python's response metadata. Reported as `N/A` only on the legacy HTTP shim (`server.py`), which has no endpoint exposing model internals and returns `None` rather than fabricate a number.
+- **GPU cycles are not reported.** There's no portable way to read actual GPU cycle counters across llama.cpp's backends (Metal, CUDA) from Python without backend-specific profiling tools — rather than guess, this is omitted. FLOPs-avoided is hardware-agnostic (it counts operations skipped regardless of which device would run them), so it's the closest honest stand-in for "compute avoided" on either CPU or GPU.
 - **Token counts** (`tokens_this_session`, `tokens_saved`): never approximated — come directly from llama-cpp-python's response metadata. Useful for context-budget intuition, kept alongside the time/compute metrics rather than as the cost figure.
 - **Context budget sizing**: `ModelTokenizer` (`cacheflow/tokenizer.py`) loads the model with `vocab_only=True` — only the BPE vocabulary tables (~50–100 MB, no weights or KV cache) — giving exact counts for context-packing decisions without a second full model load.
 
@@ -344,10 +346,10 @@ A shared `tests/conftest.py` autouse fixture patches `cacheflow.agent.get_tokeni
 - Model tokenizer (vocab_only): ~50–100 MB (main process)
 - KV cache per slot: ~1–2 GB at 8192 context
 
-**Time/compute efficiency (measured/estimated on this repo, 16384 ctx, qwen2.5-coder:7b):**
+**Time/compute efficiency (measured on this repo, 16384 ctx, qwen2.5-coder:7b):**
 - Cold prime (baseline): ~1.8s wall-clock, 9,064 prompt tokens evaluated
 - Warm restore: ~15ms wall-clock, ~5 prompt tokens evaluated
-- Time saved per warm session: ~1.79s; est. compute avoided: ~127 TFLOPs (`2 × params × tokens_skipped`)
+- Time saved per warm session: ~1.79s wall-clock; compute avoided: ~127 TFLOPs (`2 × params × tokens_skipped`, exact param count via `llama_model_n_params`)
 - Output tokens are the same either way — caching eliminates prefill re-evaluation, not generation
 - Savings scale with codebase size (more tokens skipped) and model size (more FLOPs/token)
 

@@ -21,13 +21,14 @@ atexit.register(stop_global_engine)
 
 
 def _format_flops(flops: Optional[float]) -> str:
-    """Human-readable FLOPs-avoided figure, or a note when it can't be estimated."""
+    """Human-readable FLOPs-avoided figure (exact param count x exact tokens
+    skipped), or a note when the param count isn't available (HTTP shim)."""
     if flops is None:
-        return "N/A (couldn't parse a param count from the model name)"
+        return "N/A (param count unavailable from this execution path)"
     for unit, scale in (("TFLOPs", 1e12), ("GFLOPs", 1e9), ("MFLOPs", 1e6)):
         if flops >= scale:
-            return f"~{flops / scale:.2f} {unit} (est.)"
-    return f"~{flops:.0f} FLOPs (est.)"
+            return f"{flops / scale:.2f} {unit}"
+    return f"{flops:.0f} FLOPs"
 
 
 def _discover_models() -> list[tuple[str, str, str]]:
@@ -324,14 +325,20 @@ def run(task, agent_name, system_prompt, max_tokens, stream, base_path):
         click.echo(f"Agent: {result.agent_name}")
         click.echo(f"Task: {result.task}")
         if result.is_first_session:
-            click.echo(f"Cold prime: {result.prime_time_ms}ms (first session — nothing to restore yet)")
+            click.echo(
+                f"Cold prime: {result.prime_time_ms}ms wall-clock / {result.prime_cpu_ms:.0f}ms CPU "
+                f"(first session — nothing to restore yet)"
+            )
         elif result.prime_time_ms:
-            click.echo(f"Re-primed (codebase/model changed): {result.prime_time_ms}ms")
+            click.echo(
+                f"Re-primed (codebase/model changed): {result.prime_time_ms}ms wall-clock / "
+                f"{result.prime_cpu_ms:.0f}ms CPU"
+            )
         else:
             click.echo(
-                f"Restored in {result.restore_time_ms}ms "
-                f"(cold prime would take ~{result.restore_time_ms + result.time_saved_ms}ms) "
-                f"— {result.time_saved_ms}ms saved"
+                f"Restored in {result.restore_time_ms}ms wall-clock / {result.restore_cpu_ms:.0f}ms CPU "
+                f"— {result.time_saved_ms}ms wall-clock / {result.cpu_time_saved_ms:.0f}ms CPU saved "
+                f"vs. this agent's measured cold-prime baseline"
             )
         click.echo(f"Tokens this session: {result.tokens_this_session} (saved: {result.tokens_saved})")
         click.echo(f"Compute avoided: {_format_flops(result.flops_avoided)}")
@@ -495,9 +502,9 @@ def _print_agent_log(store: CacheFlowStore, agent_name: str) -> None:
     click.echo(f"  Model: {agent.model_name}")
     click.echo(f"  Snapshot: {Path(agent.current_snapshot_path).name if agent.current_snapshot_path else 'none'}")
     click.echo(f"  Snapshot size: {agent.current_snapshot_size_bytes / (1024*1024):.1f} MB" if agent.current_snapshot_size_bytes else "  Snapshot size: N/A")
-    click.echo(f"  Baseline cold-prime time: {agent.baseline_prime_time_ms or 'N/A'}ms")
-    click.echo(f"  Cumulative time saved: {agent.cumulative_time_saved_ms or 0}ms")
-    click.echo(f"  Last session time saved: {agent.last_time_saved_ms or 0}ms")
+    click.echo(f"  Baseline cold-prime time: {agent.baseline_prime_time_ms or 'N/A'}ms wall-clock / {agent.baseline_prime_cpu_ms or 'N/A'}ms CPU")
+    click.echo(f"  Cumulative time saved: {agent.cumulative_time_saved_ms or 0}ms wall-clock / {agent.cumulative_cpu_time_saved_ms or 0}ms CPU")
+    click.echo(f"  Last session time saved: {agent.last_time_saved_ms or 0}ms wall-clock / {agent.last_cpu_time_saved_ms or 0}ms CPU")
     click.echo(f"  Baseline tokens: {agent.baseline_tokens_evaluated or 'N/A'}")
     click.echo(f"  Cumulative tokens saved: {agent.cumulative_tokens_saved or 0}")
     click.echo(f"  Last session tokens saved: {agent.last_tokens_saved or 0}")
@@ -716,6 +723,9 @@ def _print_agent_status(store: CacheFlowStore, agent_name: str) -> None:
     baseline_time = agent.baseline_prime_time_ms or 0
     cumulative_time = agent.cumulative_time_saved_ms or 0
     last_session_time = agent.last_time_saved_ms or 0
+    baseline_cpu = agent.baseline_prime_cpu_ms or 0
+    cumulative_cpu = agent.cumulative_cpu_time_saved_ms or 0
+    last_session_cpu = agent.last_cpu_time_saved_ms or 0
     baseline = agent.baseline_tokens_evaluated or 0
     cumulative = agent.cumulative_tokens_saved or 0
     last_session = agent.last_tokens_saved or 0
@@ -726,6 +736,9 @@ def _print_agent_status(store: CacheFlowStore, agent_name: str) -> None:
     click.echo(f"│ Baseline cold-prime time (ms): {baseline_time:17} │")
     click.echo(f"│ Cumulative time saved (ms): {cumulative_time:20} │")
     click.echo(f"│ Last session time saved (ms): {last_session_time:18} │")
+    click.echo(f"│ Baseline cold-prime CPU (ms): {baseline_cpu:18} │")
+    click.echo(f"│ Cumulative CPU saved (ms): {cumulative_cpu:21} │")
+    click.echo(f"│ Last session CPU saved (ms): {last_session_cpu:19} │")
     click.echo(f"│ Baseline tokens: {baseline:32} │")
     click.echo(f"│ Cumulative tokens saved: {cumulative:23} │")
     click.echo(f"│ Last session tokens saved: {last_session:20} │")

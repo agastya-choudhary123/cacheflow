@@ -142,6 +142,13 @@ class LlamaServer:
         except:
             return False
 
+    def get_param_count(self) -> Optional[int]:
+        """The HTTP shim has no endpoint exposing the model's exact parameter
+        count, so it returns None rather than guess — callers must treat a
+        None here as "FLOPs avoided not available," not fall back to a
+        heuristic."""
+        return None
+
     def stop(self) -> None:
         """Stop the server."""
         if self.http_client:

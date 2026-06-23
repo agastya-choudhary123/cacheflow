@@ -121,6 +121,41 @@ def test_update_agent_time_baseline(store):
     assert updated_agent.baseline_prime_time_ms == 1800
 
 
+def test_update_agent_cpu_time_baseline(store):
+    """Test updating agent's baseline cold-prime CPU time."""
+    agent = store.create_agent(
+        name="test-agent", model_name="qwen2.5-coder:7b", model_hash="abc123def456", ctx_size=8192,
+    )
+    assert agent.baseline_prime_cpu_ms is None
+
+    store.update_agent_cpu_time_baseline(agent, 1500)
+
+    updated_agent = store.get_agent("test-agent")
+    assert updated_agent.baseline_prime_cpu_ms == 1500
+
+
+def test_update_agent_snapshot_cpu_time_saved_accumulates(store, temp_dir):
+    """cpu_time_saved_ms accumulates into cumulative_cpu_time_saved_ms across sessions."""
+    agent = store.create_agent(
+        name="test-agent", model_name="qwen2.5-coder:7b", model_hash="abc123def456", ctx_size=2048,
+    )
+    snapshot_path = temp_dir / "snapshot.bin"
+    snapshot_path.write_bytes(os.urandom(1024))
+
+    store.update_agent_snapshot(
+        agent=agent, snapshot_path=str(snapshot_path), snapshot_size_bytes=1024,
+        tokens_saved=10, time_saved_ms=500, cpu_time_saved_ms=400,
+    )
+    store.update_agent_snapshot(
+        agent=agent, snapshot_path=str(snapshot_path), snapshot_size_bytes=1024,
+        tokens_saved=10, time_saved_ms=300, cpu_time_saved_ms=250,
+    )
+
+    updated_agent = store.get_agent("test-agent")
+    assert updated_agent.last_cpu_time_saved_ms == 250
+    assert updated_agent.cumulative_cpu_time_saved_ms == 650
+
+
 def test_agent_forking(store):
     """Test agent forking via parent_agent_id."""
     parent = store.create_agent(

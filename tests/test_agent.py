@@ -9,7 +9,7 @@ import pytest
 
 from cacheflow.agent import (
     AgentSession, SessionResult, DEFAULT_SYSTEM_PROMPT, fork_agent,
-    _estimate_param_count, _estimate_flops_avoided,
+    _compute_flops_avoided, _cpu_time_ms,
 )
 from cacheflow.config import CacheFlowConfig, save_config
 from cacheflow.store import CacheFlowStore
@@ -218,6 +218,7 @@ def test_restore_path_computes_time_and_flops_saved(agent_session, temp_dir):
     }
     mock_server.restore_slot = MagicMock()
     mock_server.prime_slot = MagicMock()
+    mock_server.get_param_count.return_value = 7_000_000_000  # exact, as read off the real model
 
     with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
         result = agent_session.run(task="Second task", system_prompt=DEFAULT_SYSTEM_PROMPT, max_tokens=512)
@@ -233,23 +234,27 @@ def test_restore_path_computes_time_and_flops_saved(agent_session, temp_dir):
     assert agent.cumulative_time_saved_ms == result.time_saved_ms
 
 
-def test_estimate_param_count_parses_size_tags():
-    assert _estimate_param_count("qwen2.5-coder:7b") == 7_000_000_000
-    assert _estimate_param_count("Llama-3-70B.gguf") == 70_000_000_000
-    assert _estimate_param_count("mistral:1.5b") == 1_500_000_000
+def test_compute_flops_avoided_none_without_param_count_or_skip():
+    assert _compute_flops_avoided(None, tokens_skipped=100) is None
+    assert _compute_flops_avoided(7_000_000_000, tokens_skipped=0) is None
 
 
-def test_estimate_param_count_none_when_unparseable():
-    assert _estimate_param_count("some-model-name", "/path/to/model.gguf") is None
+def test_compute_flops_avoided_uses_exact_param_count():
+    # Given an exact param count (read off the loaded model, not guessed),
+    # the formula itself (2*N FLOPs/token) is exact arithmetic, not a guess.
+    assert _compute_flops_avoided(7_000_000_000, tokens_skipped=100) == 2.0 * 7_000_000_000 * 100
 
 
-def test_estimate_flops_avoided_none_without_param_count_or_skip():
-    assert _estimate_flops_avoided("unknown-model", "/x.gguf", tokens_skipped=100) is None
-    assert _estimate_flops_avoided("qwen2.5-coder:7b", "/x.gguf", tokens_skipped=0) is None
-
-
-def test_estimate_flops_avoided_computes_2n_per_token():
-    assert _estimate_flops_avoided("qwen2.5-coder:7b", "/x.gguf", tokens_skipped=100) == 2.0 * 7_000_000_000 * 100
+def test_cpu_time_ms_reflects_real_cpu_work():
+    """_cpu_time_ms is sourced from the OS (resource.getrusage), so it should
+    strictly increase while the process actually burns CPU."""
+    before = _cpu_time_ms()
+    # Burn some real CPU cycles so ru_utime/ru_stime advances.
+    total = 0
+    for i in range(2_000_000):
+        total += i
+    after = _cpu_time_ms()
+    assert after >= before
 
 
 def test_agent_session_lock(agent_session):

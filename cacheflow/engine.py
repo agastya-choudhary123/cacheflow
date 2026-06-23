@@ -23,6 +23,7 @@ from typing import Optional, Dict, Any, Callable
 from threading import Lock
 
 from llama_cpp import Llama
+from llama_cpp.llama_cpp import llama_model_n_params
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,12 @@ class LlamaEngine:
             verbose=False,
         )
 
+        # Exact parameter count read off the loaded model via llama.cpp's own
+        # C API (llama_model_n_params) — not parsed/guessed from the model
+        # name or file size. Used for FLOPs-avoided accounting; fixed for the
+        # life of this engine since the model doesn't change after load.
+        self.param_count: int = llama_model_n_params(self.model.model)
+
         self.slot_manager = CooperativeSlotManager(self.model)
         # num_slots matches SlotPool.max_slots: up to 8 agents share this one model,
         # each with its own KV state swapped in/out by slot_manager.
@@ -102,6 +109,10 @@ class LlamaEngine:
     # ── lifecycle (no-ops kept for interface parity with LlamaServer) ─────────
     def is_running(self) -> bool:
         return True
+
+    def get_param_count(self) -> Optional[int]:
+        """Exact parameter count of the loaded model (llama.cpp's own metadata)."""
+        return self.param_count
 
     def stop(self) -> None:
         # Llama frees native resources on GC; nothing to tear down explicitly.

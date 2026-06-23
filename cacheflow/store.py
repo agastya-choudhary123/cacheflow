@@ -40,6 +40,11 @@ class Agent(Base):
     baseline_prime_time_ms = Column(Integer, nullable=True)
     last_time_saved_ms = Column(Integer, nullable=False, default=0)
     cumulative_time_saved_ms = Column(Integer, nullable=False, default=0)  # total across all sessions
+    # CPU time (user+sys) consumed by a cold prime, read from the OS via
+    # resource.getrusage — real per-process accounting, not derived.
+    baseline_prime_cpu_ms = Column(Integer, nullable=True)
+    last_cpu_time_saved_ms = Column(Integer, nullable=False, default=0)
+    cumulative_cpu_time_saved_ms = Column(Integer, nullable=False, default=0)  # total across all sessions
     parent_agent_id = Column(Uuid, ForeignKey("agents.id"), nullable=True)  # for forking
     # Running sum of tokens processed since the last consolidation; drives the
     # background Compressor's 70%-of-context threshold.
@@ -94,6 +99,9 @@ class CacheFlowStore:
                 ("baseline_prime_time_ms", "ALTER TABLE agents ADD COLUMN baseline_prime_time_ms INTEGER"),
                 ("last_time_saved_ms", "ALTER TABLE agents ADD COLUMN last_time_saved_ms INTEGER DEFAULT 0"),
                 ("cumulative_time_saved_ms", "ALTER TABLE agents ADD COLUMN cumulative_time_saved_ms INTEGER DEFAULT 0"),
+                ("baseline_prime_cpu_ms", "ALTER TABLE agents ADD COLUMN baseline_prime_cpu_ms INTEGER"),
+                ("last_cpu_time_saved_ms", "ALTER TABLE agents ADD COLUMN last_cpu_time_saved_ms INTEGER DEFAULT 0"),
+                ("cumulative_cpu_time_saved_ms", "ALTER TABLE agents ADD COLUMN cumulative_cpu_time_saved_ms INTEGER DEFAULT 0"),
             ]
 
             for col_name, migration_sql in migrations:
@@ -169,6 +177,19 @@ class CacheFlowStore:
         session = self._get_session()
         try:
             agent.baseline_prime_time_ms = baseline_ms
+            session.merge(agent)
+            session.commit()
+        finally:
+            session.close()
+
+    def update_agent_cpu_time_baseline(self, agent: Agent, baseline_cpu_ms: int) -> None:
+        """Persist baseline_prime_cpu_ms (cold-prime CPU-time cost)."""
+        if baseline_cpu_ms < 0:
+            raise ValueError(f"Baseline prime CPU time must be non-negative, got {baseline_cpu_ms}")
+
+        session = self._get_session()
+        try:
+            agent.baseline_prime_cpu_ms = baseline_cpu_ms
             session.merge(agent)
             session.commit()
         finally:
@@ -257,6 +278,7 @@ class CacheFlowStore:
         snapshot_size_bytes: int,
         tokens_saved: int,
         time_saved_ms: int = 0,
+        cpu_time_saved_ms: int = 0,
     ) -> None:
         """Update agent's current snapshot and metrics. Increments cumulative savings."""
         session = self._get_session()
@@ -267,6 +289,8 @@ class CacheFlowStore:
             agent.cumulative_tokens_saved = (agent.cumulative_tokens_saved or 0) + max(0, tokens_saved)
             agent.last_time_saved_ms = time_saved_ms
             agent.cumulative_time_saved_ms = (agent.cumulative_time_saved_ms or 0) + max(0, time_saved_ms)
+            agent.last_cpu_time_saved_ms = cpu_time_saved_ms
+            agent.cumulative_cpu_time_saved_ms = (agent.cumulative_cpu_time_saved_ms or 0) + max(0, cpu_time_saved_ms)
             session.merge(agent)
             session.commit()
         finally:

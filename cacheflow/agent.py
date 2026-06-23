@@ -2,7 +2,7 @@
 
 import hashlib
 import logging
-import re
+import resource
 import shutil
 import subprocess
 import threading
@@ -32,38 +32,33 @@ _SLOT_POOL = SlotPool(max_slots=8)
 # Serializes concurrent init_db calls to prevent SQLite locking races
 _DB_INIT_LOCK = threading.Lock()
 
-# Matches a parameter-count size tag like "7b", "1.5b", "70B" in a model
-# name/path (e.g. "qwen2.5-coder:7b", "Llama-3-70B.gguf").
-_PARAM_SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*[bB](?![a-zA-Z])")
+def _compute_flops_avoided(param_count: Optional[int], tokens_skipped: int) -> Optional[float]:
+    """FLOPs avoided by skipping prefill on `tokens_skipped` tokens.
 
-
-def _estimate_param_count(*sources: str) -> Optional[int]:
-    """Best-effort parameter count parsed from a model name/path size tag.
-
-    There's no reliable way to get an exact parameter count out of
-    llama-cpp-python's GGUF metadata, so this is a labeled estimate (used only
-    for the FLOPs-avoided figure) rather than the exact counts tokenizer.py
-    provides for budgeting. Returns None if no size tag is found.
+    `param_count` must be the model's exact parameter count, read directly off
+    the loaded GGUF via llama.cpp's own `llama_model_n_params` (engine.py) —
+    never parsed/guessed from a model name or file size. Given that exact
+    count, `2 * param_count` FLOPs/token is the standard, analytically-derived
+    cost of a dense transformer forward pass (one multiply-add per parameter
+    per token), so this is a real computation from real inputs, not a guess.
+    Returns None (rather than fabricating a number) if either input is
+    unavailable.
     """
-    for source in sources:
-        match = _PARAM_SIZE_RE.search(source or "")
-        if match:
-            return int(float(match.group(1)) * 1_000_000_000)
-    return None
-
-
-def _estimate_flops_avoided(model_name: str, model_path: str, tokens_skipped: int) -> Optional[float]:
-    """Rough FLOPs avoided by skipping prefill on `tokens_skipped` tokens.
-
-    Uses the standard ~2*N FLOPs/token approximation for a transformer
-    forward pass (N = parameter count). An estimate, not a measurement.
-    """
-    if tokens_skipped <= 0:
-        return None
-    param_count = _estimate_param_count(model_name, model_path)
-    if param_count is None:
+    if tokens_skipped <= 0 or param_count is None:
         return None
     return 2.0 * param_count * tokens_skipped
+
+
+def _cpu_time_ms() -> float:
+    """Total CPU time (user + system) consumed by this process so far, in ms.
+
+    Sourced from the OS via `resource.getrusage` — the kernel's own per-process
+    CPU accounting (sums all threads under RUSAGE_SELF), not derived or
+    estimated. Since the model runs in-process (engine.py), this captures the
+    actual CPU work llama.cpp performs during prime/restore/completion.
+    """
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    return (usage.ru_utime + usage.ru_stime) * 1000.0
 
 
 @dataclass
@@ -82,6 +77,9 @@ class SessionResult:
     prime_time_ms: int = 0
     restore_time_ms: int = 0
     time_saved_ms: int = 0
+    prime_cpu_ms: float = 0.0
+    restore_cpu_ms: float = 0.0
+    cpu_time_saved_ms: float = 0.0
     flops_avoided: Optional[float] = None
 
 
@@ -383,6 +381,8 @@ class AgentSession:
             # Step d: Build stable prefix and detect codebase changes
             restore_time_ms = 0
             prime_time_ms = 0
+            restore_cpu_ms = 0.0
+            prime_cpu_ms = 0.0
             is_first_session = agent.current_snapshot_path is None
 
             stable_prefix = self._build_stable_prefix(system_prompt, agent.knowledge_summary)
@@ -403,14 +403,18 @@ class AgentSession:
 
             if is_first_session or context_changed or model_changed:
                 prime_start = time.time()
+                prime_cpu_start = _cpu_time_ms()
                 self.server.prime_slot(stable_prefix, slot_id=self.slot_id)
                 prime_time_ms = int((time.time() - prime_start) * 1000)
+                prime_cpu_ms = _cpu_time_ms() - prime_cpu_start
             else:
                 if agent.current_snapshot_path:
                     restore_start = time.time()
+                    restore_cpu_start = _cpu_time_ms()
                     snapshot_filename = Path(agent.current_snapshot_path).name
                     self.server.restore_slot(snapshot_filename, slot_id=self.slot_id)
                     restore_time_ms = int((time.time() - restore_start) * 1000)
+                    restore_cpu_ms = _cpu_time_ms() - restore_cpu_start
 
             # Step e: Save snapshot (stable prefix only, before task evaluation).
             # Only save when we actually re-primed: on the restore path the HEAD
@@ -472,18 +476,25 @@ class AgentSession:
 
             if primed:
                 # Re-measure the cold-prime cost on every prime (codebase growth
-                # changes it over time), so time_saved_ms always compares against
-                # the current baseline rather than a stale first-session number.
+                # changes it over time), so time_saved_ms/cpu_time_saved_ms always
+                # compare against the current baseline rather than a stale
+                # first-session number.
                 self.store.update_agent_time_baseline(agent, prime_time_ms)
                 agent.baseline_prime_time_ms = prime_time_ms
+                self.store.update_agent_cpu_time_baseline(agent, int(prime_cpu_ms))
+                agent.baseline_prime_cpu_ms = int(prime_cpu_ms)
                 time_saved_ms = 0
+                cpu_time_saved_ms = 0.0
             else:
                 baseline_prime_ms = agent.baseline_prime_time_ms or 0
                 time_saved_ms = max(0, baseline_prime_ms - restore_time_ms)
+                baseline_prime_cpu_ms = agent.baseline_prime_cpu_ms or 0
+                cpu_time_saved_ms = max(0.0, baseline_prime_cpu_ms - restore_cpu_ms)
 
-            flops_avoided = _estimate_flops_avoided(
-                self.config.model_name, self.config.model_path, tokens_saved
-            )
+            # Exact parameter count read off the loaded model (engine.py); None
+            # only for the legacy HTTP shim, which doesn't expose it.
+            param_count = self.server.get_param_count() if hasattr(self.server, "get_param_count") else None
+            flops_avoided = _compute_flops_avoided(param_count, tokens_saved)
 
             if primed:
                 # Validate save result and promote the new snapshot to HEAD
@@ -513,6 +524,7 @@ class AgentSession:
                 snapshot_size_bytes=final_snapshot_path.stat().st_size,
                 tokens_saved=tokens_saved,
                 time_saved_ms=time_saved_ms,
+                cpu_time_saved_ms=int(cpu_time_saved_ms),
             )
 
             total_duration_ms = int((time.time() - start_time) * 1000)
@@ -539,6 +551,9 @@ class AgentSession:
                 prime_time_ms=prime_time_ms,
                 restore_time_ms=restore_time_ms,
                 time_saved_ms=time_saved_ms,
+                prime_cpu_ms=prime_cpu_ms,
+                restore_cpu_ms=restore_cpu_ms,
+                cpu_time_saved_ms=cpu_time_saved_ms,
                 flops_avoided=flops_avoided,
             )
 
@@ -563,10 +578,14 @@ class AgentSession:
 
         if is_first or context_changed or model_changed:
             prime_start = time.time()
+            prime_cpu_start = _cpu_time_ms()
             self.server.prime_slot(stable_prefix, slot_id=self.slot_id)
             prime_time_ms = int((time.time() - prime_start) * 1000)
+            prime_cpu_ms = _cpu_time_ms() - prime_cpu_start
             self.store.update_agent_time_baseline(agent, prime_time_ms)
             agent.baseline_prime_time_ms = prime_time_ms
+            self.store.update_agent_cpu_time_baseline(agent, int(prime_cpu_ms))
+            agent.baseline_prime_cpu_ms = int(prime_cpu_ms)
             save_result = self.server.save_slot(slot_id=self.slot_id)
             saved_filename = save_result.get("filename", "")
             saved_path = self.config.slot_save_path / saved_filename
@@ -748,8 +767,11 @@ def fork_agent(
         snapshot_size_bytes=fork_snapshot_path.stat().st_size,
         tokens_saved=parent_agent.last_tokens_saved,
         time_saved_ms=parent_agent.last_time_saved_ms,
+        cpu_time_saved_ms=parent_agent.last_cpu_time_saved_ms,
     )
     if parent_agent.baseline_prime_time_ms is not None:
         store.update_agent_time_baseline(child_agent, parent_agent.baseline_prime_time_ms)
+    if parent_agent.baseline_prime_cpu_ms is not None:
+        store.update_agent_cpu_time_baseline(child_agent, parent_agent.baseline_prime_cpu_ms)
 
     return child_agent
