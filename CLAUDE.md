@@ -32,6 +32,9 @@ cf agents                            # List all agents and their stats
 cf status --agent main               # Show one agent's current state
 cf fork main research                # Fork a child agent from an agent's HEAD
 cf repl                              # Interactive REPL (model stays hot between tasks)
+cf install                           # Wire the cacheflow-knowledge skill + thinking-capture hook into Claude Code/Cursor/Codex
+cf thinking query "implement retry logic" --role implementer  # Check the thinking-block cache before re-reasoning
+cf knowledge query cacheflow/engine.py --region-hash HASH      # Check the knowledge pool before re-reading a file
 ```
 
 ## Architecture Overview
@@ -110,6 +113,28 @@ CacheFlow is a **persistent KV cache system for AI agents**. It solves token was
 - `CodeRetriever`: retrieves top-K relevant chunks given a task, feeds to agent's system prompt
 - Used on first session to seed stable_context efficiently
 
+**cacheflow/thinking_store.py — `ThinkingStore` (cached extended-thinking blocks)**
+- Addresses a different cost than KV caching: KV caching avoids re-evaluating the *prompt*; this avoids re-running *extended thinking* (the cloud-model reasoning tokens), which KV caching doesn't touch since they're newly generated every call.
+- `submit(thinking_block, problem_hash, codebase_hash, **metadata)`: stores the block in SQLite (`.cacheflow/thinking.db`) plus, if `sentence-transformers` is importable, an E5-Mistral embedding (pickled `BLOB`) and a best-effort Qdrant upsert (`_index_in_qdrant`) for semantic search.
+- `query(problem_description, role=None, confidence_threshold=0.85)`: exact SHA-256 problem-hash lookup first (`_exact_lookup`, <1ms); on miss, embeds the query and runs `_semantic_search` against Qdrant, applying an age-decay weight (`exp(-0.1 * age_days)`, ~7-day half-life) to the raw similarity score. Returns one of three actions: confidence >0.90 → `use_directly` (skip thinking entirely), 0.85–0.90 → `validate` (cheap ~100-token validation call), else → `re_think`.
+- Degrades gracefully with no embedding model or no reachable Qdrant: falls back to exact-hash-only matching rather than raising (`_get_embedding_model`/`_ensure_qdrant` swallow import/connection errors and return `None`/`False`).
+- `list_blocks`/`garbage_collect(older_than_days=60)` mirror the snapshot-GC pattern elsewhere in the codebase.
+
+**cacheflow/knowledge_store.py — `KnowledgeStore` (shared region summaries)**
+- `submit(region, summary, source_agent, region_hash, role=None)`: stores a dense summary for a file/region path in SQLite (`.cacheflow/knowledge.db`); marks any prior entry for the same `(region, role)` as superseded via `supersedes_id` (versioned, not deleted) rather than overwriting it.
+- `query(region, current_region_hash, role=None, max_tokens=None)`: returns the summary only if `region_hash` matches the row's stored hash — staleness is automatic via content-hash comparison, no separate invalidation/expiry logic needed. Falls back from a role-specific match to a generic (`role IS NULL`) entry if no exact-role match exists.
+- `garbage_collect(older_than_days=60)`: deletes superseded entries unconditionally plus any entry older than the cutoff.
+
+**cacheflow/hooks.py — transcript parsing for the thinking-capture hook**
+- `extract_thinking_blocks_from_transcript(transcript_path)`: reads a Claude Code session transcript (JSONL), finds the most recent assistant turn containing `"type": "thinking"` content blocks, and pairs them with the nearest preceding user turn's text (used as the `task_description` for problem hashing). Best-effort — malformed/missing transcripts yield `[]` rather than raising, since this runs inside a hook that must never block the agent.
+- `compute_repo_hash`/`compute_git_delta`: hash HEAD + working-tree diff for `codebase_hash`, and list changed files/line-counts for the Layer-2 reuse-robustness `delta` metadata described in `THINKING_REUSE.md`.
+- `classify_task(description)`: cheap keyword heuristic (`review`/`debug`/`refactor`/`test`/`implement`) used to tag `problem_type` for cache routing — not meant to be precise, just good enough to bucket similar problems.
+
+**cacheflow/installer.py — `cf install`**
+- `install(base_path)`: renders the same skill-body content (`_SKILL_BODY`) into harness-specific wrappers — `.claude/skills/cacheflow-knowledge.md`, `.cursor/rules/cacheflow-knowledge.mdc`, `.codex/cacheflow-knowledge.md` — so every harness gets the same "check the pool before reading, submit a summary after working" instructions in its own format.
+- Idempotent by content comparison: a target whose existing content already matches the rendered content is left untouched (reported `"unchanged"`); otherwise `"created"`/`"updated"`.
+- `install_hook(base_path)`: registers `cf thinking capture-block` as a `PostToolUse` hook in `.claude/settings.json`, scanning existing `hooks.PostToolUse` entries for the same command under any matcher before appending, so re-running `cf install` never double-registers it.
+
 ### Multi-Agent Concurrency
 
 - **SlotPool** allocates 1 slot per agent; up to 8 concurrent agents
@@ -130,6 +155,16 @@ When agent runs:
 This prevents silent breakage where stale cached knowledge doesn't match updated code.
 
 ## Design Patterns & Key Decisions
+
+### Two Separate Caches for Two Separate Costs
+- KV caching (`agent.py`/`engine.py`/`store.py`) and the thinking/knowledge pools (`thinking_store.py`/`knowledge_store.py`) solve different problems and don't share storage or invalidation logic — conflating them would be wrong, since the costs they avoid are orthogonal: KV caching avoids re-evaluating the *prompt* (tokens fed into the model); thinking/knowledge caching avoids re-running *reasoning* (tokens the model generates while thinking, or re-deriving understanding a prior agent already wrote down).
+- Both new stores are intentionally separate SQLite files (`.cacheflow/thinking.db`, `.cacheflow/knowledge.db`) from the agent store (`.cacheflow/agents.db`) — they have no `Agent` foreign key and no relationship to KV snapshots; an agent's HEAD pointer and a thinking-block cache hit are unrelated events that can each happen independently.
+- Both follow the same staleness philosophy already established for KV snapshots (`stable_context_hash` comparison): a content hash (`codebase_hash`/`region_hash`) is computed at write time and compared at read time, so a changed codebase or file silently invalidates the cached entry instead of needing an explicit expiry/invalidation call.
+
+### Confidence-Gated Reuse, Not All-or-Nothing
+- `ThinkingStore.query`'s three-way action (`use_directly`/`validate`/`re_think`) exists because semantic similarity isn't certainty — naively reusing any "close enough" thinking block risks silently propagating a wrong line of reasoning into a new problem.
+- The 0.85/0.90 thresholds and the `validate` tier (spend ~100 cheap tokens asking the model to confirm a borderline-similar thinking block still applies) are a deliberate middle ground between "always re-think" (no savings) and "always reuse on any match" (correctness risk) — see the Token Economics table in `THINKING_REUSE.md` for the cost/benefit math.
+- Age-decay (`exp(-0.1 * age_days)`) lowers confidence on older cached blocks even at the same raw similarity score, since the codebase context they were computed against has likely shifted further from current state the longer they sit unused.
 
 ### Per-Model-Family Instruction Templating
 - `cacheflow/templates.py` defines a `ChatTemplate` (system/user wrap formats, assistant open/close, generation stop token) per family: `CHATML`, `LLAMA3`, `MISTRAL`, `GEMMA`, `PHI3`.
@@ -195,6 +230,9 @@ This prevents silent breakage where stale cached knowledge doesn't match updated
 - `test_templates.py` — `detect_template`/`ChatTemplate` family detection and wrapping (metadata sniff, name fallback, ChatML default)
 - `test_sandbox.py` — `GitWorktreeSandbox` against a real temp git repo (isolation, commit/merge, dirty-tree rejection, discard)
 - `test_cli_sandbox.py` — `cf agent`'s sandbox wiring (default-on/off, `--test-cmd` gating, `--no-sandbox`), with `run_agentic` mocked
+- `test_thinking_reuse.py` — `ThinkingStore` (exact-hash lookup, semantic search/confidence tiers, GC) and `KnowledgeStore` (region-hash staleness, role fallback, supersession) plus integration tests across both
+- `test_hooks.py` — Transcript parsing for the thinking-capture hook (`extract_thinking_blocks_from_transcript`, `compute_repo_hash`, `compute_git_delta`, `classify_task`)
+- `test_installer.py` — `cf install`'s skill/rule rendering (content-equality idempotency) and `PostToolUse` hook registration (no double-registration on repeat runs)
 
 **Mocking patterns:**
 - `tests/conftest.py` has an **autouse** fixture that patches `cacheflow.agent.get_tokenizer` with a fake tokenizer, so constructing `AgentSession` never loads a real model. Tests needing specific counts patch it inline to override.
@@ -220,6 +258,11 @@ pytest tests/test_agent.py::test_first_session_primes_and_saves -xvs
 - **cacheflow/gc.py** — `SnapshotGC`: reaps snapshots not referenced by any agent HEAD
 - **cacheflow/templates.py** — Per-model-family instruction templating (`detect_template`); sniffs the GGUF's embedded chat_template, falls back to model name, falls back to ChatML
 - **cacheflow/sandbox.py** — `GitWorktreeSandbox`: isolates `cf agent --auto`/`--allow-bash` in a throwaway git worktree, merged back into the real tree only on request (e.g. after `--test-cmd` passes)
+- **cacheflow/thinking_store.py** — `ThinkingStore`: exact-hash + semantic (Qdrant/E5-Mistral) retrieval of cached extended-thinking blocks, with confidence-gated reuse
+- **cacheflow/knowledge_store.py** — `KnowledgeStore`: shared region summaries with automatic hash-based staleness
+- **cacheflow/hooks.py** — Transcript/repo-hash/git-delta helpers backing `cf thinking capture-block`
+- **cacheflow/installer.py** — `cf install`: idempotent skill/rule file rendering per harness + `PostToolUse` hook registration
+- **THINKING_REUSE.md** — Design doc for the thinking-reuse/knowledge-pool system: retrieval strategy, schema, latency budget, token economics, failure modes
 - **pyproject.toml** — Package metadata, dependencies, CLI entrypoint
 
 ## Development Notes
@@ -230,3 +273,5 @@ pytest tests/test_agent.py::test_first_session_primes_and_saves -xvs
 - Prefix-matching is transparent; llama-cpp-python handles it automatically when prompt prefix matches cached KV
 - Token counts for completions come from llama-cpp-python's response metadata; for sizing/budgeting, exact counts come from `tokenizer.get_tokenizer().count()` (a vocab-only model) — never hand-rolled heuristics
 - The warm/restore path deliberately skips re-saving the snapshot (the HEAD on disk is already identical); only the prime path writes
+- `cf thinking capture-block` (the `PostToolUse` hook entry point) must never raise into the agent it's attached to — it wraps its entire body in a bare `except Exception: pass`; a broken hook should silently no-op, not break the run it's hooked into
+- `ThinkingStore`/`KnowledgeStore` are independent of `AgentSession`/KV caching — don't conflate "no thinking-block hit" with "no KV snapshot," they invalidate on different hashes (`codebase_hash`/`region_hash` vs. `stable_context_hash`) for different reasons
