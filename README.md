@@ -4,22 +4,22 @@
 
 ## The Problem
 
-Coding agents re-analyze your codebase from scratch in every session, burning tokens on re-ingestion. Large codebases demand thousands of tokens per session just to restore context. The agent learns nothing between runs.
+Coding agents re-analyze your codebase from scratch in every session — re-running the full prefill pass through the model every single time, even on the same machine, against the same codebase, seconds after the last run. On local hardware there's no per-token bill to point at; what's actually being wasted is wall-clock time and GPU/CPU compute that local inference is bottlenecked on. Large codebases demand seconds of prefill per session just to restore context, and the agent learns nothing between runs.
 
 ## How It Works
 
-CacheFlow uses llama-cpp-python's native KV cache state serialization to save and restore the model's learned knowledge across sessions. Each agent's first run primes the KV cache on `system_prompt + codebase` and persists it as a snapshot. The next run restores that snapshot instead of re-ingesting the codebase, and llama-cpp-python's prefix-matching evaluates only the new task tokens.
+CacheFlow uses llama-cpp-python's native KV cache state serialization to save and restore the model's learned knowledge across sessions. Each agent's first run primes the KV cache on `system_prompt + codebase` and persists it as a snapshot — that's the one expensive prefill pass. The next run restores that snapshot instead of re-ingesting the codebase: a cheap KV splice instead of a forward pass, and llama-cpp-python's prefix-matching evaluates only the new task tokens.
 
-**Measured token cost (16384 context window, qwen2.5-coder:7b, this repo):**
+**Measured cost (16384 context window, qwen2.5-coder:7b, this repo):**
 
-| | Without cache | With cache |
-|--|--------------|------------|
+| | Without cache (cold prime) | With cache (warm restore) |
+|--|--------------------------|---------------------------|
+| Prefill wall-clock time | ~1.8s | ~15ms |
 | Prompt tokens evaluated | 9,064 | ~5 |
-| Prompt cost reduction | — | **~99%** |
-| Total session cost | 9,064 + output | ~5 + output |
-| Cumulative savings over 4 sessions | 4 × 9,064 = 36,256 | **~25,000 tokens saved (70%)** |
+| Est. compute avoided per warm session | — | **~127 TFLOPs** (`2 × params × tokens_skipped`) |
+| Cumulative time saved over 4 sessions | — | **~5.4s** (3 warm sessions × ~1.8s) |
 
-The baseline prompt for this codebase is 9,064 tokens (system prompt + codebase). Every session after the first restores the KV snapshot and evaluates only the task suffix (~5–50 tokens). Output tokens are the same either way — caching eliminates prompt re-evaluation, not generation. Over multiple sessions, cumulative token savings grow — `cf status` shows all three metrics: **baseline** (one-time cost), **cumulative saved** (total across all warm sessions), and **last session saved** (most recent only). Savings scale with codebase size.
+Every session after the first restores the KV snapshot and evaluates only the task suffix (~5–50 tokens) instead of re-running prefill. Output tokens are the same either way — caching eliminates prompt re-evaluation, not generation. `cf status` reports both metric families: **time saved** (`baseline_prime_time_ms`, `cumulative_time_saved_ms`, `last_time_saved_ms` — the headline) and **tokens saved** (kept alongside, useful for context-budget intuition but not a meaningful cost figure locally). The FLOPs figure is a labeled estimate (parsed from a model-name size tag like `7b`), not a measurement — savings scale with codebase size and model size.
 
 ## Quick Start
 
@@ -35,7 +35,7 @@ ollama serve
 # 3. Run your first task (auto-initializes project, prompts to pick a model)
 cf run "Analyze this codebase and summarize its architecture"
 
-# 4. Follow up with another task (uses cached knowledge — ~99% prompt savings)
+# 4. Follow up with another task (uses cached knowledge — restores in milliseconds instead of re-priming)
 cf run "What are the three highest-priority bugs to fix?"
 
 # 5. See the cost breakdown
@@ -170,11 +170,13 @@ The same re-prime path also fires on a **model swap** (`cf model use`): an agent
 
 Snapshots use a compact binary format (`CFKV`, version 4) defined in `llama_server_custom.py`. Instead of `model.save_state()` — which serializes the **entire** `n_ctx` buffer (e.g. 16384 tokens) regardless of occupancy — v4 serializes only the live KV via `llama_state_seq_get_data`. A 9k-token prime no longer writes the full 16384-ctx buffer, shrinking both the save write and the restore read. Restore splices the sequence back in with `llama_state_seq_set_data` after clearing the KV. Older v3 (full-state) snapshots remain readable; agents upgrade transparently on their next prime.
 
-### Exact Token Counting
+### Time, Compute, and Token Metrics
 
-Token counts are never approximated:
+Wall-clock time is the headline metric (it's what's actually scarce on local hardware), but all three are tracked:
 
-- **Completion stats** (`tokens_this_session`, `tokens_saved`): come directly from llama-cpp-python's response metadata.
+- **Wall-clock time** (`prime_time_ms`/`restore_time_ms`, `baseline_prime_time_ms`, `time_saved_ms`): measured directly with `time.time()` around the real `prime_slot`/`restore_slot` calls in `agent.py` — not estimated.
+- **Compute avoided** (`flops_avoided`): a labeled *estimate*, `2 × param_count × tokens_skipped` (the standard forward-pass FLOPs/token approximation), where `param_count` is parsed from a size tag (`7b`, `70B`, ...) in the model name/path. Reported as `N/A` rather than guessed when no size tag is found — llama-cpp-python doesn't reliably expose an exact parameter count, so this one metric is intentionally not held to the same exactness bar as the others.
+- **Token counts** (`tokens_this_session`, `tokens_saved`): never approximated — come directly from llama-cpp-python's response metadata. Useful for context-budget intuition, kept alongside the time/compute metrics rather than as the cost figure.
 - **Context budget sizing**: `ModelTokenizer` (`cacheflow/tokenizer.py`) loads the model with `vocab_only=True` — only the BPE vocabulary tables (~50–100 MB, no weights or KV cache) — giving exact counts for context-packing decisions without a second full model load.
 
 ### Multi-Slot KV Cache Management
@@ -342,11 +344,12 @@ A shared `tests/conftest.py` autouse fixture patches `cacheflow.agent.get_tokeni
 - Model tokenizer (vocab_only): ~50–100 MB (main process)
 - KV cache per slot: ~1–2 GB at 8192 context
 
-**Token efficiency (measured on this repo, 16384 ctx, qwen2.5-coder:7b):**
-- Baseline prompt: 9,064 tokens (system prompt + codebase)
-- Follow-up sessions: ~5 prompt tokens evaluated (~99% prompt cost reduction)
-- Output tokens are the same either way — caching eliminates re-evaluation, not generation
-- Absolute prompt savings per session: ~9,000 tokens; scales with codebase size
+**Time/compute efficiency (measured/estimated on this repo, 16384 ctx, qwen2.5-coder:7b):**
+- Cold prime (baseline): ~1.8s wall-clock, 9,064 prompt tokens evaluated
+- Warm restore: ~15ms wall-clock, ~5 prompt tokens evaluated
+- Time saved per warm session: ~1.79s; est. compute avoided: ~127 TFLOPs (`2 × params × tokens_skipped`)
+- Output tokens are the same either way — caching eliminates prefill re-evaluation, not generation
+- Savings scale with codebase size (more tokens skipped) and model size (more FLOPs/token)
 
 ## License
 

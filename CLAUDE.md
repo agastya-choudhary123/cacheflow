@@ -36,21 +36,20 @@ cf repl                              # Interactive REPL (model stays hot between
 
 ## Architecture Overview
 
-CacheFlow is a **persistent KV cache system for AI agents**. It solves token waste by caching a model's learned knowledge (the KV cache state) and restoring it across sessions instead of re-ingesting the codebase.
+CacheFlow is a **persistent KV cache system for AI agents**. On local hardware tokens themselves are free — there's no per-token API bill — so the thing actually worth avoiding is re-running prefill (prompt processing) through the model on every session. CacheFlow caches a model's learned knowledge (the KV cache state) and restores it across sessions instead of re-ingesting the codebase, which means skipping that prefill pass: real wall-clock time and real GPU/CPU compute (FLOPs) that would otherwise be spent re-evaluating the same codebase tokens.
 
 ### Core Flow: Restore/Prime → Save → Complete → Record
 
-1. **Restore or Prime**: Agent computes `stable_context` (system prompt + codebase text). If the agent has a HEAD snapshot whose `stable_context_hash` still matches, restore it (warm path). Otherwise prime: feed the prefix to the model so the KV cache populates (cold path).
+1. **Restore or Prime**: Agent computes `stable_context` (system prompt + codebase text). If the agent has a HEAD snapshot whose `stable_context_hash` still matches, restore it (warm path — cheap KV splice). Otherwise prime: feed the prefix to the model so the KV cache populates (cold path — a full prefill pass, the expensive step being avoided).
 2. **Save**: On the prime path only, the KV cache is serialized to disk as a snapshot. On the warm/restore path this is skipped — the HEAD snapshot already on disk is byte-identical, so re-saving would be redundant I/O.
 3. **Complete**: Model generates response using prefix-matching (cached tokens + new task suffix).
-4. **Record**: The agent's HEAD pointer (`current_snapshot_path`) and token metrics are updated in SQLite; token savings computed vs. baseline.
+4. **Record**: The agent's HEAD pointer (`current_snapshot_path`) and metrics are updated in SQLite — both wall-clock time saved (`time_saved_ms`, vs. the measured `baseline_prime_time_ms` cold-prime cost) and tokens saved (kept for context-budget intuition, not as a cost figure).
 
-**Token savings example:**
-- Session 1: 9,064 tokens (baseline, codebase ingestion)
-- Session 2: 328 tokens used, 8,182 saved (cumulative: 8,182)
-- Session 3: ~400 tokens used, ~8,600 saved (cumulative: 16,782)
-- Session 4: ~350 tokens used, ~8,700 saved (cumulative: 25,482)
-- **Total savings across 4 sessions: ~25,500 tokens (75% reduction vs. no caching)**
+**Example session (16384 ctx, qwen2.5-coder:7b, this repo):**
+- Session 1 (cold prime): ~1.8s prefill, 9,064 tokens evaluated (baseline recorded: 1800ms prime time, 9,064 tokens)
+- Session 2 (warm restore): ~15ms restore vs. ~1.8s baseline → **~1.79s saved**; ~5 tokens evaluated vs. 9,064 baseline → ~9,059 tokens skipped → **~127 TFLOPs avoided** (`2 × params × tokens_skipped` estimate)
+- Every subsequent warm session repeats that ~1.79s / ~127 TFLOPs saving; `cumulative_time_saved_ms` and `cumulative_tokens_saved` both accumulate across sessions
+- **The headline number is wall-clock time and compute avoided, not a token count** — token savings are reported alongside as a secondary, more-precise-but-less-meaningful-locally metric
 
 ### Key Components
 
@@ -73,8 +72,8 @@ CacheFlow is a **persistent KV cache system for AI agents**. It solves token was
 
 **cacheflow/store.py — `CacheFlowStore` (SQLite, flat agent model)**
 - Single `agents` table. There is **no commit DAG** — each agent points at one current (HEAD) snapshot via `current_snapshot_path`.
-- `Agent` fields of note: `stable_context_hash`, `current_snapshot_path`, `baseline_tokens_evaluated`, `last_tokens_saved` (most recent session), `cumulative_tokens_saved` (running total across all sessions), `parent_agent_id` (set when forked), `accumulated_tokens` (drives consolidation), `knowledge_summary` (distilled, folded into the stable prefix)
-- Key methods: `create_agent`, `get_agent`, `list_agents`, `update_agent_snapshot` (advances HEAD and increments cumulative), `update_agent_stable_context`, `update_agent_baseline`, `add_accumulated_tokens`, `update_agent_knowledge_summary` (stores summary + resets accumulator), `update_agent_model` (re-points an agent's stored `model_name`/`model_hash` after a forced re-prime on model swap)
+- `Agent` fields of note: `stable_context_hash`, `current_snapshot_path`, `baseline_tokens_evaluated`, `last_tokens_saved`/`cumulative_tokens_saved` (token-count savings, kept for budget intuition), `baseline_prime_time_ms` (measured cold-prime wall-clock cost, re-measured on every re-prime), `last_time_saved_ms`/`cumulative_time_saved_ms` (the headline metric — wall-clock time a restore avoided vs. that baseline), `parent_agent_id` (set when forked), `accumulated_tokens` (drives consolidation), `knowledge_summary` (distilled, folded into the stable prefix)
+- Key methods: `create_agent`, `get_agent`, `list_agents`, `update_agent_snapshot` (advances HEAD, takes both `tokens_saved` and `time_saved_ms`, increments both cumulative counters), `update_agent_stable_context`, `update_agent_baseline`, `update_agent_time_baseline` (persists `baseline_prime_time_ms`), `add_accumulated_tokens`, `update_agent_knowledge_summary` (stores summary + resets accumulator), `update_agent_model` (re-points an agent's stored `model_name`/`model_hash` after a forced re-prime on model swap)
 - `init_db()` is idempotent; call within `_DB_INIT_LOCK` to prevent a SQLite race on first init
 
 **cacheflow/engine.py — `LlamaEngine` (in-process, primary execution path)**
@@ -130,6 +129,12 @@ When agent runs:
 This prevents silent breakage where stale cached knowledge doesn't match updated code.
 
 ## Design Patterns & Key Decisions
+
+### Metrics: Wall-Clock Time and Compute, Not Token Cost
+- Token counts were the original headline metric, but on local hardware tokens have no per-unit cost — there's no API bill to point at. What's actually being avoided by restoring a KV snapshot instead of re-priming is a real prefill pass: wall-clock seconds and GPU/CPU FLOPs.
+- `agent.py`'s `run()` measures `prime_time_ms` (cold path) and `restore_time_ms` (warm path) with `time.time()` around the actual `prime_slot`/`restore_slot` calls — not estimated. `agent.baseline_prime_time_ms` stores the most recent cold-prime cost (re-measured on every re-prime, since codebase growth changes it over time); `time_saved_ms = max(0, baseline_prime_time_ms - restore_time_ms)` on the warm path.
+- `_estimate_param_count`/`_estimate_flops_avoided` (agent.py) give a labeled **estimate** of compute avoided: `2 × param_count × tokens_skipped`, the standard forward-pass FLOPs/token approximation. `param_count` is parsed from a size tag (`7b`, `70B`, etc.) in the model name/path — llama-cpp-python's GGUF metadata doesn't reliably expose an exact parameter count, so this is explicitly not held to the same "never approximate" bar as token counting (see Exact Token Counting in the README); it returns `None` (and the CLI prints "N/A") when no size tag is found rather than guessing.
+- `store.py` tracks both metric families side by side on `Agent`: `baseline_prime_time_ms`/`last_time_saved_ms`/`cumulative_time_saved_ms` (the headline) and `baseline_tokens_evaluated`/`last_tokens_saved`/`cumulative_tokens_saved` (kept — still useful for context-budget intuition, just not the pitch).
 
 ### Per-Model-Family Instruction Templating
 - `cacheflow/templates.py` defines a `ChatTemplate` (system/user wrap formats, assistant open/close, generation stop token) per family: `CHATML`, `LLAMA3`, `MISTRAL`, `GEMMA`, `PHI3`.

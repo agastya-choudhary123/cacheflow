@@ -34,6 +34,12 @@ class Agent(Base):
     current_snapshot_size_bytes = Column(Integer, nullable=False, default=0)
     last_tokens_saved = Column(Integer, nullable=False, default=0)
     cumulative_tokens_saved = Column(Integer, nullable=False, default=0)  # total across all sessions
+    # Wall-clock cost of a cold prime (system prompt + codebase), measured once
+    # on the first prime and re-measured on every re-prime. This is the cost a
+    # restore avoids, so it's the baseline for time_saved_ms.
+    baseline_prime_time_ms = Column(Integer, nullable=True)
+    last_time_saved_ms = Column(Integer, nullable=False, default=0)
+    cumulative_time_saved_ms = Column(Integer, nullable=False, default=0)  # total across all sessions
     parent_agent_id = Column(Uuid, ForeignKey("agents.id"), nullable=True)  # for forking
     # Running sum of tokens processed since the last consolidation; drives the
     # background Compressor's 70%-of-context threshold.
@@ -85,6 +91,9 @@ class CacheFlowStore:
                 ("stable_context_hash", "ALTER TABLE agents ADD COLUMN stable_context_hash TEXT"),
                 ("accumulated_tokens", "ALTER TABLE agents ADD COLUMN accumulated_tokens INTEGER DEFAULT 0"),
                 ("knowledge_summary", "ALTER TABLE agents ADD COLUMN knowledge_summary TEXT"),
+                ("baseline_prime_time_ms", "ALTER TABLE agents ADD COLUMN baseline_prime_time_ms INTEGER"),
+                ("last_time_saved_ms", "ALTER TABLE agents ADD COLUMN last_time_saved_ms INTEGER DEFAULT 0"),
+                ("cumulative_time_saved_ms", "ALTER TABLE agents ADD COLUMN cumulative_time_saved_ms INTEGER DEFAULT 0"),
             ]
 
             for col_name, migration_sql in migrations:
@@ -147,6 +156,19 @@ class CacheFlowStore:
         session = self._get_session()
         try:
             agent.baseline_tokens_evaluated = baseline
+            session.merge(agent)
+            session.commit()
+        finally:
+            session.close()
+
+    def update_agent_time_baseline(self, agent: Agent, baseline_ms: int) -> None:
+        """Persist baseline_prime_time_ms (cold-prime wall-clock cost)."""
+        if baseline_ms < 0:
+            raise ValueError(f"Baseline prime time must be non-negative, got {baseline_ms}")
+
+        session = self._get_session()
+        try:
+            agent.baseline_prime_time_ms = baseline_ms
             session.merge(agent)
             session.commit()
         finally:
@@ -234,6 +256,7 @@ class CacheFlowStore:
         snapshot_path: str,
         snapshot_size_bytes: int,
         tokens_saved: int,
+        time_saved_ms: int = 0,
     ) -> None:
         """Update agent's current snapshot and metrics. Increments cumulative savings."""
         session = self._get_session()
@@ -242,6 +265,8 @@ class CacheFlowStore:
             agent.current_snapshot_size_bytes = snapshot_size_bytes
             agent.last_tokens_saved = tokens_saved
             agent.cumulative_tokens_saved = (agent.cumulative_tokens_saved or 0) + max(0, tokens_saved)
+            agent.last_time_saved_ms = time_saved_ms
+            agent.cumulative_time_saved_ms = (agent.cumulative_time_saved_ms or 0) + max(0, time_saved_ms)
             session.merge(agent)
             session.commit()
         finally:

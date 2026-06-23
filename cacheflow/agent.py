@@ -2,6 +2,7 @@
 
 import hashlib
 import logging
+import re
 import shutil
 import subprocess
 import threading
@@ -31,6 +32,39 @@ _SLOT_POOL = SlotPool(max_slots=8)
 # Serializes concurrent init_db calls to prevent SQLite locking races
 _DB_INIT_LOCK = threading.Lock()
 
+# Matches a parameter-count size tag like "7b", "1.5b", "70B" in a model
+# name/path (e.g. "qwen2.5-coder:7b", "Llama-3-70B.gguf").
+_PARAM_SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*[bB](?![a-zA-Z])")
+
+
+def _estimate_param_count(*sources: str) -> Optional[int]:
+    """Best-effort parameter count parsed from a model name/path size tag.
+
+    There's no reliable way to get an exact parameter count out of
+    llama-cpp-python's GGUF metadata, so this is a labeled estimate (used only
+    for the FLOPs-avoided figure) rather than the exact counts tokenizer.py
+    provides for budgeting. Returns None if no size tag is found.
+    """
+    for source in sources:
+        match = _PARAM_SIZE_RE.search(source or "")
+        if match:
+            return int(float(match.group(1)) * 1_000_000_000)
+    return None
+
+
+def _estimate_flops_avoided(model_name: str, model_path: str, tokens_skipped: int) -> Optional[float]:
+    """Rough FLOPs avoided by skipping prefill on `tokens_skipped` tokens.
+
+    Uses the standard ~2*N FLOPs/token approximation for a transformer
+    forward pass (N = parameter count). An estimate, not a measurement.
+    """
+    if tokens_skipped <= 0:
+        return None
+    param_count = _estimate_param_count(model_name, model_path)
+    if param_count is None:
+        return None
+    return 2.0 * param_count * tokens_skipped
+
 
 @dataclass
 class SessionResult:
@@ -45,6 +79,10 @@ class SessionResult:
     duration_ms: int
     is_first_session: bool
     tokens_per_sec: float = 0.0
+    prime_time_ms: int = 0
+    restore_time_ms: int = 0
+    time_saved_ms: int = 0
+    flops_avoided: Optional[float] = None
 
 
 class AgentSession:
@@ -433,6 +471,21 @@ class AgentSession:
                 tokens_saved = max(0, agent.baseline_tokens_evaluated - tokens_in)
 
             if primed:
+                # Re-measure the cold-prime cost on every prime (codebase growth
+                # changes it over time), so time_saved_ms always compares against
+                # the current baseline rather than a stale first-session number.
+                self.store.update_agent_time_baseline(agent, prime_time_ms)
+                agent.baseline_prime_time_ms = prime_time_ms
+                time_saved_ms = 0
+            else:
+                baseline_prime_ms = agent.baseline_prime_time_ms or 0
+                time_saved_ms = max(0, baseline_prime_ms - restore_time_ms)
+
+            flops_avoided = _estimate_flops_avoided(
+                self.config.model_name, self.config.model_path, tokens_saved
+            )
+
+            if primed:
                 # Validate save result and promote the new snapshot to HEAD
                 saved_filename = save_result.get("filename", "")
                 if not saved_filename:
@@ -459,6 +512,7 @@ class AgentSession:
                 snapshot_path=str(final_snapshot_path),
                 snapshot_size_bytes=final_snapshot_path.stat().st_size,
                 tokens_saved=tokens_saved,
+                time_saved_ms=time_saved_ms,
             )
 
             total_duration_ms = int((time.time() - start_time) * 1000)
@@ -482,6 +536,10 @@ class AgentSession:
                 duration_ms=total_duration_ms,
                 is_first_session=is_first_session,
                 tokens_per_sec=response_data.get("tokens_per_sec", 0.0),
+                prime_time_ms=prime_time_ms,
+                restore_time_ms=restore_time_ms,
+                time_saved_ms=time_saved_ms,
+                flops_avoided=flops_avoided,
             )
 
         finally:
@@ -504,7 +562,11 @@ class AgentSession:
         model_changed = agent.model_name != self.config.model_name
 
         if is_first or context_changed or model_changed:
+            prime_start = time.time()
             self.server.prime_slot(stable_prefix, slot_id=self.slot_id)
+            prime_time_ms = int((time.time() - prime_start) * 1000)
+            self.store.update_agent_time_baseline(agent, prime_time_ms)
+            agent.baseline_prime_time_ms = prime_time_ms
             save_result = self.server.save_slot(slot_id=self.slot_id)
             saved_filename = save_result.get("filename", "")
             saved_path = self.config.slot_save_path / saved_filename
@@ -517,6 +579,7 @@ class AgentSession:
                     snapshot_path=str(final_path),
                     snapshot_size_bytes=final_path.stat().st_size,
                     tokens_saved=0,
+                    time_saved_ms=0,
                 )
                 self.store.update_agent_stable_context(agent, stable_prefix)
                 agent.stable_context_hash = current_hash
@@ -684,6 +747,9 @@ def fork_agent(
         snapshot_path=str(fork_snapshot_path),
         snapshot_size_bytes=fork_snapshot_path.stat().st_size,
         tokens_saved=parent_agent.last_tokens_saved,
+        time_saved_ms=parent_agent.last_time_saved_ms,
     )
+    if parent_agent.baseline_prime_time_ms is not None:
+        store.update_agent_time_baseline(child_agent, parent_agent.baseline_prime_time_ms)
 
     return child_agent

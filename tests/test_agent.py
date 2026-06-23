@@ -7,7 +7,10 @@ from unittest.mock import MagicMock, patch, mock_open
 
 import pytest
 
-from cacheflow.agent import AgentSession, SessionResult, DEFAULT_SYSTEM_PROMPT, fork_agent
+from cacheflow.agent import (
+    AgentSession, SessionResult, DEFAULT_SYSTEM_PROMPT, fork_agent,
+    _estimate_param_count, _estimate_flops_avoided,
+)
 from cacheflow.config import CacheFlowConfig, save_config
 from cacheflow.store import CacheFlowStore
 
@@ -158,6 +161,95 @@ def test_agent_consecutive_session(agent_session, temp_dir):
     assert result.tokens_this_session == 60  # 40 + 20
     # Either restore_slot or prime_slot was called (depending on if stable_context matches)
     assert mock_server.restore_slot.called or mock_server.prime_slot.called
+
+
+def test_first_session_records_baseline_prime_time(agent_session, temp_dir):
+    """First session measures and stores baseline_prime_time_ms; flops_avoided is
+    None since there's nothing skipped yet (tokens_saved == 0)."""
+    snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
+    snapshots_dir.mkdir(parents=True, exist_ok=True)
+    (snapshots_dir / "snapshot.bin").write_bytes(os.urandom(1024))
+
+    mock_server = MagicMock()
+    mock_server.completion.return_value = {
+        "content": "Task completed successfully.",
+        "tokens_evaluated": 50,
+        "tokens_predicted": 25,
+    }
+    mock_server.save_slot.return_value = {"filename": "snapshot.bin"}
+
+    with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
+        result = agent_session.run(task="Test task", system_prompt=DEFAULT_SYSTEM_PROMPT, max_tokens=512)
+
+    assert result.prime_time_ms >= 0
+    assert result.time_saved_ms == 0
+    assert result.flops_avoided is None
+
+    agent = agent_session.store.get_agent("test-agent")
+    assert agent.baseline_prime_time_ms is not None
+
+
+def test_restore_path_computes_time_and_flops_saved(agent_session, temp_dir):
+    """On a warm restore, time_saved_ms compares against the stored baseline
+    cold-prime cost, and flops_avoided is estimated from the model's size tag."""
+    store = agent_session.store
+    agent = store.create_agent("test-agent", "qwen2.5-coder:7b", "abc123def456", 8192)
+
+    snapshot_path = temp_dir / ".cacheflow" / "snapshots" / "initial.bin"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_path.write_bytes(os.urandom(1024))
+
+    store.update_agent_snapshot(
+        agent=agent, snapshot_path=str(snapshot_path), snapshot_size_bytes=1024, tokens_saved=0,
+    )
+    store.update_agent_baseline(agent, 100)
+    store.update_agent_time_baseline(agent, 1800)
+
+    # Match the real stable prefix so run() takes the restore path deterministically.
+    stable_prefix = agent_session._build_stable_prefix(DEFAULT_SYSTEM_PROMPT, None)
+    store.update_agent_stable_context(agent, stable_prefix)
+
+    mock_server = MagicMock()
+    mock_server.completion.return_value = {
+        "content": "Second task completed.",
+        "tokens_evaluated": 40,
+        "tokens_predicted": 20,
+        "usage": {"prompt_tokens": 100},
+    }
+    mock_server.restore_slot = MagicMock()
+    mock_server.prime_slot = MagicMock()
+
+    with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
+        result = agent_session.run(task="Second task", system_prompt=DEFAULT_SYSTEM_PROMPT, max_tokens=512)
+
+    assert mock_server.restore_slot.called
+    assert not mock_server.prime_slot.called
+    assert result.tokens_saved == 60  # baseline (100) - tokens_evaluated (40)
+    assert result.time_saved_ms == max(0, 1800 - result.restore_time_ms)
+    assert result.flops_avoided == 2.0 * 7_000_000_000 * 60
+
+    agent = store.get_agent("test-agent")
+    assert agent.last_time_saved_ms == result.time_saved_ms
+    assert agent.cumulative_time_saved_ms == result.time_saved_ms
+
+
+def test_estimate_param_count_parses_size_tags():
+    assert _estimate_param_count("qwen2.5-coder:7b") == 7_000_000_000
+    assert _estimate_param_count("Llama-3-70B.gguf") == 70_000_000_000
+    assert _estimate_param_count("mistral:1.5b") == 1_500_000_000
+
+
+def test_estimate_param_count_none_when_unparseable():
+    assert _estimate_param_count("some-model-name", "/path/to/model.gguf") is None
+
+
+def test_estimate_flops_avoided_none_without_param_count_or_skip():
+    assert _estimate_flops_avoided("unknown-model", "/x.gguf", tokens_skipped=100) is None
+    assert _estimate_flops_avoided("qwen2.5-coder:7b", "/x.gguf", tokens_skipped=0) is None
+
+
+def test_estimate_flops_avoided_computes_2n_per_token():
+    assert _estimate_flops_avoided("qwen2.5-coder:7b", "/x.gguf", tokens_skipped=100) == 2.0 * 7_000_000_000 * 100
 
 
 def test_agent_session_lock(agent_session):

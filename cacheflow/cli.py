@@ -1,6 +1,7 @@
 """Command-line interface for CacheFlow."""
 
 from pathlib import Path
+from typing import Optional
 import atexit
 
 import click
@@ -17,6 +18,16 @@ from cacheflow.sandbox import GitWorktreeSandbox, SandboxError
 # Register cleanup on exit
 atexit.register(stop_global_server)
 atexit.register(stop_global_engine)
+
+
+def _format_flops(flops: Optional[float]) -> str:
+    """Human-readable FLOPs-avoided figure, or a note when it can't be estimated."""
+    if flops is None:
+        return "N/A (couldn't parse a param count from the model name)"
+    for unit, scale in (("TFLOPs", 1e12), ("GFLOPs", 1e9), ("MFLOPs", 1e6)):
+        if flops >= scale:
+            return f"~{flops / scale:.2f} {unit} (est.)"
+    return f"~{flops:.0f} FLOPs (est.)"
 
 
 def _discover_models() -> list[tuple[str, str, str]]:
@@ -312,8 +323,18 @@ def run(task, agent_name, system_prompt, max_tokens, stream, base_path):
         click.echo()
         click.echo(f"Agent: {result.agent_name}")
         click.echo(f"Task: {result.task}")
-        click.echo(f"Tokens this session: {result.tokens_this_session}")
-        click.echo(f"Tokens saved: {result.tokens_saved}")
+        if result.is_first_session:
+            click.echo(f"Cold prime: {result.prime_time_ms}ms (first session — nothing to restore yet)")
+        elif result.prime_time_ms:
+            click.echo(f"Re-primed (codebase/model changed): {result.prime_time_ms}ms")
+        else:
+            click.echo(
+                f"Restored in {result.restore_time_ms}ms "
+                f"(cold prime would take ~{result.restore_time_ms + result.time_saved_ms}ms) "
+                f"— {result.time_saved_ms}ms saved"
+            )
+        click.echo(f"Tokens this session: {result.tokens_this_session} (saved: {result.tokens_saved})")
+        click.echo(f"Compute avoided: {_format_flops(result.flops_avoided)}")
         click.echo(f"Snapshot size: {result.snapshot_size_bytes} bytes")
         click.echo(f"Duration: {result.duration_ms}ms")
         click.echo(f"Decode speed: {result.tokens_per_sec:.1f} tok/s")
@@ -474,9 +495,12 @@ def _print_agent_log(store: CacheFlowStore, agent_name: str) -> None:
     click.echo(f"  Model: {agent.model_name}")
     click.echo(f"  Snapshot: {Path(agent.current_snapshot_path).name if agent.current_snapshot_path else 'none'}")
     click.echo(f"  Snapshot size: {agent.current_snapshot_size_bytes / (1024*1024):.1f} MB" if agent.current_snapshot_size_bytes else "  Snapshot size: N/A")
+    click.echo(f"  Baseline cold-prime time: {agent.baseline_prime_time_ms or 'N/A'}ms")
+    click.echo(f"  Cumulative time saved: {agent.cumulative_time_saved_ms or 0}ms")
+    click.echo(f"  Last session time saved: {agent.last_time_saved_ms or 0}ms")
     click.echo(f"  Baseline tokens: {agent.baseline_tokens_evaluated or 'N/A'}")
     click.echo(f"  Cumulative tokens saved: {agent.cumulative_tokens_saved or 0}")
-    click.echo(f"  Last session saved: {agent.last_tokens_saved or 0}")
+    click.echo(f"  Last session tokens saved: {agent.last_tokens_saved or 0}")
 
 
 @cli.command()
@@ -514,9 +538,11 @@ def _print_agents_list(store: CacheFlowStore, base_path: Path) -> None:
 
     for agent in agent_list:
         has_snapshot = "✓" if agent.current_snapshot_path else "✗"
+        time_saved_ms = agent.last_time_saved_ms if agent.current_snapshot_path else 0
         tokens_saved = agent.last_tokens_saved if agent.current_snapshot_path else 0
         click.echo(
-            f"{agent.name} | model: {agent.model_name} | snapshot: {has_snapshot} | saved: {tokens_saved}"
+            f"{agent.name} | model: {agent.model_name} | snapshot: {has_snapshot} "
+            f"| time saved: {time_saved_ms}ms | tokens saved: {tokens_saved}"
         )
 
 
@@ -629,7 +655,10 @@ def repl(base_path):
                     task = parts[2]
                     session = AgentSession(agent_name, base_path)
                     result = session.run(task, max_tokens=1024)
-                    click.echo(f"\n✓ Task complete (tokens: {result.tokens_this_session}, saved: {result.tokens_saved})")
+                    click.echo(
+                        f"\n✓ Task complete (time saved: {result.time_saved_ms}ms, "
+                        f"tokens: {result.tokens_this_session}, tokens saved: {result.tokens_saved})"
+                    )
                     click.echo(f"Response preview: {result.response[:200]}...\n")
 
                 elif cmd == "log" and len(parts) >= 2:
@@ -684,6 +713,9 @@ def _print_agent_status(store: CacheFlowStore, agent_name: str) -> None:
     if not agent:
         raise click.ClickException(f"Agent '{agent_name}' not found")
 
+    baseline_time = agent.baseline_prime_time_ms or 0
+    cumulative_time = agent.cumulative_time_saved_ms or 0
+    last_session_time = agent.last_time_saved_ms or 0
     baseline = agent.baseline_tokens_evaluated or 0
     cumulative = agent.cumulative_tokens_saved or 0
     last_session = agent.last_tokens_saved or 0
@@ -691,9 +723,12 @@ def _print_agent_status(store: CacheFlowStore, agent_name: str) -> None:
     click.echo(f"╭─ Status: {agent_name} ────────────────────╮")
     click.echo(f"│ Model: {agent.model_name:37} │")
     click.echo(f"│ Context size: {agent.ctx_size:34} │")
+    click.echo(f"│ Baseline cold-prime time (ms): {baseline_time:17} │")
+    click.echo(f"│ Cumulative time saved (ms): {cumulative_time:20} │")
+    click.echo(f"│ Last session time saved (ms): {last_session_time:18} │")
     click.echo(f"│ Baseline tokens: {baseline:32} │")
-    click.echo(f"│ Cumulative saved: {cumulative:31} │")
-    click.echo(f"│ Last session saved: {last_session:28} │")
+    click.echo(f"│ Cumulative tokens saved: {cumulative:23} │")
+    click.echo(f"│ Last session tokens saved: {last_session:20} │")
     click.echo(f"╰─────────────────────────────────────────────╯")
 
 
