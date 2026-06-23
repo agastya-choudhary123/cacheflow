@@ -36,19 +36,6 @@ class Compressor:
         """True once the agent has accumulated ≥70% of context worth of tokens."""
         return (agent.accumulated_tokens or 0) >= self._threshold_tokens()
 
-    def compact(self, agent: Agent):
-        """Synchronously consolidate the agent's knowledge. Returns the summary.
-
-        Builds a fresh `AgentSession` (its own slot + engine handle) and asks it to
-        distill knowledge. Imported lazily to avoid a circular import with agent.py.
-        """
-        if not self.needs_compaction(agent):
-            return None
-        from cacheflow.agent import AgentSession
-
-        session = AgentSession(agent.name, self.config.base_path)
-        return session.consolidate()
-
     def maybe_compact_async(self, agent: Agent) -> None:
         """Schedule consolidation on the background executor if the agent is due."""
         if not self.needs_compaction(agent):

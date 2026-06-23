@@ -5,7 +5,6 @@ import threading
 from dataclasses import dataclass, field
 from uuid import UUID
 from typing import Optional, Dict
-from contextlib import contextmanager
 
 
 @dataclass
@@ -17,7 +16,6 @@ class SlotState:
     loaded_commit_id: Optional[UUID] = None
     is_dirty: bool = False
     access_time: float = field(default_factory=time.time)
-    token_baseline: int = 0
 
 
 class SlotLease:

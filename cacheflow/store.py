@@ -3,7 +3,7 @@
 import hashlib
 from pathlib import Path
 from datetime import datetime, timezone
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from sqlalchemy import create_engine, Column, String, Integer, Text, DateTime, ForeignKey, Uuid, event, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session as SQLSession
@@ -152,10 +152,6 @@ class CacheFlowStore:
         finally:
             session.close()
 
-    def get_stable_context_hash(self, agent: Agent) -> str | None:
-        """Return the stored stable_context_hash for an agent."""
-        return agent.stable_context_hash
-
     def update_agent_baseline(self, agent: Agent, baseline: int) -> None:
         """Persist baseline_tokens_evaluated on first session completion."""
         if baseline <= 0:
@@ -234,14 +230,6 @@ class CacheFlowStore:
         session = self._get_session()
         try:
             return session.query(Agent).filter(Agent.name == name).first()
-        finally:
-            session.close()
-
-    def get_agent_by_id(self, agent_id: UUID) -> Agent | None:
-        """Get an agent by ID."""
-        session = self._get_session()
-        try:
-            return session.query(Agent).filter(Agent.id == agent_id).first()
         finally:
             session.close()
 

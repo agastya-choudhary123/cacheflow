@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import threading
-from typing import Optional
 
 _tokenizer_registry: dict[str, "ModelTokenizer"] = {}
 _registry_lock = threading.Lock()

@@ -1,18 +1,16 @@
 """
-In-process Llama engine: same prime/restore/save/completion surface as the HTTP
-LlamaServer client, but called directly — no Flask, no subprocess, no HTTP.
+In-process Llama engine: loads the model once and drives it directly in this
+process — no Flask, no subprocess, no HTTP.
 
 Why this exists
 ---------------
-The HTTP design ran the model in a separate Werkzeug subprocess and drove it over
-HTTP. On macOS, token-by-token GPU decode collapses ~10x while an inbound HTTP
-request is in flight (bulk prefill is unaffected, which is why only generation was
-slow). Running the model in the same process as the agent removes that throttle
-entirely (full-speed decode), and as a bonus avoids reloading the 7B model on every
-`cf run` and the per-call snapshot disk round-trips.
-
-The HTTP server (server.py + llama_server_custom.py) is kept as an optional shim
-for the multi-client / MCP case.
+An earlier design ran the model in a separate Werkzeug subprocess and drove it
+over HTTP. On macOS, token-by-token GPU decode collapses ~10x while an inbound
+HTTP request is in flight (bulk prefill is unaffected, which is why only
+generation was slow). Running the model in the same process as the agent
+removes that throttle entirely (full-speed decode), and as a bonus avoids
+reloading the 7B model on every `cf run` and the per-call snapshot disk
+round-trips.
 """
 
 import logging
@@ -94,6 +92,17 @@ class LlamaEngine:
         # life of this engine since the model doesn't change after load.
         self.param_count: int = llama_model_n_params(self.model.model)
 
+        # n_layer/n_embd read straight off the GGUF's own architecture metadata
+        # (general.architecture + {arch}.block_count/{arch}.embedding_length),
+        # exposed by llama-cpp-python as Llama.metadata (a dict[str,str] built
+        # from llama_model_meta_val_str_by_index — the same C-level KV store
+        # templates.py already sniffs for chat_template). Used to add the
+        # context-length-dependent self-attention term that a flat
+        # 2*param_count*tokens estimate misses (see _compute_flops_avoided in
+        # agent.py). None if the arch key or its dims aren't present/parseable
+        # — degrade to the simpler estimate rather than guess.
+        self.arch_info: Optional[Dict[str, int]] = self._read_arch_info()
+
         self.slot_manager = CooperativeSlotManager(self.model)
         # num_slots matches SlotPool.max_slots: up to 8 agents share this one model,
         # each with its own KV state swapped in/out by slot_manager.
@@ -113,6 +122,23 @@ class LlamaEngine:
     def get_param_count(self) -> Optional[int]:
         """Exact parameter count of the loaded model (llama.cpp's own metadata)."""
         return self.param_count
+
+    def get_arch_info(self) -> Optional[Dict[str, int]]:
+        """{"n_layer", "n_embd"} read off the GGUF's own architecture metadata,
+        or None if unavailable (e.g. an unrecognized general.architecture)."""
+        return self.arch_info
+
+    def _read_arch_info(self) -> Optional[Dict[str, int]]:
+        try:
+            meta = self.model.metadata
+            arch = meta.get("general.architecture")
+            if not arch:
+                return None
+            n_layer = int(meta[f"{arch}.block_count"])
+            n_embd = int(meta[f"{arch}.embedding_length"])
+            return {"n_layer": n_layer, "n_embd": n_embd}
+        except (KeyError, ValueError, TypeError):
+            return None
 
     def stop(self) -> None:
         # Llama frees native resources on GC; nothing to tear down explicitly.
@@ -264,10 +290,6 @@ class LlamaEngine:
                 },
             }
 
-    def erase_slot(self, slot_id: int = 0) -> None:
-        with self._exec_lock:
-            self.slot_manager.invalidate(slot_id)
-            self.slot_manager.switch_to(slot_id)
 
 
 # ── Global in-process singleton ───────────────────────────────────────────────

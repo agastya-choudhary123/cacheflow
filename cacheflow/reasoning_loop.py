@@ -34,7 +34,6 @@ if TYPE_CHECKING:
 class AgentStep:
     """One iteration of the agentic loop."""
 
-    thought_action: str   # the model's raw THOUGHT/ACTION/ARGS text
     tool: str
     args: dict
     observation: str
@@ -198,18 +197,18 @@ def run_agentic(
                         f"ERROR: {e}. Reply with exactly THOUGHT/ACTION/ARGS, "
                         "where ARGS is a one-line JSON object."
                     )
-                steps.append(AgentStep(content, "(parse_error)", {}, obs))
+                steps.append(AgentStep("(parse_error)", {}, obs))
                 convo = _append_observation(session, convo, content, obs)
                 continue
 
             if action.tool == "finish":
                 final_answer = action.answer if action.answer is not None else content
-                steps.append(AgentStep(content, "finish", action.args, ""))
+                steps.append(AgentStep("finish", action.args, ""))
                 completed = True
                 break
 
             obs = execute(action, ctx)
-            steps.append(AgentStep(content, action.tool, action.args, obs))
+            steps.append(AgentStep(action.tool, action.args, obs))
             convo = _append_observation(session, convo, content, obs)
 
         return AgentLoopResult(

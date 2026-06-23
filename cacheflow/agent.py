@@ -1,6 +1,5 @@
 """Agent loop: completion, save, commit."""
 
-import hashlib
 import logging
 import resource
 import shutil
@@ -9,7 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import uuid4
 from typing import Optional, Callable
 
 logger = logging.getLogger(__name__)
@@ -32,21 +31,51 @@ _SLOT_POOL = SlotPool(max_slots=8)
 # Serializes concurrent init_db calls to prevent SQLite locking races
 _DB_INIT_LOCK = threading.Lock()
 
-def _compute_flops_avoided(param_count: Optional[int], tokens_skipped: int) -> Optional[float]:
+def _compute_flops_avoided(
+    param_count: Optional[int],
+    tokens_skipped: int,
+    arch_info: Optional[dict] = None,
+) -> Optional[float]:
     """FLOPs avoided by skipping prefill on `tokens_skipped` tokens.
 
     `param_count` must be the model's exact parameter count, read directly off
     the loaded GGUF via llama.cpp's own `llama_model_n_params` (engine.py) —
     never parsed/guessed from a model name or file size. Given that exact
     count, `2 * param_count` FLOPs/token is the standard, analytically-derived
-    cost of a dense transformer forward pass (one multiply-add per parameter
-    per token), so this is a real computation from real inputs, not a guess.
-    Returns None (rather than fabricating a number) if either input is
-    unavailable.
+    cost of every QKVO projection + FFN matmul in a forward pass (one
+    multiply-add per parameter per token) — but it's a *floor*, not the whole
+    cost: it has no notion of context length, while causal self-attention's
+    score (Q·K^T) and weighted-sum (softmax·V) steps are NOT covered by
+    param_count at all (attention weights have no parameters) and scale with
+    how many prior tokens each token attends to. Summed over a prefill of T
+    tokens evaluated together (token i attends to i prior tokens), that extra
+    cost is `2 * n_layer * n_embd * T^2` — quadratic in T, derived from
+    n_layer attention blocks each doing two T-by-n_embd matmuls per token,
+    summed over T. (Residual adds and layernorm are elementwise — O(n_embd)
+    each, negligible next to either term above, so deliberately not modeled.)
+
+    This quadratic term is exactly the kind of thing the flat 2*param_count*T
+    estimate hides, and it's not negligible for CacheFlow's workload: prefill
+    lengths here run into the thousands of tokens, often comparable to or
+    larger than the model's n_embd, at which point T^2 stops being dominated
+    by the linear term. `arch_info` (engine.py's `get_arch_info()`) supplies
+    n_layer/n_embd read straight off the GGUF's own metadata; when it's
+    unavailable (e.g. an architecture whose metadata keys don't match the
+    standard `{arch}.block_count`/`{arch}.embedding_length` convention), this
+    falls back to the param-count-only floor rather than guess dimensions.
+
+    Returns None (rather than fabricating a number) if `tokens_skipped` or
+    `param_count` is unavailable.
     """
     if tokens_skipped <= 0 or param_count is None:
         return None
-    return 2.0 * param_count * tokens_skipped
+    flops = 2.0 * param_count * tokens_skipped
+    if arch_info:
+        n_layer = arch_info.get("n_layer")
+        n_embd = arch_info.get("n_embd")
+        if n_layer and n_embd:
+            flops += 2.0 * n_layer * n_embd * (tokens_skipped ** 2)
+    return flops
 
 
 def _cpu_time_ms() -> float:
@@ -189,51 +218,6 @@ class AgentSession:
         """Return the exact token count using the model's tokenizer."""
         return self._tokenizer.count(text)
 
-    def _chunk_files_for_ingestion(self, files: list[Path]) -> list[str]:
-        """Pack files into chunks that each fit within the context window."""
-        budget_tokens = int(self.config.ctx_size * 0.6)
-
-        SKIP_SUFFIXES = {".lock", ".sum", ".mod"}
-        SKIP_NAMES = {"package-lock.json", "yarn.lock", "poetry.lock"}
-        # Upper char limit per file slice before we do exact token counting.
-        # Assumes worst-case ~4 bytes/token to avoid reading huge files into one string.
-        MAX_FILE_CHARS = budget_tokens * 4
-
-        blocks: list[tuple[str, str]] = []
-        for f in files:
-            if f.suffix in SKIP_SUFFIXES or f.name in SKIP_NAMES:
-                continue
-            try:
-                content = f.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            rel = str(f.relative_to(self.base_path))
-            for start in range(0, len(content), MAX_FILE_CHARS):
-                slice_ = content[start:start + MAX_FILE_CHARS]
-                label = rel if start == 0 else f"{rel} (cont.)"
-                blocks.append((label, slice_))
-
-        chunks: list[str] = []
-        current_parts: list[str] = []
-        current_tokens = 0
-
-        for label, content in blocks:
-            block = f"\n--- {label} ---\n{content}\n"
-            block_tokens = self._count_tokens(block)
-            if current_tokens + block_tokens > budget_tokens and current_parts:
-                chunks.append("Codebase (continued):\n" + "".join(current_parts))
-                current_parts = []
-                current_tokens = 0
-            current_parts.append(block)
-            current_tokens += block_tokens
-
-        if current_parts:
-            chunks.append("Codebase (continued):\n" + "".join(current_parts))
-
-        if chunks:
-            chunks[0] = chunks[0].replace("Codebase (continued):", "Codebase:", 1)
-        return chunks
-
     def _build_stable_context(self, budget_tokens: int) -> str:
         """Build codebase context that is byte-for-byte identical every session.
 
@@ -311,33 +295,6 @@ class AgentSession:
         """Build the task-specific suffix that appends to the stable prefix."""
         template = self._get_template()
         return f"{template.wrap_user(f'Task: {task}')}{template.assistant_open}{self._think_prefill()}"
-
-    def _ingest_codebase_progressively(self, system_prompt: str) -> None:
-        """Feed the entire codebase into the model across multiple passes."""
-        files = self._collect_source_files()
-        if not files:
-            return
-
-        chunks = self._chunk_files_for_ingestion(files)
-        if not chunks:
-            return
-
-        total = len(chunks)
-        for i, chunk in enumerate(chunks):
-            is_last = i == total - 1
-            if i == 0:
-                prompt = f"{system_prompt}\n\n{chunk}\n\nAcknowledge that you have read this code. Do not summarize yet."
-            else:
-                prompt = f"{chunk}\n\nYou now have read {i + 1} of {total} chunks. Acknowledge receipt."
-
-            self.server.completion(
-                prompt=prompt,
-                slot_id=self.slot_id,
-                max_tokens=64,
-            )
-
-            if not is_last:
-                self.server.save_slot(slot_id=self.slot_id)
 
     def run(
         self,
@@ -421,26 +378,20 @@ class AgentSession:
             # snapshot already exists on disk and is byte-identical to what save_slot
             # would write, so saving again is pure redundant I/O (~503 MB write).
             primed = is_first_session or context_changed or model_changed
-            save_time_ms = 0
             save_result = None
             if primed:
-                save_start = time.time()
                 save_result = self.server.save_slot(slot_id=self.slot_id)
-                save_time_ms = int((time.time() - save_start) * 1000)
 
-            # Step f: Run completion
-            completion_start = time.time()
-
-            # Always send the full prompt so llama-cpp-python's prefix matching can
-            # find the stable prefix in the KV cache (whether from prime or restore)
-            # and only evaluate the task suffix tokens.
+            # Step f: Run completion. Always send the full prompt so
+            # llama-cpp-python's prefix matching can find the stable prefix in
+            # the KV cache (whether from prime or restore) and only evaluate
+            # the task suffix tokens.
             response_data = self.server.completion(
                 prompt=full_prompt,
                 slot_id=self.slot_id,
                 max_tokens=max_tokens,
                 on_token=on_token,
             )
-            completion_time_ms = int((time.time() - completion_start) * 1000)
 
             response_text = response_data.get("content", "")
             tokens_in = response_data.get("tokens_evaluated", 0)
@@ -491,10 +442,10 @@ class AgentSession:
                 baseline_prime_cpu_ms = agent.baseline_prime_cpu_ms or 0
                 cpu_time_saved_ms = max(0.0, baseline_prime_cpu_ms - restore_cpu_ms)
 
-            # Exact parameter count read off the loaded model (engine.py); None
-            # only for the legacy HTTP shim, which doesn't expose it.
-            param_count = self.server.get_param_count() if hasattr(self.server, "get_param_count") else None
-            flops_avoided = _compute_flops_avoided(param_count, tokens_saved)
+            # Exact parameter count and architecture dims read off the loaded model.
+            param_count = self.server.get_param_count()
+            arch_info = self.server.get_arch_info()
+            flops_avoided = _compute_flops_avoided(param_count, tokens_saved, arch_info)
 
             if primed:
                 # Validate save result and promote the new snapshot to HEAD
@@ -536,7 +487,7 @@ class AgentSession:
             compressor = Compressor(self.store, self.config)
             compressor.maybe_compact_async(agent)
 
-            SnapshotGC(self.store, self.config.slot_save_path).collect(keep_latest_n=1)
+            SnapshotGC(self.store, self.config.slot_save_path).collect()
 
             return SessionResult(
                 agent_name=self.agent_name,

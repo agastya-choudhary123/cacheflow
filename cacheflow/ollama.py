@@ -89,16 +89,3 @@ def ollama_is_installed() -> bool:
         return True
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
-
-
-def get_running_ollama_url() -> Optional[str]:
-    """Check if ollama server is running and return its URL."""
-    try:
-        subprocess.run(
-            ["curl", "-s", "http://127.0.0.1:11434/api/tags"],
-            capture_output=True,
-            timeout=2,
-        )
-        return "http://127.0.0.1:11434"
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None

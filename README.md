@@ -16,10 +16,10 @@ CacheFlow uses llama-cpp-python's native KV cache state serialization to save an
 |--|--------------------------|---------------------------|
 | Prefill wall-clock time | ~1.8s | ~15ms |
 | Prompt tokens evaluated | 9,064 | ~5 |
-| Compute avoided per warm session | — | **~127 TFLOPs** (`2 × params × tokens_skipped`, exact param count) |
+| Compute avoided per warm session | — | **~144 TFLOPs** (`2 × params × tokens_skipped` + the quadratic self-attention term, exact param count and arch dims) |
 | Cumulative time saved over 4 sessions | — | **~5.4s** (3 warm sessions × ~1.8s) |
 
-Every session after the first restores the KV snapshot and evaluates only the task suffix (~5–50 tokens) instead of re-running prefill. Output tokens are the same either way — caching eliminates prompt re-evaluation, not generation. `cf status` reports all three metric families: **wall-clock time saved** (`baseline_prime_time_ms`, `cumulative_time_saved_ms`, `last_time_saved_ms` — the headline), **CPU time saved** (`baseline_prime_cpu_ms`, `cumulative_cpu_time_saved_ms`, `last_cpu_time_saved_ms`, from `resource.getrusage`), and **tokens saved** (kept alongside, useful for context-budget intuition but not a meaningful cost figure locally). The FLOPs figure is a real computation, not a guess: the model's parameter count is read exactly off the loaded GGUF via llama.cpp's own API (`llama_model_n_params`), not parsed from a model-name size tag — savings scale with codebase size and model size.
+Every session after the first restores the KV snapshot and evaluates only the task suffix (~5–50 tokens) instead of re-running prefill. Output tokens are the same either way — caching eliminates prompt re-evaluation, not generation. `cf status` reports all three metric families: **wall-clock time saved** (`baseline_prime_time_ms`, `cumulative_time_saved_ms`, `last_time_saved_ms` — the headline), **CPU time saved** (`baseline_prime_cpu_ms`, `cumulative_cpu_time_saved_ms`, `last_cpu_time_saved_ms`, from `resource.getrusage`), and **tokens saved** (kept alongside, useful for context-budget intuition but not a meaningful cost figure locally). The FLOPs figure is a real computation, not a guess: the model's parameter count is read exactly off the loaded GGUF via llama.cpp's own API (`llama_model_n_params`), not parsed from a model-name size tag, and (when available) the model's exact `n_layer`/`n_embd` add the attention-score/weighted-sum cost that scales with prefill length squared, not with parameter count — for a 9,064-token prefill on Qwen2.5-Coder-7B (28 layers, 3584 hidden dim) that term alone is ~16.5 TFLOPs on top of the ~127 TFLOPs param-only floor, ~13% more. Savings scale with codebase size and model size.
 
 ## Quick Start
 
@@ -46,7 +46,7 @@ cf log main
 
 ## In-Process Execution
 
-CacheFlow runs the model **in the same process** as the agent (`cacheflow/engine.py`, `LlamaEngine`) — no subprocess, no HTTP round-trips. This matters on macOS, where token-by-token GPU decode collapses ~10x while an inbound HTTP request is in flight, and it avoids reloading the model on every `cf run`. A Flask-based HTTP shim (`server.py` + `llama_server_custom.py`) is kept for the out-of-process / multi-client case but is not the default.
+CacheFlow runs the model **in the same process** as the agent (`cacheflow/engine.py`, `LlamaEngine`) — no subprocess, no HTTP round-trips. This matters on macOS, where token-by-token GPU decode collapses ~10x while an inbound HTTP request is in flight, and it avoids reloading the model on every `cf run`. `cacheflow/llama_server_custom.py` still backs the engine with the binary snapshot format and `CooperativeSlotManager`, but it no longer fronts an HTTP server — an earlier Flask-based out-of-process server existed for a multi-client/MCP case that's since been removed, so it was dead weight and has been deleted.
 
 ## Multi-Agent Workflows
 
@@ -176,7 +176,7 @@ Wall-clock time is the headline metric (it's what's actually scarce on local har
 
 - **Wall-clock time** (`prime_time_ms`/`restore_time_ms`, `baseline_prime_time_ms`, `time_saved_ms`): measured directly with `time.time()` around the real `prime_slot`/`restore_slot` calls in `agent.py`.
 - **CPU time** (`prime_cpu_ms`/`restore_cpu_ms`, `baseline_prime_cpu_ms`, `cpu_time_saved_ms`): read from the kernel via `resource.getrusage(RUSAGE_SELF).ru_utime + ru_stime` around the same calls — real per-process CPU accounting, valid because the model runs in-process (no subprocess to lose visibility into).
-- **Compute avoided** (`flops_avoided`): `2 × param_count × tokens_skipped` — the standard forward-pass FLOPs/token formula, computed from two exact inputs: `param_count` read straight off the loaded GGUF via llama.cpp's own C API (`llama_model_n_params`), not parsed from a model-name size tag or file size, and `tokens_skipped` from llama-cpp-python's response metadata. Reported as `N/A` only on the legacy HTTP shim (`server.py`), which has no endpoint exposing model internals and returns `None` rather than fabricate a number.
+- **Compute avoided** (`flops_avoided`): two terms, both exact arithmetic over measured/metadata inputs, no estimation. The first, `2 × param_count × tokens_skipped`, is the standard QKVO-projection + FFN forward-pass FLOPs/token cost, from `param_count` read straight off the loaded GGUF via llama.cpp's own C API (`llama_model_n_params`) and `tokens_skipped` from llama-cpp-python's response metadata. The second, `2 × n_layer × n_embd × tokens_skipped²`, adds the causal self-attention score/weighted-sum cost — these have *no* parameters of their own (attention weights are computed per-query, not learned), so the first term is blind to them entirely, and they scale quadratically with how long the prefill is, not with model size. `n_layer`/`n_embd` come from `LlamaEngine.get_arch_info()`, reading `general.architecture` + `{arch}.block_count`/`{arch}.embedding_length` off the GGUF's own metadata — real architecture dims, not guessed. Reported as `N/A` only when `param_count` itself is unavailable; missing arch metadata alone (an unrecognized architecture) degrades to the param-count-only floor instead of guessing dimensions.
 - **GPU cycles are not reported.** There's no portable way to read actual GPU cycle counters across llama.cpp's backends (Metal, CUDA) from Python without backend-specific profiling tools — rather than guess, this is omitted. FLOPs-avoided is hardware-agnostic (it counts operations skipped regardless of which device would run them), so it's the closest honest stand-in for "compute avoided" on either CPU or GPU.
 - **Token counts** (`tokens_this_session`, `tokens_saved`): never approximated — come directly from llama-cpp-python's response metadata. Useful for context-budget intuition, kept alongside the time/compute metrics rather than as the cost figure.
 - **Context budget sizing**: `ModelTokenizer` (`cacheflow/tokenizer.py`) loads the model with `vocab_only=True` — only the BPE vocabulary tables (~50–100 MB, no weights or KV cache) — giving exact counts for context-packing decisions without a second full model load.
@@ -246,9 +246,8 @@ cacheflow/
 │   ├── cli.py                  # Entry point; all CLI commands
 │   ├── agent.py                # Core loop: restore/prime → save → complete → record HEAD
 │   ├── reasoning_loop.py       # Agentic tool-calling loop (observe→act), decoupled from AgentSession internals
-│   ├── engine.py               # In-process LlamaEngine (primary execution path)
-│   ├── server.py               # Optional HTTP shim: LlamaServer subprocess + client
-│   ├── llama_server_custom.py  # Flask shim + v4 snapshot format + CooperativeSlotManager
+│   ├── engine.py               # In-process LlamaEngine, the only execution path
+│   ├── llama_server_custom.py  # Shared primitives: v4 snapshot format + CooperativeSlotManager
 │   ├── store.py                # SQLite flat store: agents + HEAD snapshot pointers
 │   ├── slot_pool.py            # SlotPool: LRU eviction, concurrency, SlotLease
 │   ├── compressor.py           # Background consolidation (≥70%-of-context threshold)
@@ -278,7 +277,7 @@ cacheflow/
 | `cacheflow/reasoning_loop.py` | Agentic tool-calling loop (`run_agentic`, used by `cf agent`); only touches `AgentSession` through its KV-cache primitives |
 | `cacheflow/engine.py` | In-process `LlamaEngine`; `get_global_engine()` singleton |
 | `cacheflow/cli.py` | All CLI commands; model discovery via ollama/GGUF search; `cf model list`/`cf model use` |
-| `cacheflow/server.py` + `llama_server_custom.py` | Optional HTTP shim; the latter owns the v4 snapshot format and `CooperativeSlotManager` |
+| `cacheflow/llama_server_custom.py` | Shared primitives used by `engine.py`: v4 snapshot format + `CooperativeSlotManager` |
 | `cacheflow/store.py` | SQLite flat store (agent + HEAD snapshot) operations |
 | `cacheflow/slot_pool.py` | Multi-agent slot allocation and LRU eviction |
 | `cacheflow/tokenizer.py` | `ModelTokenizer`: exact BPE token counts, `vocab_only=True` |
@@ -335,7 +334,7 @@ pytest tests/test_agent.py::test_name   # Specific test
 pytest -xvs                             # Stop on first failure, verbose
 ```
 
-A shared `tests/conftest.py` autouse fixture patches `cacheflow.agent.get_tokenizer` with a lightweight fake, so constructing an `AgentSession` in unit tests never loads a real model. Mock `get_global_engine()` (or `get_global_server()` for the HTTP shim) to avoid running a real model; tests needing specific token counts patch `get_tokenizer` inline to override the default fake.
+A shared `tests/conftest.py` autouse fixture patches `cacheflow.agent.get_tokenizer` with a lightweight fake, so constructing an `AgentSession` in unit tests never loads a real model. Mock `get_global_engine()` to avoid running a real model; tests needing specific token counts patch `get_tokenizer` inline to override the default fake.
 
 **Test modules:** `test_agent.py` (incl. model-swap re-prime guard), `test_agentic.py` (the `reasoning_loop.py` tool loop), `test_cli.py` (incl. `cf model list`/`use`), `test_store.py`, `test_config.py`, `test_compressor.py` (incl. model-swap during `consolidate()`), `test_rag_integration.py`, `test_indexer.py`, `test_multi_agent.py`, `test_fixes.py` (regressions incl. snapshot format + `SnapshotGC`), `test_stress.py`, `test_server_smoke.py`, `test_system_questions*.py`, `test_templates.py` (per-model template detection), `test_sandbox.py` (`GitWorktreeSandbox` against a real temp git repo), `test_cli_sandbox.py` (`cf agent`'s sandbox wiring).
 
@@ -349,7 +348,7 @@ A shared `tests/conftest.py` autouse fixture patches `cacheflow.agent.get_tokeni
 **Time/compute efficiency (measured on this repo, 16384 ctx, qwen2.5-coder:7b):**
 - Cold prime (baseline): ~1.8s wall-clock, 9,064 prompt tokens evaluated
 - Warm restore: ~15ms wall-clock, ~5 prompt tokens evaluated
-- Time saved per warm session: ~1.79s wall-clock; compute avoided: ~127 TFLOPs (`2 × params × tokens_skipped`, exact param count via `llama_model_n_params`)
+- Time saved per warm session: ~1.79s wall-clock; compute avoided: ~144 TFLOPs (~127 TFLOPs from `2 × params × tokens_skipped`, exact param count via `llama_model_n_params`, plus ~16.5 TFLOPs from the `2 × n_layer × n_embd × tokens_skipped²` self-attention term — Qwen2.5-Coder-7B's 28 layers / 3584 hidden dim, read off the GGUF's own metadata)
 - Output tokens are the same either way — caching eliminates prefill re-evaluation, not generation
 - Savings scale with codebase size (more tokens skipped) and model size (more FLOPs/token)
 

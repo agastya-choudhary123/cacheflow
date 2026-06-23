@@ -15,18 +15,12 @@ class SnapshotGC:
         self.store = store
         self.snapshots_dir = snapshots_dir
 
-    def collect(
-        self,
-        keep_latest_n: int = 1,
-        dry_run: bool = False,
-        older_than_days: int | None = None,
-    ) -> list[Path]:
-        """Remove old snapshot files.
+    def collect(self, dry_run: bool = False) -> list[Path]:
+        """Remove snapshot files no longer referenced by any agent's HEAD,
+        plus orphaned .tmp_ files from crashed sessions.
 
         Args:
-            keep_latest_n: Keep only the current snapshot (keep_latest_n is ignored)
             dry_run: If True, return the list without deleting anything
-            older_than_days: Not used in simplified mode
 
         Returns:
             List of paths that were deleted (or would be deleted on dry_run)

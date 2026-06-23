@@ -5,8 +5,6 @@ import json
 import logging
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import Optional
-import re
 import subprocess
 
 logger = logging.getLogger(__name__)
@@ -275,23 +273,3 @@ class CodeIndexer:
 
         knowledge["architecture"] = knowledge["architecture"].strip()
         return knowledge
-
-    def load_index(self, index_path: Path) -> Optional[dict]:
-        """
-        Load index from JSON file.
-
-        Args:
-            index_path: Path to index.json
-
-        Returns:
-            Index dict or None if not found
-        """
-        if not index_path.exists():
-            return None
-
-        try:
-            with open(index_path, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            logger.warning(f"Failed to load index: {e}")
-            return None

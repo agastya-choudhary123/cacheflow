@@ -47,8 +47,8 @@ CacheFlow is a **persistent KV cache system for AI agents**. On local hardware t
 
 **Example session (16384 ctx, qwen2.5-coder:7b, this repo):**
 - Session 1 (cold prime): ~1.8s prefill, 9,064 tokens evaluated (baseline recorded: 1800ms prime time, 9,064 tokens)
-- Session 2 (warm restore): ~15ms restore vs. ~1.8s baseline → **~1.79s saved** (real, measured wall-clock and CPU time, not estimated); ~5 tokens evaluated vs. 9,064 baseline → ~9,059 tokens skipped → **~127 TFLOPs avoided** (computed from the model's exact parameter count, not guessed — see below)
-- Every subsequent warm session repeats that ~1.79s / ~127 TFLOPs saving; `cumulative_time_saved_ms`, `cumulative_cpu_time_saved_ms`, and `cumulative_tokens_saved` all accumulate across sessions
+- Session 2 (warm restore): ~15ms restore vs. ~1.8s baseline → **~1.79s saved** (real, measured wall-clock and CPU time, not estimated); ~5 tokens evaluated vs. 9,064 baseline → ~9,059 tokens skipped → **~144 TFLOPs avoided** (~127 TFLOPs from the model's exact parameter count, plus ~16.5 TFLOPs from the context-quadratic self-attention term using its exact n_layer/n_embd — neither guessed, see below)
+- Every subsequent warm session repeats that ~1.79s / ~144 TFLOPs saving; `cumulative_time_saved_ms`, `cumulative_cpu_time_saved_ms`, and `cumulative_tokens_saved` all accumulate across sessions
 - **The headline numbers are wall-clock/CPU time and compute avoided, not a token count** — token savings are reported alongside as a secondary, more-precise-but-less-meaningful-locally metric
 
 ### Key Components
@@ -76,17 +76,17 @@ CacheFlow is a **persistent KV cache system for AI agents**. On local hardware t
 - Key methods: `create_agent`, `get_agent`, `list_agents`, `update_agent_snapshot` (advances HEAD, takes `tokens_saved`, `time_saved_ms`, and `cpu_time_saved_ms`, increments all three cumulative counters), `update_agent_stable_context`, `update_agent_baseline`, `update_agent_time_baseline` (persists `baseline_prime_time_ms`), `update_agent_cpu_time_baseline` (persists `baseline_prime_cpu_ms`), `add_accumulated_tokens`, `update_agent_knowledge_summary` (stores summary + resets accumulator), `update_agent_model` (re-points an agent's stored `model_name`/`model_hash` after a forced re-prime on model swap)
 - `init_db()` is idempotent; call within `_DB_INIT_LOCK` to prevent a SQLite race on first init
 
-**cacheflow/engine.py — `LlamaEngine` (in-process, primary execution path)**
+**cacheflow/engine.py — `LlamaEngine` (in-process, the only execution path)**
 - Runs the model **in the same process** as the agent via llama-cpp-python — no subprocess, no HTTP. This avoids the macOS HTTP decode throttle (~10x slowdown) and reloading the model per `cf run`.
 - `Llama(...)` is constructed with explicit `n_batch=2048, n_ubatch=2048` (vs. the library default 512/512) to speed cold-prefill TTFT; `flash_attn=False` is load-bearing for prefix-match correctness and is left untouched
 - `__init__` reads the model's exact parameter count once via `llama_model_n_params(self.model.model)` (llama.cpp's own C API, not parsed from the model name/file) and caches it on `self.param_count`; `get_param_count()` exposes it for FLOPs-avoided accounting in `agent.py`
+- `__init__` also calls `_read_arch_info()`, which reads `general.architecture` + `{arch}.block_count`/`{arch}.embedding_length` off `Llama.metadata` (the GGUF's own KV store) and caches `{"n_layer", "n_embd"}` on `self.arch_info` (`None` if the arch key or its dims aren't present/parseable); `get_arch_info()` exposes it so `_compute_flops_avoided` can add the context-length-quadratic self-attention term on top of the param-count-only floor
 - Global singleton via `get_global_engine()`; shares one model across all agents
-- Cooperative `CooperativeSlotManager` time-multiplexes up to 8 agents onto the one model, swapping KV state on context switch
-- Same method surface as the HTTP client (`prime_slot`/`restore_slot`/`save_slot`/`completion`) so they're interchangeable
+- Cooperative `CooperativeSlotManager` (llama_server_custom.py) time-multiplexes up to 8 agents onto the one model, swapping KV state on context switch
+- `prime_slot`/`restore_slot`/`save_slot`/`completion` are the engine's full method surface
 
-**cacheflow/server.py + llama_server_custom.py — HTTP shim (optional)**
-- `LlamaServer` (`get_global_server()`) drives the model over a Flask subprocess. Kept only for the multi-client / out-of-process case; the in-process `LlamaEngine` is the default.
-- `llama_server_custom.py` also owns the binary snapshot format (`_write_snapshot`/`_read_snapshot`) and `CooperativeSlotManager`, both shared with the engine.
+**cacheflow/llama_server_custom.py — shared llama-cpp-python primitives**
+- Owns the binary KV-cache snapshot format (`_write_snapshot`/`_read_snapshot`) and `CooperativeSlotManager`, both used directly by `engine.py`. No longer fronts an HTTP server — an earlier Flask-based out-of-process server (`server.py` + a `CustomLlamaServer` class here) was removed since nothing in the live CLI ever used it: `AgentSession`/`reasoning_loop.run_agentic` always construct `self.server` via `get_global_engine()` (in-process), never the HTTP client, and the MCP server that was the original reason to run out-of-process was already removed in an earlier commit.
 
 **cacheflow/slot_pool.py — `SlotPool`**
 - Manages up to 8 concurrent KV cache slots (llama.cpp limit)
@@ -135,7 +135,7 @@ This prevents silent breakage where stale cached knowledge doesn't match updated
 - Token counts were the original headline metric, but on local hardware tokens have no per-unit cost — there's no API bill to point at. What's actually being avoided by restoring a KV snapshot instead of re-priming is a real prefill pass: wall-clock seconds, CPU time, and FLOPs. Every metric below is either a direct measurement off the running process/model or an exact arithmetic computation from measured inputs — none of them are parsed/guessed from a model name, file size, or any other indirect signal.
 - **Wall-clock time** — `agent.py`'s `run()` measures `prime_time_ms` (cold path) and `restore_time_ms` (warm path) with `time.time()` around the actual `prime_slot`/`restore_slot` calls. `agent.baseline_prime_time_ms` stores the most recent cold-prime cost (re-measured on every re-prime, since codebase growth changes it over time); `time_saved_ms = max(0, baseline_prime_time_ms - restore_time_ms)` on the warm path.
 - **CPU time** — `_cpu_time_ms()` (agent.py) reads `resource.getrusage(RUSAGE_SELF).ru_utime + ru_stime`: the kernel's own per-process CPU accounting (sums all threads), sampled around the same prime/restore calls. Since the model runs in-process (`engine.py`, no subprocess), this is real CPU time llama.cpp actually burned, not derived. Tracked in parallel to wall-clock as `prime_cpu_ms`/`restore_cpu_ms` → `baseline_prime_cpu_ms`/`cpu_time_saved_ms` (same baseline/saved pattern as wall-clock time).
-- **Compute avoided (FLOPs)** — `LlamaEngine.__init__` (engine.py) reads the model's *exact* parameter count straight off the loaded GGUF via llama.cpp's own C API, `llama_model_n_params(self.model.model)` — not parsed from the model name or file size. `_compute_flops_avoided(param_count, tokens_skipped)` (agent.py) then computes `2 × param_count × tokens_skipped`: given an exact parameter count and an exact tokens-skipped figure (from llama-cpp-python's response metadata), this is exact arithmetic using the standard, analytically-derived FLOPs/token cost of a dense transformer forward pass — not an approximation layered on a guess. `AgentSession.run()` calls `self.server.get_param_count()`; the optional HTTP shim (`server.py`) doesn't expose model internals over its API surface and returns `None` rather than fabricate a number, so `_compute_flops_avoided` reports `None` (CLI prints "N/A") on that path instead of guessing.
+- **Compute avoided (FLOPs)** — `LlamaEngine.__init__` (engine.py) reads the model's *exact* parameter count straight off the loaded GGUF via llama.cpp's own C API, `llama_model_n_params(self.model.model)` — not parsed from the model name or file size. `_compute_flops_avoided(param_count, tokens_skipped, arch_info)` (agent.py) computes two terms: `2 × param_count × tokens_skipped` (the QKVO-projection + FFN matmuls — the standard "2 FLOPs/param/token" forward-pass cost), plus `2 × n_layer × n_embd × tokens_skipped²` (the causal self-attention score/weighted-sum cost, which has no parameters of its own — attention weights are computed, not learned — so it's invisible to the first term and scales with how many prior tokens each token attends to). The quadratic term isn't a rounding error here: prefill lengths CacheFlow skips run into the thousands of tokens, often comparable to or larger than `n_embd`, exactly where `tokens_skipped²` stops being dominated by the linear term. (Residual adds and layernorm are elementwise, O(n_embd) per token — negligible next to either term, so deliberately not modeled.) `n_layer`/`n_embd` come from `LlamaEngine.get_arch_info()`, which reads `general.architecture` + `{arch}.block_count`/`{arch}.embedding_length` off the GGUF's own metadata (`Llama.metadata`, the same KV store `templates.py` sniffs for `chat_template`) — real architecture dims, not guessed. `AgentSession.run()` calls `self.server.get_param_count()`/`get_arch_info()`; `_compute_flops_avoided` degrades to the param-count-only floor when `arch_info` is unavailable (an unrecognized architecture), or returns `None` entirely (CLI prints "N/A") if `param_count` itself is unavailable.
 - **GPU cycles are deliberately not reported.** There's no portable, reliable way to read actual GPU cycle/utilization counters across llama.cpp's backends (Metal on macOS, CUDA elsewhere) from Python without vendor-specific profiling tools (Instruments, nvml) that aren't wired in here — fabricating a number would violate the same "no guessing" bar as everything above. The FLOPs-avoided figure is hardware-agnostic (it counts actual skipped operations regardless of which device would have run them), so it's the closest honest proxy for "GPU/CPU compute avoided" without GPU-specific instrumentation.
 - `store.py` tracks all three metric families side by side on `Agent`: `baseline_prime_time_ms`/`last_time_saved_ms`/`cumulative_time_saved_ms` (wall-clock, headline), `baseline_prime_cpu_ms`/`last_cpu_time_saved_ms`/`cumulative_cpu_time_saved_ms` (CPU time), and `baseline_tokens_evaluated`/`last_tokens_saved`/`cumulative_tokens_saved` (kept — still useful for context-budget intuition, just not the pitch).
 
@@ -178,7 +178,6 @@ This prevents silent breakage where stale cached knowledge doesn't match updated
 - `get_global_engine()` returns a persistent in-process `LlamaEngine` (model loaded once)
 - Multiple agents don't spawn multiple model processes; KV state is swapped between them
 - Each agent gets an exclusive slot during its session; no contention
-- (`get_global_server()` is the analogous singleton for the optional HTTP shim)
 
 ### No Agent Rewrites Another Agent's History
 - `agent_slot_map` is only used for LRU slot tracking
@@ -206,7 +205,7 @@ This prevents silent breakage where stale cached knowledge doesn't match updated
 
 **Mocking patterns:**
 - `tests/conftest.py` has an **autouse** fixture that patches `cacheflow.agent.get_tokenizer` with a fake tokenizer, so constructing `AgentSession` never loads a real model. Tests needing specific counts patch it inline to override.
-- Mock `get_global_engine()` (or `get_global_server()` for the HTTP shim) to avoid running a real model
+- Mock `get_global_engine()` to avoid running a real model
 - Mock `CodeRetriever` to avoid semantic embeddings during unit tests
 - Fixtures in `test_fixes.py`: `temp_dir`, `config`, `store`, `snapshots_dir` for isolated projects
 
@@ -221,8 +220,8 @@ pytest tests/test_agent.py::test_first_session_primes_and_saves -xvs
 - **cacheflow/agent.py** — Core `AgentSession.run()` loop (restore/prime → save → complete → record HEAD); also `_restore_or_prime()`, the shared restore/prime/model-mismatch primitive used by `reasoning_loop.run_agentic`
 - **cacheflow/reasoning_loop.py** — The agentic tool-calling loop (`run_agentic`, used by `cf agent`); decoupled from `AgentSession` internals, only touches its KV-cache-facing primitives
 - **cacheflow/store.py** — SQLite schema and flat-store (agent + HEAD snapshot) operations, incl. `update_agent_model`
-- **cacheflow/engine.py** — In-process `LlamaEngine` (primary execution path); `get_global_engine()`
-- **cacheflow/server.py** + **llama_server_custom.py** — Optional HTTP shim; the latter owns the v4 snapshot format and `CooperativeSlotManager`
+- **cacheflow/engine.py** — In-process `LlamaEngine`, the only execution path; `get_global_engine()`
+- **cacheflow/llama_server_custom.py** — Shared llama-cpp-python primitives used by `engine.py`: the v4 snapshot format (`_write_snapshot`/`_read_snapshot`) and `CooperativeSlotManager`
 - **cacheflow/tokenizer.py** — Exact token counting via a vocab-only Llama (`get_tokenizer`); the vocab-only model is lazily loaded on first `encode()`/`count()` call, not at `AgentSession` construction
 - **cacheflow/slot_pool.py** — Multi-agent slot allocation and LRU eviction
 - **cacheflow/gc.py** — `SnapshotGC`: reaps snapshots not referenced by any agent HEAD

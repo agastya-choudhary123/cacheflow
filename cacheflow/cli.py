@@ -8,15 +8,13 @@ import click
 
 from cacheflow.agent import AgentSession, DEFAULT_SYSTEM_PROMPT, fork_agent
 from cacheflow.reasoning_loop import run_agentic
-from cacheflow.config import CacheFlowConfig, compute_model_hash, save_config, load_config, register_project
-from cacheflow.server import stop_global_server
+from cacheflow.config import CacheFlowConfig, compute_model_hash, save_config, load_config
 from cacheflow.engine import stop_global_engine
 from cacheflow.store import CacheFlowStore
 from cacheflow.ollama import list_ollama_models, get_ollama_model_path, ollama_is_installed
-from cacheflow.sandbox import GitWorktreeSandbox, SandboxError
+from cacheflow.sandbox import GitWorktreeSandbox
 
 # Register cleanup on exit
-atexit.register(stop_global_server)
 atexit.register(stop_global_engine)
 
 
@@ -129,11 +127,6 @@ def ensure_initialized(
     db_path = base_path / ".cacheflow" / "agents.db"
     store = CacheFlowStore(db_path)
     store.init_db()
-
-    try:
-        register_project(base_path.resolve(), db_path.resolve())
-    except Exception:
-        pass
 
     click.echo(f"✓ Initialized with {model_name}")
     click.echo(f"  Config: {config_file}")
@@ -687,7 +680,7 @@ def repl(base_path):
                 elif cmd == "fork" and len(parts) >= 3:
                     parent = parts[1]
                     child = parts[2]
-                    new_agent = fork_agent(parent, child, base_path)
+                    fork_agent(parent, child, base_path)
                     click.echo(f"✓ Forked '{parent}' → '{child}'\n")
 
                 elif cmd == "model" and len(parts) >= 2:

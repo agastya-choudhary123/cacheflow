@@ -219,6 +219,7 @@ def test_restore_path_computes_time_and_flops_saved(agent_session, temp_dir):
     mock_server.restore_slot = MagicMock()
     mock_server.prime_slot = MagicMock()
     mock_server.get_param_count.return_value = 7_000_000_000  # exact, as read off the real model
+    mock_server.get_arch_info.return_value = None  # no arch metadata on this path -> param-count-only floor
 
     with patch("cacheflow.agent.get_global_engine", return_value=mock_server):
         result = agent_session.run(task="Second task", system_prompt=DEFAULT_SYSTEM_PROMPT, max_tokens=512)
@@ -243,6 +244,28 @@ def test_compute_flops_avoided_uses_exact_param_count():
     # Given an exact param count (read off the loaded model, not guessed),
     # the formula itself (2*N FLOPs/token) is exact arithmetic, not a guess.
     assert _compute_flops_avoided(7_000_000_000, tokens_skipped=100) == 2.0 * 7_000_000_000 * 100
+
+
+def test_compute_flops_avoided_adds_quadratic_attention_term_with_arch_info():
+    # Without arch_info: the param-count-only floor (no notion of context length).
+    floor = _compute_flops_avoided(7_000_000_000, tokens_skipped=9064)
+    # With arch_info (n_layer/n_embd read off the GGUF), the attention score/
+    # weighted-sum cost over a 9064-token prefill is added on top: it's
+    # quadratic in tokens_skipped, so for a prefill this long it's not a
+    # rounding error vs. the linear floor.
+    arch_info = {"n_layer": 32, "n_embd": 4096}
+    with_attention = _compute_flops_avoided(7_000_000_000, tokens_skipped=9064, arch_info=arch_info)
+    expected = floor + 2.0 * 32 * 4096 * (9064 ** 2)
+    assert with_attention == expected
+    assert with_attention > floor
+
+
+def test_compute_flops_avoided_ignores_incomplete_arch_info():
+    # Missing either dim -> fall back to the param-count-only floor rather
+    # than guess the missing one.
+    floor = _compute_flops_avoided(7_000_000_000, tokens_skipped=100)
+    assert _compute_flops_avoided(7_000_000_000, tokens_skipped=100, arch_info={"n_layer": 32}) == floor
+    assert _compute_flops_avoided(7_000_000_000, tokens_skipped=100, arch_info={}) == floor
 
 
 def test_cpu_time_ms_reflects_real_cpu_work():

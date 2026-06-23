@@ -341,17 +341,6 @@ def test_fix12_compressor_no_per_instance_executor(store, config):
     assert _COMPACTION_EXECUTOR is not None
 
 
-# ── Issue 13: OS-assigned port ────────────────────────────────────────────────
-
-def test_fix13_port_is_os_assigned():
-    """_find_available_port uses socket port 0 to get an OS-assigned port."""
-    from cacheflow.server import LlamaServer
-    server = LlamaServer()
-    port = server._find_available_port()
-    assert isinstance(port, int)
-    assert 1024 <= port <= 65535
-
-
 # ── Issue 14: fork_agent fail-fast on missing snapshot ───────────────────────
 
 # ── Issue 15: .gitignore respected in rglob fallback ─────────────────────────
