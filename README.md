@@ -92,24 +92,29 @@ A forked agent's `parent_agent_id` records its lineage and it starts from a copy
 
 KV caching (above) avoids re-evaluating the *prompt*. It doesn't help with **extended thinking tokens** — the cloud-model reasoning that's the real cost in multi-step/multi-agent workflows, since every agent re-reasons about the same problem independently. CacheFlow adds two local, SQLite-backed pools to address that:
 
-- **Thinking block reuse** (`cacheflow/thinking_store.py`, `.cacheflow/thinking.db`): caches an agent's extended-thinking output, keyed by an exact problem hash with a semantic-search fallback (E5-Mistral embeddings via an optional Qdrant index). A query returns one of `use_directly` (>0.90 confidence), `validate` (0.85–0.90, costs a cheap ~100-token validation call), or `re_think` (<0.85). A `PostToolUse` Claude Code hook (`cf thinking capture-block`, wired by `cf install`) pulls thinking blocks out of the session transcript automatically — no manual submission needed.
+- **Thinking block reuse** (`cacheflow/thinking_store.py`, `.cacheflow/thinking.db`): caches an agent's extended-thinking output, keyed by an exact problem hash with a semantic-search fallback (E5-Mistral embeddings via an optional Qdrant index). A query returns one of `use_directly` (>0.90 confidence), `validate` (0.85–0.90, costs a cheap ~100-token validation call), or `re_think` (<0.85). A `PostToolUse` Claude Code hook (`cf thinking capture-block`, wired by `cf install`) pulls thinking blocks out of the session transcript automatically — no manual submission needed, hashing the problem text the same way `query()` does so the hook's own submissions are actually findable later.
 - **Knowledge pool** (`cacheflow/knowledge_store.py`, `.cacheflow/knowledge.db`): one agent's dense summary of a file/region, shared so the next agent reads the summary instead of the raw code. Staleness is automatic — entries are keyed by a content hash of the region, so a query against changed code returns `None` (no separate invalidation logic).
 
 ```bash
 cf install                       # Wire the cacheflow-knowledge skill (Claude Code/Cursor/Codex) + the thinking-capture hook
 
 cf thinking query "implement retry logic" --role implementer
-cf thinking submit --problem-hash HASH --codebase-hash HASH --thinking-file FILE [--role ROLE] [--problem-type TYPE]
+cf thinking stats                # Exact cumulative tokens saved by reuse (see Metrics below)
+cf thinking submit --problem-hash HASH --codebase-hash HASH --thinking-file FILE [--role ROLE] [--problem-type TYPE] [--token-count N]
 cf thinking list [--older-than-days N] [--limit N]
 cf thinking gc [--older-than-days N]
 
 cf knowledge query cacheflow/engine.py --region-hash HASH [--role ROLE]
-cf knowledge submit cacheflow/engine.py --region-hash HASH --summary-file - [--role ROLE] [--source-agent NAME]
+cf knowledge submit cacheflow/engine.py --region-hash HASH --summary-file - [--role ROLE] [--source-agent NAME] [--token-count N]
 cf knowledge list [--region PATH] [--limit N]
 cf knowledge gc [--older-than-days N]
 ```
 
 Both stores degrade gracefully without optional dependencies: if `sentence-transformers`/`qdrant-client` aren't installed or Qdrant isn't reachable, thinking lookups fall back to exact-hash-only (no semantic search) instead of failing. See [`THINKING_REUSE.md`](THINKING_REUSE.md) for the full design (retrieval strategy, confidence thresholds, schema, token economics, failure modes).
+
+### Metrics: Exact Token Savings, Never Guessed From Text Length
+
+`--token-count` on both `submit` commands is the block/summary's real cost — e.g. the Anthropic API's own `usage.output_tokens` for the turn that produced it — and is stored as `NULL` rather than derived from `len(text)` when the caller doesn't have an exact figure (an earlier version used character count as a stand-in, which isn't a token count and would make every savings number fictional). The `PostToolUse` hook attributes `output_tokens` from the transcript's own API response automatically, only when a turn produced exactly one thinking block (splitting a turn-level total across several blocks would itself be a guess). Every exact-hash reuse logs the matched block's real `token_count`; `cf thinking stats` sums those logged values for the headline "tokens saved by reuse" number — exact, not estimated.
 
 ## CLI Reference
 
@@ -158,10 +163,12 @@ cf install [--base-path PATH]
   (.claude/skills, .cursor/rules, .codex/) and register the PostToolUse
   thinking-capture hook in .claude/settings.json. Idempotent.
 
-cf thinking query|submit|list|gc ...
+cf thinking query|stats|submit|list|gc ...
 cf knowledge query|submit|list|gc ...
   Manage the thinking-block and knowledge pools — see "Thinking Block
-  Reuse & Knowledge Sharing" above.
+  Reuse & Knowledge Sharing" above. `cf thinking stats` prints exact
+  cumulative reuse count + tokens saved, summed from real logged token_count
+  values.
 ```
 
 ## How It Works: Technical
