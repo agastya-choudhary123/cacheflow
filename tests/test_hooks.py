@@ -99,6 +99,41 @@ class TestRepoHash:
             assert hooks.compute_repo_hash(Path(tmpdir)) == "no-git"
 
 
+class TestRegionHash:
+    def test_matches_git_hash_object(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir)
+            _init_repo(base_path)
+            file_path = base_path / "file.txt"
+            file_path.write_text("hello\n")
+
+            expected = subprocess.run(
+                ["git", "hash-object", str(file_path)],
+                cwd=base_path, capture_output=True, text=True, check=True,
+            ).stdout.strip()
+
+            assert hooks.compute_region_hash(file_path) == expected
+
+    def test_changes_with_content(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir)
+            _init_repo(base_path)
+            file_path = base_path / "file.txt"
+
+            file_path.write_text("v1")
+            hash_v1 = hooks.compute_region_hash(file_path)
+            file_path.write_text("v2")
+            hash_v2 = hooks.compute_region_hash(file_path)
+
+            assert hash_v1 != hash_v2
+
+    def test_missing_file_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir)
+            _init_repo(base_path)
+            assert hooks.compute_region_hash(base_path / "nope.txt") is None
+
+
 class TestGitDelta:
     def test_reports_changed_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:

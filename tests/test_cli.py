@@ -621,3 +621,88 @@ class TestThinkingCaptureBlockCommand:
         )
 
         assert result.exit_code == 0, result.output
+
+
+class TestKnowledgeCheckBeforeReadCommand:
+    """Test the `cf knowledge check-before-read` PreToolUse hook entry point."""
+
+    def _init_repo(self, base_path):
+        import subprocess
+        subprocess.run(["git", "init", "-q"], cwd=base_path, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=base_path, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=base_path, check=True, capture_output=True)
+
+    def test_blocks_read_on_knowledge_pool_hit(self, runner, temp_dir):
+        import json
+        from cacheflow.hooks import compute_region_hash
+        from cacheflow.knowledge_store import KnowledgeStore
+
+        self._init_repo(temp_dir)
+        file_path = temp_dir / "engine.py"
+        file_path.write_text("print('hello')\n")
+
+        region_hash = compute_region_hash(file_path)
+        store = KnowledgeStore(str(temp_dir / ".cacheflow" / "knowledge.db"))
+        store.submit("engine.py", "Dense summary of engine.py.", "claude", region_hash)
+
+        payload = json.dumps({"tool_name": "Read", "tool_input": {"file_path": str(file_path)}})
+        result = runner.invoke(
+            cli, ["knowledge", "check-before-read", "--base-path", str(temp_dir)], input=payload
+        )
+
+        assert result.exit_code == 2
+        assert "cf knowledge query" in result.output
+
+    def test_allows_read_with_no_cached_summary(self, runner, temp_dir):
+        import json
+
+        self._init_repo(temp_dir)
+        file_path = temp_dir / "engine.py"
+        file_path.write_text("print('hello')\n")
+
+        payload = json.dumps({"tool_name": "Read", "tool_input": {"file_path": str(file_path)}})
+        result = runner.invoke(
+            cli, ["knowledge", "check-before-read", "--base-path", str(temp_dir)], input=payload
+        )
+
+        assert result.exit_code == 0, result.output
+
+    def test_allows_read_when_file_content_changed_since_summary(self, runner, temp_dir):
+        import json
+        from cacheflow.hooks import compute_region_hash
+        from cacheflow.knowledge_store import KnowledgeStore
+
+        self._init_repo(temp_dir)
+        file_path = temp_dir / "engine.py"
+        file_path.write_text("print('v1')\n")
+
+        stale_hash = compute_region_hash(file_path)
+        store = KnowledgeStore(str(temp_dir / ".cacheflow" / "knowledge.db"))
+        store.submit("engine.py", "Summary of the old content.", "claude", stale_hash)
+
+        file_path.write_text("print('v2, edited')\n")  # content changed after the summary was written
+
+        payload = json.dumps({"tool_name": "Read", "tool_input": {"file_path": str(file_path)}})
+        result = runner.invoke(
+            cli, ["knowledge", "check-before-read", "--base-path", str(temp_dir)], input=payload
+        )
+
+        assert result.exit_code == 0, result.output
+
+    def test_ignores_non_read_tools(self, runner, temp_dir):
+        import json
+
+        self._init_repo(temp_dir)
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}})
+        result = runner.invoke(
+            cli, ["knowledge", "check-before-read", "--base-path", str(temp_dir)], input=payload
+        )
+
+        assert result.exit_code == 0, result.output
+
+    def test_malformed_stdin_does_not_raise(self, runner, temp_dir):
+        result = runner.invoke(
+            cli, ["knowledge", "check-before-read", "--base-path", str(temp_dir)], input="not json"
+        )
+
+        assert result.exit_code == 0, result.output

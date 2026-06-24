@@ -38,6 +38,28 @@ def compute_repo_hash(base_path: Path) -> str:
         return "no-git"
 
 
+def compute_region_hash(file_path: Path) -> Optional[str]:
+    """Hash a file's contents the same way `git hash-object <file>` would --
+    the exact convention the cacheflow-knowledge skill instructs agents to
+    use for --region-hash, so a hash computed here matches one a human or
+    agent computed by hand. Returns None (rather than guessing) if the file
+    doesn't exist or git isn't available -- a missing hash means "skip the
+    check", not "treat as a match".
+    """
+    try:
+        if not file_path.is_file():
+            return None
+        result = subprocess.run(
+            ["git", "hash-object", str(file_path)],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip() or None
+    except Exception:
+        return None
+
+
 def compute_git_delta(base_path: Path) -> Dict[str, Any]:
     """Files/lines changed in the working tree, for Layer-2 reuse robustness."""
     try:

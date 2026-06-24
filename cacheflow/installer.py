@@ -83,6 +83,15 @@ _TARGETS = {
 _HOOK_COMMAND = "cf thinking capture-block"
 _HOOK_MATCHER = "*"
 
+# PreToolUse, not advisory: this is the one piece that doesn't depend on the
+# model reading and choosing to follow the skill above. It runs before every
+# Read and, on a knowledge-pool hit for that exact file content, blocks the
+# read (exit code 2) and tells the model to use `cf knowledge query` instead --
+# the model has to act on that before it can proceed, unlike the skill file,
+# which it can simply ignore.
+_PRE_HOOK_COMMAND = "cf knowledge check-before-read"
+_PRE_HOOK_MATCHER = "Read"
+
 
 def install(base_path: Path) -> List[Tuple[str, str]]:
     """Write skill/rule files for every supported harness.
@@ -111,9 +120,11 @@ def install(base_path: Path) -> List[Tuple[str, str]]:
     return results
 
 
-def install_hook(base_path: Path) -> str:
-    """Idempotently register the PostToolUse capture-block hook in
-    .claude/settings.json. Returns "created", "updated", or "unchanged".
+def _register_command_hook(base_path: Path, event: str, matcher: str, command: str) -> str:
+    """Idempotently register a single command hook under `event` (e.g.
+    "PostToolUse", "PreToolUse") in .claude/settings.json. Returns "created",
+    "updated", or "unchanged". Shared by install_hook/install_pretooluse_hook
+    so both follow the identical existing-entry-scan-before-append pattern.
     """
     settings_path = base_path / ".claude" / "settings.json"
     settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -129,13 +140,13 @@ def install_hook(base_path: Path) -> str:
         existed = False
 
     hooks = settings.setdefault("hooks", {})
-    post_tool_use = hooks.setdefault("PostToolUse", [])
+    event_hooks = hooks.setdefault(event, [])
 
     # Each entry is {"matcher": ..., "hooks": [{"type": "command", "command": ...}]}.
-    # Look for one already running our capture command, under any matcher.
+    # Look for one already running this command, under any matcher.
     already_present = any(
-        any(h.get("command") == _HOOK_COMMAND for h in entry.get("hooks", []))
-        for entry in post_tool_use
+        any(h.get("command") == command for h in entry.get("hooks", []))
+        for entry in event_hooks
         if isinstance(entry, dict)
     )
 
@@ -145,11 +156,31 @@ def install_hook(base_path: Path) -> str:
             return "created"
         return "unchanged"
 
-    post_tool_use.append(
+    event_hooks.append(
         {
-            "matcher": _HOOK_MATCHER,
-            "hooks": [{"type": "command", "command": _HOOK_COMMAND}],
+            "matcher": matcher,
+            "hooks": [{"type": "command", "command": command}],
         }
     )
     settings_path.write_text(json.dumps(settings, indent=2) + "\n")
     return "created" if not existed else "updated"
+
+
+def install_hook(base_path: Path) -> str:
+    """Idempotently register the PostToolUse capture-block hook in
+    .claude/settings.json. Returns "created", "updated", or "unchanged".
+    """
+    return _register_command_hook(base_path, "PostToolUse", _HOOK_MATCHER, _HOOK_COMMAND)
+
+
+def install_pretooluse_hook(base_path: Path) -> str:
+    """Idempotently register the PreToolUse check-before-read hook in
+    .claude/settings.json. Returns "created", "updated", or "unchanged".
+
+    Unlike the skill file (which the model can simply not read or not
+    follow), this is enforced: it runs before every Read, and on a
+    knowledge-pool hit for that exact file content it blocks the read
+    (exit code 2, see cli.py's knowledge_check_before_read) and tells the
+    model to use `cf knowledge query` instead.
+    """
+    return _register_command_hook(base_path, "PreToolUse", _PRE_HOOK_MATCHER, _PRE_HOOK_COMMAND)

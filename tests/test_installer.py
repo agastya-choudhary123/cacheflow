@@ -105,3 +105,50 @@ class TestInstallHook:
             ]
             assert "echo hi" in commands
             assert "cf thinking capture-block" in commands
+
+
+class TestInstallPreToolUseHook:
+    def test_creates_hook_in_fresh_settings(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir)
+            result = installer.install_pretooluse_hook(base_path)
+
+            assert result == "created"
+            settings = json.loads((base_path / ".claude" / "settings.json").read_text())
+            pre_tool_use = settings["hooks"]["PreToolUse"]
+            assert any(
+                h.get("command") == "cf knowledge check-before-read"
+                for entry in pre_tool_use
+                for h in entry.get("hooks", [])
+            )
+            assert any(entry.get("matcher") == "Read" for entry in pre_tool_use)
+
+    def test_idempotent_no_duplicate_hook_entries(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir)
+            installer.install_pretooluse_hook(base_path)
+            result = installer.install_pretooluse_hook(base_path)
+
+            assert result == "unchanged"
+            settings = json.loads((base_path / ".claude" / "settings.json").read_text())
+            matching = [
+                h for entry in settings["hooks"]["PreToolUse"] for h in entry.get("hooks", [])
+                if h.get("command") == "cf knowledge check-before-read"
+            ]
+            assert len(matching) == 1
+
+    def test_coexists_with_post_tool_use_hook(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir)
+            installer.install_hook(base_path)
+            installer.install_pretooluse_hook(base_path)
+
+            settings = json.loads((base_path / ".claude" / "settings.json").read_text())
+            post_commands = [
+                h.get("command") for entry in settings["hooks"]["PostToolUse"] for h in entry.get("hooks", [])
+            ]
+            pre_commands = [
+                h.get("command") for entry in settings["hooks"]["PreToolUse"] for h in entry.get("hooks", [])
+            ]
+            assert "cf thinking capture-block" in post_commands
+            assert "cf knowledge check-before-read" in pre_commands

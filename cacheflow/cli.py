@@ -163,13 +163,18 @@ def init(ctx_size, n_gpu_layers, base_path):
 @click.option("--base-path", default=".", help="Project root")
 def install(base_path):
     """Install the knowledge-sharing skill/rule files (Claude Code, Cursor,
-    Codex) and wire the PostToolUse hook that captures extended thinking
-    blocks. Safe to run repeatedly -- unchanged targets are left as-is.
+    Codex) and wire two hooks: a PostToolUse hook that captures extended
+    thinking blocks, and a PreToolUse hook that blocks a Read when a
+    knowledge-pool summary already exists for that exact file content (the
+    one enforced piece -- everything else is advisory skill text the model
+    can choose to follow or not). Safe to run repeatedly -- unchanged
+    targets are left as-is.
     """
     try:
         base_path = Path(base_path)
         results = installer.install(base_path)
-        hook_result = installer.install_hook(base_path)
+        post_hook_result = installer.install_hook(base_path)
+        pre_hook_result = installer.install_pretooluse_hook(base_path)
 
         click.echo("Skill/rule files:")
         for rel_path, action in results:
@@ -177,7 +182,8 @@ def install(base_path):
             click.echo(f"  {marker} {rel_path} ({action})")
 
         click.echo()
-        click.echo(f"PostToolUse hook (.claude/settings.json): {hook_result}")
+        click.echo(f"PostToolUse hook -- thinking capture (.claude/settings.json): {post_hook_result}")
+        click.echo(f"PreToolUse hook -- knowledge-pool enforcement on Read (.claude/settings.json): {pre_hook_result}")
     except Exception as e:
         raise click.ClickException(str(e))
 
@@ -955,6 +961,64 @@ def knowledge_query(region, role, region_hash, base_path):
             click.echo(f"No knowledge summary found for {region}.")
     except Exception as e:
         raise click.ClickException(str(e))
+
+
+@knowledge.command("check-before-read")
+@click.option("--base-path", default=".", help="Project root")
+def knowledge_check_before_read(base_path):
+    """Claude Code PreToolUse hook entry point (matcher: Read). Unlike the
+    cacheflow-knowledge skill -- advisory text the model can simply not
+    read or not follow -- this is enforced: on a knowledge-pool hit for the
+    exact file content about to be read, it blocks the Read (exit code 2,
+    which Claude Code surfaces to the model as feedback it must act on
+    before retrying) and tells the model to use `cf knowledge query`
+    instead. Best-effort otherwise: any ambiguity (missing payload, no git,
+    no stored summary) allows the read through rather than guessing.
+    """
+    import sys
+
+    try:
+        base_path = Path(base_path)
+        payload = json.loads(sys.stdin.read() or "{}")
+        if payload.get("tool_name") != "Read":
+            return
+
+        file_path = (payload.get("tool_input") or {}).get("file_path")
+        if not file_path:
+            return
+
+        resolved = Path(file_path)
+        if not resolved.is_absolute():
+            resolved = base_path / resolved
+        resolved = resolved.resolve()
+
+        region_hash = thinking_hooks.compute_region_hash(resolved)
+        if not region_hash:
+            return  # no git / missing file -- nothing to check against
+
+        try:
+            region = str(resolved.relative_to(base_path.resolve()))
+        except ValueError:
+            region = str(resolved)
+
+        db_path = base_path / ".cacheflow" / "knowledge.db"
+        store = KnowledgeStore(str(db_path))
+        summary = store.query(region, current_region_hash=region_hash)
+        if not summary:
+            return  # no cached summary for this exact content -- read normally
+
+        sys.stderr.write(
+            f"A knowledge summary already exists for {region} (content unchanged "
+            f"since it was written). Run this instead of reading the raw file:\n\n"
+            f'  cf knowledge query "{region}" --region-hash {region_hash}\n\n'
+            "It costs far fewer tokens than the raw file and was written by a prior "
+            "agent specifically to save you from re-reading and re-understanding it.\n"
+        )
+        sys.exit(2)
+    except Exception:
+        # Never let a hook failure block a real read it has no informed
+        # opinion about.
+        return
 
 
 @knowledge.command("submit")
