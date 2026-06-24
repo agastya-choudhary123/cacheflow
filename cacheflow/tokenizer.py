@@ -37,32 +37,42 @@ class ModelTokenizer:
     def __init__(self, model_path: str) -> None:
         self._model_path = model_path
         self._model = None
+        self._load_lock = threading.Lock()
 
     def _ensure_loaded(self) -> None:
         if self._model is not None:
             return
-        try:
-            from llama_cpp import Llama
-        except ImportError:
-            raise ImportError(
-                "llama-cpp-python is required for tokenization. "
-                "Install with: pip install llama-cpp-python"
-            )
+        # get_tokenizer()'s registry lock only guards which ModelTokenizer
+        # instance callers get back -- it doesn't protect this lazy load. Without
+        # this lock, concurrent agents calling .count()/.encode() for the first
+        # time race into constructing a second llama_cpp.Llama against the same
+        # GGUF file simultaneously, which crashes natively (SIGABRT, no Python
+        # traceback) rather than raising a catchable exception.
+        with self._load_lock:
+            if self._model is not None:
+                return
+            try:
+                from llama_cpp import Llama
+            except ImportError:
+                raise ImportError(
+                    "llama-cpp-python is required for tokenization. "
+                    "Install with: pip install llama-cpp-python"
+                )
 
-        try:
-            self._model = Llama(
-                model_path=self._model_path,
-                vocab_only=True,
-                verbose=False,
-            )
-        except TypeError:
-            # Older llama-cpp-python without vocab_only parameter
-            self._model = Llama(
-                model_path=self._model_path,
-                n_ctx=128,
-                n_gpu_layers=0,
-                verbose=False,
-            )
+            try:
+                self._model = Llama(
+                    model_path=self._model_path,
+                    vocab_only=True,
+                    verbose=False,
+                )
+            except TypeError:
+                # Older llama-cpp-python without vocab_only parameter
+                self._model = Llama(
+                    model_path=self._model_path,
+                    n_ctx=128,
+                    n_gpu_layers=0,
+                    verbose=False,
+                )
 
     def encode(self, text: str) -> list[int]:
         """Return the exact token IDs for text."""
