@@ -17,7 +17,7 @@ pip install -e ".[dev]"
 
 **Wire CacheFlow into a coding harness (Claude Code, Cursor, or Codex):**
 ```bash
-cf install                           # Render the cacheflow-knowledge skill + register the PostToolUse capture hook
+cf install                           # Render the cacheflow-knowledge skill + register the PostToolUse capture hook + the PreToolUse enforcement hook
 cf thinking query "implement retry logic" --role implementer  # Check the thinking-block cache before re-reasoning
 cf thinking stats                    # Exact cumulative tokens saved by reuse (sums real, logged token_count values)
 cf knowledge query cacheflow/engine.py --region-hash HASH      # Check the knowledge pool before re-reading a file
@@ -60,6 +60,8 @@ pytest tests/test_installer.py             # cf install rendering + hook wiring
 - `install(base_path)`: renders the same skill-body content (`_SKILL_BODY`) into harness-specific wrappers — `.claude/skills/cacheflow-knowledge.md`, `.cursor/rules/cacheflow-knowledge.mdc`, `.codex/cacheflow-knowledge.md` — so every harness gets the same "check the pool before reading, submit a summary after working" instructions in its own format.
 - Idempotent by content comparison: a target whose existing content already matches the rendered content is left untouched (reported `"unchanged"`); otherwise `"created"`/`"updated"`.
 - `install_hook(base_path)`: registers `cf thinking capture-block` as a `PostToolUse` hook in `.claude/settings.json`, scanning existing `hooks.PostToolUse` entries for the same command under any matcher before appending, so re-running `cf install` never double-registers it.
+- `install_pretooluse_hook(base_path)`: registers `cf knowledge check-before-read` as a `PreToolUse` hook matched on `Read`. Both hook registrations share `_register_command_hook(base_path, event, matcher, command)`, the same idempotent scan-before-append logic generalized over the event name.
+- **This is the one piece of the cloud-models system that's actually enforced, not advisory.** The skill file tells an external agent to run `cf knowledge query` before reading a file; the agent can simply not read the skill, or read it and not comply. `cf knowledge check-before-read` (cli.py's `knowledge_check_before_read`) runs before every `Read` regardless: it reads the PreToolUse JSON payload from stdin, extracts `tool_input.file_path`, hashes the file's current content (`hooks.compute_region_hash`, matching the skill's documented `git hash-object` convention), and queries `KnowledgeStore`. On a hit, it writes a redirect message to stderr and exits with code 2 — Claude Code surfaces that to the model as feedback it must act on before the Read can proceed, rather than silently letting a redundant read through. On any ambiguity (non-`Read` tool, missing payload, no git, no cached summary) it returns 0 and allows the read — the hook has an informed opinion only on an exact-hash hit, never a guess.
 
 ## Design Patterns & Key Decisions
 
@@ -80,18 +82,27 @@ pytest tests/test_installer.py             # cf install rendering + hook wiring
 - Both follow the same staleness philosophy as the KV engine's `stable_context_hash` comparison: a content hash (`codebase_hash`/`region_hash`) is computed at write time and compared at read time, so a changed codebase or file silently invalidates the cached entry instead of needing an explicit expiry/invalidation call.
 
 ### Hook Failures Are Silent By Design
-- `cf thinking capture-block` (the `PostToolUse` hook entry point) must never raise into the agent it's attached to — it wraps its entire body in a bare `except Exception: pass`; a broken hook should silently no-op, not break the run it's hooked into.
+- `cf thinking capture-block` (the `PostToolUse` hook entry point) must never raise into the agent it's attached to — it wraps its entire body in a bare `except Exception: pass`; a broken hook should silently no-op, not break the run it's hooked into. `knowledge_check_before_read` follows the same rule for anything *other* than a deliberate exit-code-2 block: its `except Exception: return` never swallows the intentional `sys.exit(2)` path (`SystemExit` isn't an `Exception` subclass), but any unrelated failure allows the read through rather than blocking on an error it has no informed opinion about.
+
+### Give the Local Agentic Loop the Same Tools, Not Just the External Skill
+- `cf agent`'s own loop (`reasoning_loop.py`/`tools.py`) used to have zero awareness that `cf`'s CLI, or these two pools, existed — its tool palette was `read_file`/`write_file`/`edit_file`/`grep`/`list_dir`/`syntax_check`/`run_bash`/`finish`, none of which touch `ThinkingStore`/`KnowledgeStore`, and `tools_help()` (what the model actually sees in its system preamble) never mentioned `cf` commands. A local model running `cf agent` got none of the reuse benefit the cacheflow-knowledge skill gives an external Claude Code/Cursor/Codex agent.
+- Fixed by adding `knowledge_query`/`knowledge_submit`/`thinking_query` directly to `tools.py`'s `TOOLS` registry, calling `KnowledgeStore`/`ThinkingStore` in-process rather than shelling out to `cf` itself (no recursive subprocess, no second DB connection to reconcile). `_build_agentic_preamble` (reasoning_loop.py) now also tells the model to try `knowledge_query`/`thinking_query` before reading/reasoning and `knowledge_submit` after a meaningful unit of work — the same guidance the skill gives an external agent, but as part of this loop's own tool-use instructions rather than a file the model would have no reason to look for.
+- Also added `cacheflow_status` (works on both halves of this repo, local KV engine included): `ToolContext` now carries `agent_name`/`store` (set from `session.agent_name`/`session.store` in `run_agentic`), so the model can check its own baseline/cumulative token-savings mid-loop without shelling out to a second `cf status` process and re-parsing its stdout.
+- These are query/submit tools the model chooses to use, same as the skill — there's no enforcement equivalent to the `PreToolUse` hook for this loop, since that hook is Claude-Code-harness-specific (it intercepts the harness's own `Read` tool call) and this loop has no separate harness sitting between the model and `tools.py`'s `execute()` to intercept.
 
 ## Testing
 
 **Test modules for this branch's system:**
 - `test_thinking_reuse.py` — `ThinkingStore` (exact-hash lookup, semantic search/confidence tiers, reuse logging, GC) and `KnowledgeStore` (region-hash staleness, role fallback, supersession) plus integration tests across both
-- `test_hooks.py` — Transcript parsing for the thinking-capture hook (`extract_thinking_blocks_from_transcript`, `compute_repo_hash`, `compute_git_delta`, `classify_task`, `output_tokens` attribution)
-- `test_installer.py` — `cf install`'s skill/rule rendering (content-equality idempotency) and `PostToolUse` hook registration (no double-registration on repeat runs)
+- `test_hooks.py` — Transcript parsing for the thinking-capture hook (`extract_thinking_blocks_from_transcript`, `compute_repo_hash`, `compute_git_delta`, `classify_task`, `output_tokens` attribution) plus `compute_region_hash` (`TestRegionHash`: matches `git hash-object`, changes with content, `None` on a missing file)
+- `test_installer.py` — `cf install`'s skill/rule rendering (content-equality idempotency), `PostToolUse` hook registration, and `PreToolUse` hook registration (`TestInstallPreToolUseHook`: created/idempotent/coexists-with-PostToolUse)
+- `test_cli.py::TestKnowledgeCheckBeforeReadCommand` — the `cf knowledge check-before-read` hook entry point itself: blocks (exit 2) on a knowledge-pool hit, allows through on no hit / stale hit / non-`Read` tool / malformed stdin
+- `test_agentic.py` — alongside the local KV-loop's own tests, covers the new `knowledge_query`/`knowledge_submit`/`thinking_query`/`cacheflow_status` tools added to that loop's `TOOLS` registry
 
 **Mocking patterns:**
 - `tests/conftest.py` has an **autouse** fixture that patches `cacheflow.agent.get_tokenizer` with a fake tokenizer, so constructing an `AgentSession` (used by the local KV engine, below) never loads a real model.
 - Fixtures in `test_fixes.py`: `temp_dir`, `config`, `store`, `snapshots_dir` for isolated projects.
+- Tests for `compute_region_hash`/`knowledge_check_before_read`/the local loop's pool tools need a real git repo (`git hash-object` is shelled out to), not just a bare `temp_dir` — see `_init_repo`/`_init_git_repo` helpers in `test_hooks.py`/`test_cli.py`/`test_agentic.py`.
 
 The local KV-cache engine has its own, larger test suite (`test_agent.py`, `test_agentic.py`, `test_store.py`, `test_compressor.py`, `test_sandbox.py`, `test_templates.py`, etc.) covering the unrelated prefix-matching/restore path — see "Also in This Repo" below if you're touching that code.
 
@@ -99,10 +110,11 @@ The local KV-cache engine has its own, larger test suite (`test_agent.py`, `test
 
 - **cacheflow/thinking_store.py** — `ThinkingStore`: exact-hash + semantic (Qdrant/E5-Mistral) retrieval of cached extended-thinking blocks, with confidence-gated reuse and exact reuse-savings logging
 - **cacheflow/knowledge_store.py** — `KnowledgeStore`: shared region summaries with automatic hash-based staleness
-- **cacheflow/hooks.py** — Transcript/repo-hash/git-delta helpers backing `cf thinking capture-block`
-- **cacheflow/installer.py** — `cf install`: idempotent skill/rule file rendering per harness + `PostToolUse` hook registration
+- **cacheflow/hooks.py** — Transcript/repo-hash/git-delta helpers backing `cf thinking capture-block`, plus `compute_region_hash` (the `git hash-object` convention shared by the skill, `cf knowledge submit`, and `knowledge_check_before_read`)
+- **cacheflow/installer.py** — `cf install`: idempotent skill/rule file rendering per harness + `PostToolUse`/`PreToolUse` hook registration (`_register_command_hook` is the shared idempotency logic for both)
 - **THINKING_REUSE.md** — Design doc for the thinking-reuse/knowledge-pool system: retrieval strategy, schema, latency budget, token economics, failure modes
-- **cacheflow/cli.py** — Also owns this branch's CLI surface: `cf install`, `cf thinking query|stats|submit|list|gc`, `cf knowledge query|submit|list|gc`
+- **cacheflow/cli.py** — Also owns this branch's CLI surface: `cf install`, `cf thinking query|stats|submit|list|gc`, `cf knowledge query|submit|list|gc|check-before-read`
+- **cacheflow/tools.py** — Shared by both halves of this repo: the local agentic loop's tool palette, now including `knowledge_query`/`knowledge_submit`/`thinking_query` (native, in-process calls into `ThinkingStore`/`KnowledgeStore`) and `cacheflow_status`
 - **pyproject.toml** — Package metadata, dependencies, CLI entrypoint
 
 ## Development Notes

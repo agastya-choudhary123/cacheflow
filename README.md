@@ -75,15 +75,34 @@ cf knowledge query cacheflow/engine.py --region-hash HASH
 cf thinking stats
 ```
 
-`cf install` is idempotent — re-running it compares rendered content before writing, and the hook registration scans existing `PostToolUse` entries before appending, so re-running it never double-registers anything.
+`cf install` is idempotent — re-running it compares rendered content before writing, and the hook registration scans existing `PostToolUse`/`PreToolUse` entries before appending, so re-running it never double-registers anything.
+
+## Enforcement: A PreToolUse Hook, Not Just an Advisory Skill
+
+Everything above the capture hook is advisory: the skill file tells an external agent to check the knowledge pool before reading a file, but the agent can simply not read the skill, or read it and not comply. `cf install` also registers a second hook — `cf knowledge check-before-read`, matched on `PreToolUse:Read` — that doesn't depend on the model cooperating.
+
+It runs before every `Read`: hashes the file's current content the same way the skill instructs a human/agent to (`git hash-object`), checks the knowledge pool for that exact hash, and on a hit, blocks the read (exit code 2) with a message telling the model to run `cf knowledge query` instead. Claude Code surfaces that as feedback the model has to act on before the read can proceed — a real redirect, not a suggestion it can ignore. On anything else (no hit, stale hit, non-`Read` tool, missing git) it allows the read through; the hook only ever acts on an exact match, never a guess.
+
+```bash
+cf install                       # also registers this hook now
+echo '{"tool_name": "Read", "tool_input": {"file_path": "cacheflow/engine.py"}}' \
+  | cf knowledge check-before-read   # what Claude Code actually runs, for testing by hand
+```
 
 ## CLI Reference
 
 ```
 cf install [--base-path PATH]
   Write the cacheflow-knowledge skill/rule to every supported harness
-  (.claude/skills, .cursor/rules, .codex/) and register the PostToolUse
-  thinking-capture hook in .claude/settings.json. Idempotent.
+  (.claude/skills, .cursor/rules, .codex/) and register two hooks in
+  .claude/settings.json: a PostToolUse thinking-capture hook, and a
+  PreToolUse hook (matched on Read) that blocks a redundant read on a
+  knowledge-pool hit -- see "Enforcement" above. Idempotent.
+
+cf knowledge check-before-read
+  PreToolUse hook entry point (not normally run by hand). Reads the hook
+  payload from stdin; exits 2 (blocking the Read) on a knowledge-pool hit
+  for that exact file content, else exits 0.
 
 cf thinking query PROBLEM [--role ROLE]
   Check the thinking-block cache before re-reasoning. Returns one of
@@ -129,7 +148,24 @@ The hook hashes the problem text the same way `ThinkingStore.query()` does, so w
 
 **Two independent stores for two independent costs.** Thinking-block reuse and knowledge sharing don't share storage, schema, or invalidation logic, because the costs they avoid — regenerated reasoning vs. re-derived understanding — are genuinely orthogonal, even though both follow the same content-hash staleness pattern (`codebase_hash`/`region_hash` computed at write time, compared at read time).
 
-**Hook failures are silent by design.** `cf thinking capture-block` wraps its entire body in a bare `except Exception: pass` — a broken hook should no-op, not break the agent run it's attached to.
+**Hook failures are silent by design.** `cf thinking capture-block` wraps its entire body in a bare `except Exception: pass` — a broken hook should no-op, not break the agent run it's attached to. `knowledge_check_before_read` follows the same rule for everything except its one deliberate `sys.exit(2)` block path.
+
+**Enforcement where it's actually possible, advisory where it isn't.** The `PreToolUse` hook exists because Claude Code gives a harness-level interception point for `Read`; there's no equivalent interception point inside this loop's own model-driven tool dispatch (see below), so the local loop's reuse tools stay query/submit-and-hope, same as the skill.
+
+## The Local Agentic Loop Gets the Same Tools
+
+`cf agent`'s own loop (the local, llama.cpp-driven half of this repo, below) used to have no idea any of the above existed — its tool palette was read/write/edit/grep/bash/finish, none of which touched `ThinkingStore`/`KnowledgeStore`, and its system preamble never mentioned `cf` commands. A local model running `cf agent` got none of this branch's reuse benefit.
+
+Fixed by adding three tools directly to that loop's palette, calling the stores in-process rather than shelling out to `cf` itself:
+
+```
+knowledge_query {"path": "rel/path", "role"?: "..."}     — check the pool before reading a file
+knowledge_submit {"path": "rel/path", "summary": "..."}  — submit a summary after analyzing one (needs --auto)
+thinking_query {"problem": "description", "role"?: "..."} — check the pool before reasoning at length
+cacheflow_status {}                                        — this agent's own baseline/cumulative token-savings
+```
+
+The loop's system preamble now tells the model to try `knowledge_query`/`thinking_query` before reading/reasoning and `knowledge_submit` after a meaningful unit of work — the same guidance the skill gives an external agent, but built into this loop's own instructions instead of a file the model would have no reason to look for. There's no `PreToolUse`-style enforcement for this path (see "Enforcement where it's actually possible" above) — it's the same query/submit-and-hope as the skill, just available at all, which it wasn't before.
 
 ## Also in This Repo: Local KV Caching for Self-Hosted Models
 
