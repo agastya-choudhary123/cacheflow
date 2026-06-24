@@ -13,6 +13,7 @@ reloading the 7B model on every `cf run` and the per-call snapshot disk
 round-trips.
 """
 
+import atexit
 import logging
 import time
 import uuid
@@ -151,7 +152,16 @@ class LlamaEngine:
             return None
 
     def stop(self) -> None:
-        # Llama frees native resources on GC; nothing to tear down explicitly.
+        # Explicit close (not just dropping the reference) matters when this
+        # process also holds a second Llama instance (e.g. the tokenizer's
+        # vocab-only model, cacheflow/tokenizer.py): letting both get freed
+        # implicitly via GC/interpreter shutdown races in ggml-metal's global
+        # device manager and crashes with "GGML_ASSERT([rsets->data count]
+        # == 0) failed" (SIGABRT) at exit, even though all real inference
+        # work already completed successfully. Closing deterministically
+        # while the process is still otherwise healthy avoids that race.
+        if self.model is not None:
+            self.model.close()
         self.model = None
 
     # ── model operations ──────────────────────────────────────────────────────
@@ -305,6 +315,31 @@ class LlamaEngine:
 # ── Global in-process singleton ───────────────────────────────────────────────
 _GLOBAL_ENGINE: Optional[LlamaEngine] = None
 _ENGINE_LOCK = Lock()
+_atexit_teardown_registered = False
+
+
+def _atexit_teardown_models() -> None:
+    """Explicitly free every loaded Llama instance, tokenizer model(s) before
+    the main engine model, before the interpreter starts its own shutdown
+    teardown. Two (or more) Llama instances left to be freed implicitly by
+    GC/interpreter shutdown race in ggml-metal's global device manager and
+    SIGABRT with "GGML_ASSERT([rsets->data count] == 0) failed" -- closing
+    them ourselves, in a fixed order, while the process is still healthy
+    avoids that race. Order doesn't matter for correctness (no caller still
+    needs either model by exit time); the tokenizer-first order just keeps
+    the most recently constructed instance (usually the main model) closed
+    last.
+    """
+    from cacheflow.tokenizer import _tokenizer_registry
+
+    for tok in list(_tokenizer_registry.values()):
+        if tok._model is not None:
+            tok._model.close()
+            tok._model = None
+
+    global _GLOBAL_ENGINE
+    if _GLOBAL_ENGINE is not None and _GLOBAL_ENGINE.model is not None:
+        _GLOBAL_ENGINE.stop()
 
 
 def get_global_engine(
@@ -314,7 +349,7 @@ def get_global_engine(
     n_gpu_layers: int = 99,
 ) -> LlamaEngine:
     """Get or create the process-wide in-process engine (loads the model once)."""
-    global _GLOBAL_ENGINE
+    global _GLOBAL_ENGINE, _atexit_teardown_registered
     with _ENGINE_LOCK:
         if _GLOBAL_ENGINE is None or not _GLOBAL_ENGINE.is_running():
             _GLOBAL_ENGINE = LlamaEngine(
@@ -323,6 +358,9 @@ def get_global_engine(
                 ctx_size=ctx_size,
                 n_gpu_layers=n_gpu_layers,
             )
+        if not _atexit_teardown_registered:
+            atexit.register(_atexit_teardown_models)
+            _atexit_teardown_registered = True
         return _GLOBAL_ENGINE
 
 
