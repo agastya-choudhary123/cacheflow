@@ -57,15 +57,25 @@ class LlamaEngine:
             model_path=model_path,
             n_ctx=ctx_size,
             n_gpu_layers=n_gpu_layers,
-            # flash_attn must stay OFF: it makes llama.cpp's *partial*
-            # kv_cache_seq_rm fail, and llama-cpp-python falls back to
-            # re-evaluating the ENTIRE prompt whenever a new prompt diverges from
-            # the cached tokens before their end. The agentic loop appends an
-            # observation after each turn, so it would re-prefill the whole
-            # codebase (~7k tokens) every step. Keeping flash_attn off lets the
-            # prefix match reuse the KV and evaluate only the new tokens — the
-            # whole point of CacheFlow — at the cost of ~18% decode throughput.
-            flash_attn=False,
+            # flash_attn=True: with it OFF, this llama-cpp-python build cannot
+            # decode a prompt that needs more than one n_batch chunk at all —
+            # any eval() past the first n_batch tokens fails outright with
+            # "llama_decode returned -3" / "failed to find a memory slot for
+            # batch" (reproduced directly against llama_cpp.Llama, independent
+            # of CacheFlow's own code, on both qwen3:8b and qwen2.5-coder:7b).
+            # Since priming a real codebase's stable_context is almost always
+            # >2048 tokens, flash_attn=False made priming fail unconditionally
+            # for any non-trivial project — previously masked because every
+            # prior test/demo here only ever primed a tiny (<2048-token) RAG
+            # slice. flash_attn=True fixes that, and prefix-match/restore
+            # correctness was re-verified directly against llama_cpp.Llama
+            # after switching: exact full-length lcp match after a save/
+            # restore round-trip on an 8k+-token prime, and a completion whose
+            # prompt diverges mid-cache (forcing a partial kv_cache_seq_rm —
+            # the scenario this flag used to guard against) still succeeds and
+            # reuses the cache (~2.4x faster than an equivalent cold eval,
+            # not a full re-prefill fallback).
+            flash_attn=True,
             # Library default is 512/512. The cold-start prime evaluates the
             # entire codebase prefix (often several thousand tokens) in one
             # call; a larger logical batch (n_batch) lets llama.cpp submit more
