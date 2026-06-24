@@ -155,10 +155,27 @@ def run_agentic(
         gen_time_ms = 0
         final_answer: Optional[str] = None
         completed = False
+        last_content: Optional[str] = None
+        repeat_count = 0
 
         for _ in range(max_steps):
+            prompt = stable_prefix + convo
+            # A model stuck repeating the same malformed action (e.g. unescaped
+            # quotes in ARGS JSON) grows convo every step without making
+            # progress; without this guard the loop runs prompt straight into
+            # the engine and crashes with "Requested tokens exceed context
+            # window" instead of returning whatever partial progress it made.
+            if session._tokenizer.count(prompt) + max_tokens_per_step >= session.config.ctx_size:
+                steps.append(AgentStep(
+                    "(context_limit)", {},
+                    "Stopped: the conversation grew too large for the context "
+                    "window before the task finished. This usually means the "
+                    "model got stuck repeating a failing action -- see the "
+                    "preceding steps for the loop it was stuck in.",
+                ))
+                break
             resp = session.server.completion(
-                prompt=stable_prefix + convo,
+                prompt=prompt,
                 slot_id=session.slot_id,
                 max_tokens=max_tokens_per_step,
                 on_token=on_token,
@@ -172,6 +189,29 @@ def run_agentic(
             # regenerated prompt diverge from the cached KV tokens, forcing a
             # re-prefill instead of a cheap prefix-match.
             content = resp.get("content") or ""
+
+            # With deterministic decoding, an identical prompt produces an
+            # identical completion -- so a model that fails the same way once
+            # (e.g. unescaped quotes inside ARGS JSON) sees byte-identical
+            # error feedback next turn and regenerates the exact same broken
+            # action forever, eventually crashing on context overflow instead
+            # of recovering. Detect the repeat and break out with a specific
+            # diagnostic before that happens.
+            if content == last_content:
+                repeat_count += 1
+            else:
+                repeat_count = 0
+            last_content = content
+            if repeat_count >= 2:
+                steps.append(AgentStep(
+                    "(stuck_loop)", {},
+                    "Stopped: the model repeated the exact same action "
+                    f"{repeat_count + 1} times in a row without making progress "
+                    "(likely unescaped quote characters inside an ARGS JSON "
+                    "string, e.g. a Python triple-quoted docstring). See the "
+                    "repeated step above for the exact malformed action.",
+                ))
+                break
 
             try:
                 action = parse_action(content)

@@ -502,3 +502,48 @@ def test_run_agentic_recovers_from_malformed_action(temp_dir, config, store):
     assert result.completed is True
     assert result.final_answer == "recovered"
     assert result.steps[0].tool == "(parse_error)"
+
+
+def test_run_agentic_stops_on_repeated_identical_action(temp_dir, config, store):
+    """A model stuck regenerating the exact same broken action (e.g. unescaped
+    quotes inside ARGS JSON) must be detected and stopped, instead of grinding
+    through every remaining step (and eventually overflowing the context)."""
+    snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
+    snapshots_dir.mkdir(parents=True, exist_ok=True)
+
+    # Same malformed action, byte-for-byte identical, every turn -- exactly
+    # what deterministic decoding produces when fed identical error feedback.
+    broken = 'ACTION: edit_file\nARGS: {"path": "x.py", "search": "a\\"\\"\\"b"}'
+    script = [broken] * 6
+    engine = _mock_engine_with_script(snapshots_dir, script)
+
+    session = AgentSession("a", temp_dir)
+    with patch("cacheflow.reasoning_loop.get_global_engine", return_value=engine):
+        result = run_agentic(session, "stuck task", DEFAULT_SYSTEM_PROMPT, max_steps=6)
+
+    assert result.completed is False
+    assert result.steps[-1].tool == "(stuck_loop)"
+    # caught well before exhausting the full step budget
+    assert len(result.steps) < 6
+
+
+def test_run_agentic_stops_before_context_overflow(temp_dir, config, store):
+    """If the growing conversation would exceed ctx_size, the loop must stop
+    cleanly and return a partial result instead of crashing the engine with
+    'Requested tokens exceed context window'."""
+    snapshots_dir = temp_dir / ".cacheflow" / "snapshots"
+    snapshots_dir.mkdir(parents=True, exist_ok=True)
+
+    script = ['ACTION: list_dir\nARGS: {"path": "."}']
+    engine = _mock_engine_with_script(snapshots_dir, script)
+
+    session = AgentSession("a", temp_dir)
+    session._tokenizer = MagicMock()
+    session._tokenizer.count.return_value = session.config.ctx_size  # already over budget
+
+    with patch("cacheflow.reasoning_loop.get_global_engine", return_value=engine):
+        result = run_agentic(session, "huge task", DEFAULT_SYSTEM_PROMPT, max_steps=5)
+
+    assert result.completed is False
+    assert result.steps[-1].tool == "(context_limit)"
+    engine.completion.assert_not_called()
