@@ -69,6 +69,7 @@ CacheFlow is a **persistent KV cache system for AI agents**. On local hardware t
 - Deliberately decoupled from `AgentSession` internals: only calls `session._acquire_lock()`/`_release_lock()`, `session._restore_or_prime()`, and `session.server.completion()` — the same surface an external harness would have. `AgentSession`/`LlamaEngine` never reach back into this module; the dependency is one-directional
 - The codebase KV stays hot in one slot for the whole loop so every step prefix-matches the cached prefix and only evaluates the new observation + generated action
 - A model-identity mismatch is handled by the `session._restore_or_prime()` call inside `run_agentic` (forces re-prime), not by a separate check in this module
+- Two guards stop the loop cleanly instead of crashing on a model stuck making no progress: (1) if a completion is byte-identical to the previous one twice in a row — what deterministic decoding produces when a model regenerates the same malformed action against identical error feedback (e.g. unescaped quotes in ARGS JSON) — it stops with a `(stuck_loop)` step; (2) before each completion call, if the prompt's token count plus `max_tokens_per_step` would meet or exceed `ctx_size`, it stops with a `(context_limit)` step instead of letting the engine call raise "Requested tokens exceed context window". Both return whatever partial result/steps exist rather than killing the session.
 
 **cacheflow/store.py — `CacheFlowStore` (SQLite, flat agent model)**
 - Single `agents` table. There is **no commit DAG** — each agent points at one current (HEAD) snapshot via `current_snapshot_path`.
@@ -78,10 +79,10 @@ CacheFlow is a **persistent KV cache system for AI agents**. On local hardware t
 
 **cacheflow/engine.py — `LlamaEngine` (in-process, the only execution path)**
 - Runs the model **in the same process** as the agent via llama-cpp-python — no subprocess, no HTTP. This avoids the macOS HTTP decode throttle (~10x slowdown) and reloading the model per `cf run`.
-- `Llama(...)` is constructed with explicit `n_batch=2048, n_ubatch=2048` (vs. the library default 512/512) to speed cold-prefill TTFT; `flash_attn=False` is load-bearing for prefix-match correctness and is left untouched
+- `Llama(...)` is constructed with explicit `n_batch=2048, n_ubatch=2048` (vs. the library default 512/512) to speed cold-prefill TTFT; `flash_attn=True` (flipped from `False`: with it off, this llama-cpp-python build cannot decode a prompt spanning more than one `n_batch` chunk at all, so priming any real codebase's >2048-token stable_context crashed unconditionally with "llama_decode returned -3" — masked previously because every prior test/demo only primed a tiny <2048-token RAG slice). Prefix-match/restore correctness was re-verified directly against `llama_cpp.Llama` after the flip.
 - `__init__` reads the model's exact parameter count once via `llama_model_n_params(self.model.model)` (llama.cpp's own C API, not parsed from the model name/file) and caches it on `self.param_count`; `get_param_count()` exposes it for FLOPs-avoided accounting in `agent.py`
 - `__init__` also calls `_read_arch_info()`, which reads `general.architecture` + `{arch}.block_count`/`{arch}.embedding_length` off `Llama.metadata` (the GGUF's own KV store) and caches `{"n_layer", "n_embd"}` on `self.arch_info` (`None` if the arch key or its dims aren't present/parseable); `get_arch_info()` exposes it so `_compute_flops_avoided` can add the context-length-quadratic self-attention term on top of the param-count-only floor
-- Global singleton via `get_global_engine()`; shares one model across all agents
+- Global singleton via `get_global_engine()`; shares one model across all agents. It also registers an `atexit` hook (`_atexit_teardown_models`) the first time it's called: this process also holds a second `Llama` instance (the vocab-only tokenizer model in `tokenizer.py`), and letting both free implicitly via GC/interpreter shutdown races in ggml-metal's global device manager and SIGABRTs (`GGML_ASSERT([rsets->data count] == 0) failed`) on exit even though inference already succeeded. The hook closes the tokenizer registry's models, then the main engine model, in a fixed order, while the process is still healthy; `stop()` itself now calls `self.model.close()` explicitly rather than relying on GC.
 - Cooperative `CooperativeSlotManager` (llama_server_custom.py) time-multiplexes up to 8 agents onto the one model, swapping KV state on context switch
 - `prime_slot`/`restore_slot`/`save_slot`/`completion` are the engine's full method surface
 
@@ -114,7 +115,7 @@ CacheFlow is a **persistent KV cache system for AI agents**. On local hardware t
 
 - **SlotPool** allocates 1 slot per agent; up to 8 concurrent agents
 - Each agent has an independent HEAD snapshot; there are no branches/DAG
-- `cf fork parent_agent child_agent` creates a child whose `parent_agent_id` points at the parent and which inherits a copy of the parent's HEAD snapshot
+- `cf fork parent_agent child_agent` creates a child whose `parent_agent_id` points at the parent and which inherits a copy of the parent's HEAD snapshot. `current_snapshot_path` is stored relative to `base_path` when `base_path` itself is relative (matching how `run()` consumes it directly) — `fork_agent` must use it as-is rather than re-joining `base_path/".cacheflow"` onto it, which previously doubled the path into an unresolvable `.cacheflow/.cacheflow/...`
 - All agents share a single in-memory model instance (no duplication); the `CooperativeSlotManager` swaps KV state between them
 
 ### Stable Context & Change Detection
@@ -222,7 +223,7 @@ pytest tests/test_agent.py::test_first_session_primes_and_saves -xvs
 - **cacheflow/store.py** — SQLite schema and flat-store (agent + HEAD snapshot) operations, incl. `update_agent_model`
 - **cacheflow/engine.py** — In-process `LlamaEngine`, the only execution path; `get_global_engine()`
 - **cacheflow/llama_server_custom.py** — Shared llama-cpp-python primitives used by `engine.py`: the v4 snapshot format (`_write_snapshot`/`_read_snapshot`) and `CooperativeSlotManager`
-- **cacheflow/tokenizer.py** — Exact token counting via a vocab-only Llama (`get_tokenizer`); the vocab-only model is lazily loaded on first `encode()`/`count()` call, not at `AgentSession` construction
+- **cacheflow/tokenizer.py** — Exact token counting via a vocab-only Llama (`get_tokenizer`); the vocab-only model is lazily loaded on first `encode()`/`count()` call, not at `AgentSession` construction. The lazy load is guarded by a per-instance `threading.Lock` (`_load_lock`) — the registry lock in `get_tokenizer()` only guards which `ModelTokenizer` instance callers get back, not the load itself, so without `_load_lock` concurrent agents racing into their first `.count()`/`.encode()` call could construct two `llama_cpp.Llama` instances against the same GGUF simultaneously, which crashes natively (SIGABRT, no Python traceback) instead of raising
 - **cacheflow/slot_pool.py** — Multi-agent slot allocation and LRU eviction
 - **cacheflow/gc.py** — `SnapshotGC`: reaps snapshots not referenced by any agent HEAD
 - **cacheflow/templates.py** — Per-model-family instruction templating (`detect_template`); sniffs the GGUF's embedded chat_template, falls back to model name, falls back to ChatML

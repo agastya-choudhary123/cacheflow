@@ -48,6 +48,10 @@ cf log main
 
 CacheFlow runs the model **in the same process** as the agent (`cacheflow/engine.py`, `LlamaEngine`) — no subprocess, no HTTP round-trips. This matters on macOS, where token-by-token GPU decode collapses ~10x while an inbound HTTP request is in flight, and it avoids reloading the model on every `cf run`. `cacheflow/llama_server_custom.py` still backs the engine with the binary snapshot format and `CooperativeSlotManager`, but it no longer fronts an HTTP server — an earlier Flask-based out-of-process server existed for a multi-client/MCP case that's since been removed, so it was dead weight and has been deleted.
 
+`Llama(...)` is constructed with `flash_attn=True`: with it off, this llama-cpp-python build can't decode a prompt spanning more than one `n_batch` (2048-token) chunk at all, so priming any real codebase's stable_context — almost always >2048 tokens — crashed unconditionally with "llama_decode returned -3". Prefix-match/restore correctness was re-verified directly against `llama_cpp.Llama` after the flip.
+
+Running two `Llama` instances in one process (the main engine model plus the vocab-only tokenizer model) means both need explicit, ordered teardown: letting either free implicitly via GC/interpreter shutdown races in ggml-metal's global device manager and SIGABRTs at exit even after a fully successful run. `get_global_engine()` registers an `atexit` hook that closes the tokenizer's model(s) and then the main engine model in a fixed order while the process is still healthy.
+
 ## Multi-Agent Workflows
 
 CacheFlow supports **concurrent execution of multiple agents** sharing a single in-memory model. Each agent gets an independent KV cache slot, enabling parallelism without duplicating the model.
@@ -86,7 +90,7 @@ for t in threads:
 cf fork main research          # research inherits a copy of main's HEAD snapshot
 ```
 
-A forked agent's `parent_agent_id` records its lineage and it starts from a copy of the parent's HEAD KV state — all the parent's accumulated codebase knowledge, none of the re-priming cost.
+A forked agent's `parent_agent_id` records its lineage and it starts from a copy of the parent's HEAD KV state — all the parent's accumulated codebase knowledge, none of the re-priming cost. `current_snapshot_path` is stored relative to `base_path` whenever `base_path` itself is relative, so `fork_agent` copies it as-is rather than re-joining `base_path/".cacheflow"` onto an already-relative path.
 
 ## CLI Reference
 
@@ -165,6 +169,8 @@ The same re-prime path also fires on a **model swap** (`cf model use`): an agent
 ### Agentic Loop vs. KV Engine
 
 `cacheflow/reasoning_loop.py` owns the agentic tool-calling loop (`run_agentic`, used by `cf agent`) — tool-protocol parsing, dispatch to `read_file`/`edit_file`/`write_file`/`grep`/`run_bash`/etc., and step/stop-condition bookkeeping. It is deliberately decoupled from `AgentSession`: it only calls the primitives an external harness would have access to (`session._acquire_lock`/`_release_lock`, `session._restore_or_prime`, `session.server.completion()`). `AgentSession` itself stays scoped to the KV-cache-facing surface — `run()`, prime/restore/save, stable-prefix building, HEAD tracking, and `consolidate()`.
+
+Two guards keep a model that's making no progress from crashing the session instead of stopping cleanly: an identical-completion-twice-in-a-row check (`(stuck_loop)`) catches a model regenerating the same malformed action against byte-identical error feedback under deterministic decoding, and a pre-completion token-budget check (`(context_limit)`) stops before a still-growing-but-not-stuck conversation would overflow `ctx_size`, instead of letting the engine raise "Requested tokens exceed context window" mid-run. Either way `cf agent` returns whatever partial steps/result exist rather than losing the whole session.
 
 ### Per-Sequence Snapshots (format v4)
 
