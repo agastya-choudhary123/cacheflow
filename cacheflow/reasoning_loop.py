@@ -145,6 +145,8 @@ def run_agentic(
             base_path=workspace_path or session.base_path,
             allow_writes=allow_writes,
             allow_bash=allow_bash,
+            agent_name=session.agent_name,
+            store=session.store,
         )
 
         convo = _build_agentic_preamble(session, task)

@@ -144,6 +144,31 @@ def test_read_file_rejects_escape(temp_dir):
     assert obs.startswith("ERROR")
 
 
+def test_cacheflow_status_reports_agent_metrics(temp_dir, store):
+    agent = store.create_agent("main", "qwen2.5-coder:7b", "abc123def456", 8192)
+    store.update_agent_baseline(agent, 9064)
+    store.update_agent_snapshot(agent, "/tmp/snap.bin", 0, tokens_saved=8182)
+
+    ctx = ToolContext(base_path=temp_dir, agent_name="main", store=store)
+    obs = execute(Action("cacheflow_status", {}, ""), ctx)
+
+    assert "agent=main" in obs
+    assert "baseline_tokens_evaluated=9064" in obs
+    assert "cumulative_tokens_saved=8182" in obs
+
+
+def test_cacheflow_status_without_session_attached(temp_dir):
+    ctx = ToolContext(base_path=temp_dir)
+    obs = execute(Action("cacheflow_status", {}, ""), ctx)
+    assert obs.startswith("ERROR")
+
+
+def test_cacheflow_status_unknown_agent(temp_dir, store):
+    ctx = ToolContext(base_path=temp_dir, agent_name="ghost", store=store)
+    obs = execute(Action("cacheflow_status", {}, ""), ctx)
+    assert "No CacheFlow session recorded" in obs
+
+
 def test_write_gated_off_by_default(temp_dir):
     ctx = ToolContext(base_path=temp_dir, allow_writes=False)
     obs = execute(Action("write_file", {"path": "x.py", "content": "y"}, ""), ctx)

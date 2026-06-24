@@ -21,7 +21,10 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import TYPE_CHECKING, Callable, Dict, Optional
+
+if TYPE_CHECKING:
+    from cacheflow.store import CacheFlowStore
 
 # Cap how much tool output we feed back, so a giant file/command can't blow the
 # context budget (and our token savings) in a single observation.
@@ -35,6 +38,12 @@ class ToolContext:
     base_path: Path
     allow_writes: bool = False
     allow_bash: bool = False
+    # Set by run_agentic so cacheflow_status can report the running agent's
+    # own session metrics without shelling out to `cf status` (which would
+    # need its own DB connection and re-parse stdout the agent already has
+    # in-process access to).
+    agent_name: Optional[str] = None
+    store: Optional["CacheFlowStore"] = None
 
 
 @dataclass
@@ -314,6 +323,25 @@ def _run_bash(args: dict, ctx: ToolContext) -> str:
     return _truncate(out)
 
 
+def _cacheflow_status(args: dict, ctx: ToolContext) -> str:
+    """Report this agent's own KV-cache session metrics -- the same numbers
+    `cf status`/`cf log` show a human, surfaced in-loop so the agent can use
+    them (e.g. deciding whether a costly re-prime already happened this
+    session) without shelling out to a second `cf` process and re-parsing
+    its stdout.
+    """
+    if ctx.store is None or ctx.agent_name is None:
+        return "ERROR: cacheflow_status is unavailable in this context (no agent session attached)"
+    agent = ctx.store.get_agent(ctx.agent_name)
+    if agent is None:
+        return f"No CacheFlow session recorded yet for agent '{ctx.agent_name}'."
+    return (
+        f"agent={ctx.agent_name} model={agent.model_name} ctx_size={agent.ctx_size}\n"
+        f"baseline_tokens_evaluated={agent.baseline_tokens_evaluated}\n"
+        f"last_tokens_saved={agent.last_tokens_saved} cumulative_tokens_saved={agent.cumulative_tokens_saved}"
+    )
+
+
 # Registry: name → (callable, one-line help shown to the model)
 TOOLS: Dict[str, tuple[Callable[[dict, ToolContext], str], str]] = {
     "read_file": (_read_file, 'read_file {"path": "rel/path", "start_line"?: N, "end_line"?: N} — file contents (use a line window for big files so edits can match exactly)'),
@@ -323,6 +351,7 @@ TOOLS: Dict[str, tuple[Callable[[dict, ToolContext], str], str]] = {
     "edit_file": (_edit_file, 'edit_file {"path": "rel/path", "search": "exact text", "replace": "new text", "replace_all"?: bool} — replace an exact snippet, returns a diff (needs --auto)'),
     "syntax_check": (_syntax_check, 'syntax_check {"path": "rel/path"} — verify a file parses (Python/JSON); run this after editing to catch mistakes'),
     "run_bash": (_run_bash, 'run_bash {"command": "..."} — run a shell command (needs --allow-bash)'),
+    "cacheflow_status": (_cacheflow_status, 'cacheflow_status {} — this agent\'s own KV-cache session metrics (baseline/cumulative tokens saved), same numbers `cf status` shows a human'),
     "finish": (None, 'finish {"answer": "..."} — end the task with a final answer'),
 }
 
