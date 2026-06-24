@@ -172,6 +172,8 @@ The same re-prime path also fires on a **model swap** (`cf model use`): an agent
 
 Two guards keep a model that's making no progress from crashing the session instead of stopping cleanly: an identical-completion-twice-in-a-row check (`(stuck_loop)`) catches a model regenerating the same malformed action against byte-identical error feedback under deterministic decoding, and a pre-completion token-budget check (`(context_limit)`) stops before a still-growing-but-not-stuck conversation would overflow `ctx_size`, instead of letting the engine raise "Requested tokens exceed context window" mid-run. Either way `cf agent` returns whatever partial steps/result exist rather than losing the whole session.
 
+The model's own tool palette includes `cacheflow_status`, which reports its current agent's baseline/cumulative token-savings mid-loop — the same numbers `cf status` shows a human, but available to the agent itself without it needing to know `cf`'s CLI exists or shell out to a second process.
+
 ### Per-Sequence Snapshots (format v4)
 
 Snapshots use a compact binary format (`CFKV`, version 4) defined in `llama_server_custom.py`. Instead of `model.save_state()` — which serializes the **entire** `n_ctx` buffer (e.g. 16384 tokens) regardless of occupancy — v4 serializes only the live KV via `llama_state_seq_get_data`. A 9k-token prime no longer writes the full 16384-ctx buffer, shrinking both the save write and the restore read. Restore splices the sequence back in with `llama_state_seq_set_data` after clearing the KV. Older v3 (full-state) snapshots remain readable; agents upgrade transparently on their next prime.
