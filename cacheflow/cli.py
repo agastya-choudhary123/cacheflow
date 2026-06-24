@@ -772,10 +772,28 @@ def thinking_query(problem, role, base_path):
 
         if thinking_block:
             click.echo(f"Found thinking block (confidence: {confidence:.2f}, action: {action})")
+            if store.last_tokens_saved is not None:
+                click.echo(f"Tokens saved (exact, from real API usage): {store.last_tokens_saved}")
             click.echo()
             click.echo(thinking_block[:500])  # Preview
         else:
             click.echo("No cached thinking block found.")
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+
+@thinking.command("stats")
+@click.option("--base-path", default=".", help="Project root")
+def thinking_stats(base_path):
+    """Show exact cumulative token savings from thinking-block reuse."""
+    try:
+        base_path = Path(base_path)
+        db_path = base_path / ".cacheflow" / "thinking.db"
+
+        store = ThinkingStore(str(db_path))
+        stats = store.get_reuse_stats()
+        click.echo(f"Reuses: {stats['reuse_count']}")
+        click.echo(f"Total tokens saved (exact): {stats['total_tokens_saved']}")
     except Exception as e:
         raise click.ClickException(str(e))
 
@@ -786,8 +804,14 @@ def thinking_query(problem, role, base_path):
 @click.option("--thinking-file", type=click.File("r"), required=True, help="Path to thinking block file")
 @click.option("--role", default=None, help="Role (implementer/reviewer/tester)")
 @click.option("--problem-type", default=None, help="Problem type")
+@click.option(
+    "--token-count", default=None, type=int,
+    help="Exact token count for this thinking block, e.g. from your own API "
+         "usage.output_tokens. Omit if you don't have an exact figure -- it "
+         "is stored as unknown (NULL) rather than guessed from text length.",
+)
 @click.option("--base-path", default=".", help="Project root")
-def thinking_submit(problem_hash, codebase_hash, thinking_file, role, problem_type, base_path):
+def thinking_submit(problem_hash, codebase_hash, thinking_file, role, problem_type, token_count, base_path):
     """Submit a thinking block to the cache."""
     try:
         base_path = Path(base_path)
@@ -802,8 +826,9 @@ def thinking_submit(problem_hash, codebase_hash, thinking_file, role, problem_ty
             role=role,
             problem_type=problem_type,
             source_agent="claude",
+            token_count=token_count,
         )
-        click.echo(f"✓ Submitted thinking block ({len(thinking_block)} chars)")
+        click.echo(f"✓ Submitted thinking block ({len(thinking_block)} chars, token_count={token_count})")
     except Exception as e:
         raise click.ClickException(str(e))
 
@@ -861,7 +886,13 @@ def thinking_capture_block(base_path):
 
         for block in blocks:
             task_description = block.get("task_description") or ""
-            problem_hash = store._hash_problem(task_description + codebase_hash) if task_description else None
+            # Must match query()'s own hashing convention (hash of the problem
+            # text alone) or a real `cf thinking query` lookup can never find
+            # what this hook just submitted. codebase_hash is stored alongside
+            # for the delta/staleness layer to use separately, not folded into
+            # the lookup key -- folding it in here would make every exact hit
+            # require byte-identical codebase state, defeating that layer.
+            problem_hash = store._hash_problem(task_description) if task_description else None
             if not problem_hash:
                 continue
             store.submit(
@@ -873,6 +904,7 @@ def thinking_capture_block(base_path):
                 delta=delta,
                 source_agent="claude",
                 session_id=block.get("session_id"),
+                token_count=block.get("output_tokens"),
             )
     except Exception:
         # Never let a hook failure surface to the agent it's attached to.
@@ -931,8 +963,14 @@ def knowledge_query(region, role, region_hash, base_path):
 @click.option("--role", default=None, help="Role (implementer/reviewer/tester)")
 @click.option("--summary-file", type=click.File("r"), required=True, help="Path to summary file (or - for stdin)")
 @click.option("--source-agent", default="claude", help="Source agent")
+@click.option(
+    "--token-count", default=None, type=int,
+    help="Exact token count for this summary, e.g. from your own API "
+         "usage.output_tokens. Omit if unknown -- stored as NULL rather "
+         "than guessed from text length.",
+)
 @click.option("--base-path", default=".", help="Project root")
-def knowledge_submit(region, region_hash, role, summary_file, source_agent, base_path):
+def knowledge_submit(region, region_hash, role, summary_file, source_agent, token_count, base_path):
     """Submit a knowledge summary for a region."""
     try:
         base_path = Path(base_path)
@@ -946,8 +984,9 @@ def knowledge_submit(region, region_hash, role, summary_file, source_agent, base
             source_agent=source_agent,
             region_hash=region_hash,
             role=role,
+            token_count=token_count,
         )
-        click.echo(f"✓ Submitted knowledge summary (ID: {entry_id}, {len(summary)} chars)")
+        click.echo(f"✓ Submitted knowledge summary (ID: {entry_id}, {len(summary)} chars, token_count={token_count})")
     except Exception as e:
         raise click.ClickException(str(e))
 

@@ -27,7 +27,7 @@ class KnowledgeStore:
                 role TEXT,
                 summary TEXT NOT NULL,
                 source_agent TEXT NOT NULL,
-                token_count INTEGER NOT NULL,
+                token_count INTEGER,
                 supersedes_id INTEGER,
                 created_at TIMESTAMP NOT NULL,
                 FOREIGN KEY (supersedes_id) REFERENCES knowledge_entries(id)
@@ -50,9 +50,17 @@ class KnowledgeStore:
         conn.close()
 
     def submit(
-        self, region: str, summary: str, source_agent: str, region_hash: str, role: Optional[str] = None
+        self, region: str, summary: str, source_agent: str, region_hash: str, role: Optional[str] = None,
+        token_count: Optional[int] = None,
     ) -> int:
-        """Store a knowledge summary for a region."""
+        """Store a knowledge summary for a region.
+
+        `token_count`, if given, must be the real, exact token cost of
+        `summary` (e.g. from the API usage that produced it) -- never derived
+        from `len(summary)` here, since character count isn't a token count.
+        If the caller doesn't have an exact figure, leave it None; it's
+        stored as NULL rather than a fabricated number.
+        """
         conn = sqlite3.connect(self.db_path)
 
         # Find and mark previous entries for this region+role as superseded
@@ -70,7 +78,7 @@ class KnowledgeStore:
                 (region, region_hash, role, summary, source_agent, token_count, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-                (region, region_hash, role, summary, source_agent, len(summary), datetime.now()),
+                (region, region_hash, role, summary, source_agent, token_count, datetime.now()),
             )
             entry_id = cursor.lastrowid
 

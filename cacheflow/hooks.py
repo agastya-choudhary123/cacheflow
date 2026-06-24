@@ -84,7 +84,15 @@ def extract_thinking_blocks_from_transcript(
     most recent assistant turn, paired with the task description taken from
     the nearest preceding user turn.
 
-    Returns a list of {"thinking": str, "task_description": str, "session_id": str}.
+    Returns a list of {"thinking": str, "task_description": str, "session_id": str,
+    "output_tokens": Optional[int]}. "output_tokens" is the real, exact value from
+    the turn's Anthropic API `usage` block (not a guess from text length) -- it's
+    the ground truth for how many tokens this thinking actually cost. It's only
+    attributed when the turn produced exactly one thinking block; with multiple
+    thinking blocks in one turn there's no way to split a single turn-level
+    usage total across them without guessing, so it's left as None rather than
+    estimating.
+
     Best-effort: malformed/missing files yield an empty list rather than raising,
     since this runs inside a hook that must never block the agent.
     """
@@ -145,7 +153,20 @@ def extract_thinking_blocks_from_transcript(
 
     session_id = entries[last_assistant_idx].get("sessionId") or entries[last_assistant_idx].get("session_id")
 
+    # Real, exact token cost of this turn straight from the Anthropic API's own
+    # usage accounting -- never inferred from text length or chars.
+    usage = entries[last_assistant_idx].get("message", {}).get("usage", {})
+    output_tokens = usage.get("output_tokens") if isinstance(usage, dict) else None
+    # Only attributable to a single thinking block unambiguously; with several
+    # blocks in one turn, splitting the turn-level total would be a guess.
+    output_tokens = output_tokens if len(thinking_texts) == 1 else None
+
     return [
-        {"thinking": text, "task_description": task_description, "session_id": session_id}
+        {
+            "thinking": text,
+            "task_description": task_description,
+            "session_id": session_id,
+            "output_tokens": output_tokens,
+        }
         for text in thinking_texts
     ]

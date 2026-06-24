@@ -19,6 +19,11 @@ class ThinkingStore:
     def __init__(self, db_path: str = ".cacheflow/thinking.db"):
         self.db_path = db_path
         self.qdrant_client = None
+        # Exact token_count of the most recent exact-hash hit (None if the last
+        # query() call missed, or hasn't run yet). Set by _exact_lookup so CLI
+        # callers can report real savings for that specific call without
+        # changing query()'s existing 3-tuple return contract.
+        self.last_tokens_saved: Optional[int] = None
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self.init_db()
 
@@ -66,6 +71,21 @@ class ThinkingStore:
             ON thinking_blocks(accessed_at)
         """
         )
+        # Every successful reuse (exact-hash hit) logs the exact token_count of
+        # the block it reused -- that IS the number of thinking tokens NOT
+        # regenerated, in real Anthropic-reported tokens, not an estimate.
+        # cf thinking stats sums this table for the headline savings number.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS thinking_reuse_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thinking_block_id INTEGER NOT NULL,
+                tokens_saved INTEGER,
+                reused_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (thinking_block_id) REFERENCES thinking_blocks(id)
+            )
+        """
+        )
         conn.commit()
         conn.close()
 
@@ -87,7 +107,18 @@ class ThinkingStore:
         codebase_hash: str,
         **metadata,
     ) -> None:
-        """Store a thinking block with metadata and embedding."""
+        """Store a thinking block with metadata and embedding.
+
+        `token_count` (in metadata) must be the exact, real cost of this
+        thinking block -- e.g. the `output_tokens` field from the Anthropic
+        API's own usage accounting for the turn it came from (see
+        hooks.extract_thinking_blocks_from_transcript). It is never derived
+        from `len(thinking_block)` here: character count is not a token
+        count, and guessing one from the other would make every downstream
+        savings metric (cf thinking stats) fictional. If the caller doesn't
+        have an exact count, leave it unset -- it's stored as NULL rather
+        than a fabricated number.
+        """
         embedding_blob = None
         model = self._get_embedding_model()
         if model:
@@ -117,7 +148,7 @@ class ThinkingStore:
                 json.dumps(metadata.get("delta", {})),
                 metadata.get("source_agent"),
                 metadata.get("session_id"),
-                len(thinking_block),
+                metadata.get("token_count"),
             ),
         )
         conn.commit()
@@ -168,9 +199,13 @@ class ThinkingStore:
             return None, 0, "re_think"
 
     def _exact_lookup(self, problem_hash: str, role: Optional[str] = None) -> Optional[str]:
-        """Fast exact hash lookup."""
+        """Fast exact hash lookup. On a hit, logs the exact tokens this reuse
+        saved (the matched block's real token_count) into thinking_reuse_log,
+        and records it on self.last_tokens_saved for the caller to report.
+        """
+        self.last_tokens_saved = None
         conn = sqlite3.connect(self.db_path)
-        query = "SELECT thinking_block FROM thinking_blocks WHERE problem_hash = ?"
+        query = "SELECT id, thinking_block, token_count FROM thinking_blocks WHERE problem_hash = ?"
         params = [problem_hash]
 
         if role:
@@ -181,8 +216,38 @@ class ThinkingStore:
 
         cursor = conn.execute(query, params)
         result = cursor.fetchone()
+        if result:
+            block_id, thinking_block, token_count = result
+            conn.execute(
+                "INSERT INTO thinking_reuse_log (thinking_block_id, tokens_saved) VALUES (?, ?)",
+                (block_id, token_count),
+            )
+            conn.execute(
+                "UPDATE thinking_blocks SET accessed_at = ? WHERE id = ?",
+                (datetime.now().isoformat(), block_id),
+            )
+            conn.commit()
+            self.last_tokens_saved = token_count
         conn.close()
-        return result[0] if result else None
+        return result[1] if result else None
+
+    def get_reuse_stats(self) -> Dict[str, Any]:
+        """Exact cumulative reuse savings: real count of reuses and the sum of
+        their real token_count values -- never estimated, since every row in
+        thinking_reuse_log was logged from a real stored token_count at the
+        moment of reuse (NULL token_count entries, where the source block had
+        no exact count, are excluded from the sum rather than counted as 0).
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.execute(
+            "SELECT COUNT(*), SUM(tokens_saved) FROM thinking_reuse_log"
+        )
+        reuse_count, total_tokens_saved = cursor.fetchone()
+        conn.close()
+        return {
+            "reuse_count": reuse_count or 0,
+            "total_tokens_saved": total_tokens_saved or 0,
+        }
 
     def _semantic_search(
         self, embedding, limit: int = 5, threshold: float = 0.85
