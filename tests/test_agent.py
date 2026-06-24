@@ -398,6 +398,32 @@ def test_fork_agent(temp_dir, config):
     assert child.parent_agent_id == parent.id
 
 
+def test_fork_agent_relative_snapshot_path(temp_dir, config):
+    """current_snapshot_path stored relative to base_path (the common case when
+    `cf init` is run with the default base_path="."), not relative to .cacheflow/."""
+    db_path = temp_dir / ".cacheflow" / "agents.db"
+    store = CacheFlowStore(db_path)
+    store.init_db()
+
+    parent = store.create_agent("main", "qwen2.5-coder:7b", "abc123", 8192)
+
+    snapshot_path = temp_dir / ".cacheflow" / "snapshots" / "parent_snapshot.bin"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_path.write_bytes(os.urandom(1024))
+
+    store.update_agent_snapshot(
+        agent=parent,
+        snapshot_path=str(Path(".cacheflow") / "snapshots" / "parent_snapshot.bin"),
+        snapshot_size_bytes=1024,
+        tokens_saved=0,
+    )
+
+    child = fork_agent("main", "child", temp_dir, scope="test scope")
+
+    assert child.current_snapshot_path is not None
+    assert Path(child.current_snapshot_path).exists()
+
+
 def test_fork_agent_nonexistent_parent(temp_dir, config):
     """Test forking with non-existent parent."""
     db_path = temp_dir / ".cacheflow" / "agents.db"

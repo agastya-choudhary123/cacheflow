@@ -681,7 +681,9 @@ def fork_agent(
 
     parent_snapshot_path = Path(parent_agent.current_snapshot_path)
     if not parent_snapshot_path.is_absolute():
-        parent_snapshot_path = base_path / ".cacheflow" / parent_snapshot_path
+        # Stored paths are relative to base_path already (e.g. ".cacheflow/snapshots/x.bin"),
+        # matching how the restore path in run() uses current_snapshot_path directly.
+        parent_snapshot_path = base_path / parent_snapshot_path
 
     if not parent_snapshot_path.exists():
         raise ValueError(
