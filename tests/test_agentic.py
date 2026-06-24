@@ -151,6 +151,107 @@ def test_write_gated_off_by_default(temp_dir):
     assert not (temp_dir / "x.py").exists()
 
 
+# ── cacheflow_status / knowledge_query / knowledge_submit / thinking_query ──────
+
+def _init_git_repo(base_path):
+    import subprocess
+    subprocess.run(["git", "init", "-q"], cwd=base_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=base_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=base_path, check=True, capture_output=True)
+
+
+def test_cacheflow_status_reports_agent_metrics(temp_dir, store):
+    agent = store.create_agent("main", "qwen2.5-coder:7b", "abc123def456", 8192)
+    store.update_agent_baseline(agent, 9064)
+    store.update_agent_snapshot(agent, "/tmp/snap.bin", 0, tokens_saved=8182)
+
+    ctx = ToolContext(base_path=temp_dir, agent_name="main", store=store)
+    obs = execute(Action("cacheflow_status", {}, ""), ctx)
+
+    assert "agent=main" in obs
+    assert "baseline_tokens_evaluated=9064" in obs
+    assert "cumulative_tokens_saved=8182" in obs
+
+
+def test_cacheflow_status_without_session_attached(temp_dir):
+    ctx = ToolContext(base_path=temp_dir)
+    obs = execute(Action("cacheflow_status", {}, ""), ctx)
+    assert obs.startswith("ERROR")
+
+
+def test_knowledge_query_returns_cached_summary(temp_dir):
+    from cacheflow.hooks import compute_region_hash
+    from cacheflow.knowledge_store import KnowledgeStore
+
+    _init_git_repo(temp_dir)
+    (temp_dir / "engine.py").write_text("print('hi')\n")
+    region_hash = compute_region_hash(temp_dir / "engine.py")
+
+    store = KnowledgeStore(str(temp_dir / ".cacheflow" / "knowledge.db"))
+    store.submit("engine.py", "Dense summary of engine.py.", "other-agent", region_hash)
+
+    ctx = ToolContext(base_path=temp_dir)
+    obs = execute(Action("knowledge_query", {"path": "engine.py"}, ""), ctx)
+
+    assert "Dense summary of engine.py." in obs
+
+
+def test_knowledge_query_no_hit_suggests_reading(temp_dir):
+    _init_git_repo(temp_dir)
+    (temp_dir / "engine.py").write_text("print('hi')\n")
+
+    ctx = ToolContext(base_path=temp_dir)
+    obs = execute(Action("knowledge_query", {"path": "engine.py"}, ""), ctx)
+
+    assert "No knowledge summary found" in obs
+
+
+def test_knowledge_submit_gated_off_by_default(temp_dir):
+    _init_git_repo(temp_dir)
+    (temp_dir / "engine.py").write_text("print('hi')\n")
+
+    ctx = ToolContext(base_path=temp_dir, allow_writes=False)
+    obs = execute(Action("knowledge_submit", {"path": "engine.py", "summary": "x"}, ""), ctx)
+
+    assert "disabled" in obs
+
+
+def test_knowledge_submit_then_query_round_trips(temp_dir):
+    _init_git_repo(temp_dir)
+    (temp_dir / "engine.py").write_text("print('hi')\n")
+
+    ctx = ToolContext(base_path=temp_dir, allow_writes=True)
+    submit_obs = execute(Action("knowledge_submit", {"path": "engine.py", "summary": "My summary."}, ""), ctx)
+    assert submit_obs.startswith("OK")
+
+    query_obs = execute(Action("knowledge_query", {"path": "engine.py"}, ""), ctx)
+    assert "My summary." in query_obs
+
+
+def test_thinking_query_no_hit_suggests_normal_reasoning(temp_dir):
+    ctx = ToolContext(base_path=temp_dir)
+    obs = execute(Action("thinking_query", {"problem": "implement retry logic"}, ""), ctx)
+    assert "No cached thinking found" in obs
+
+
+def test_thinking_query_exact_hit(temp_dir):
+    from cacheflow.thinking_store import ThinkingStore
+
+    store = ThinkingStore(str(temp_dir / ".cacheflow" / "thinking.db"))
+    problem = "implement retry logic with exponential backoff"
+    store.submit(
+        "Use exponential backoff with jitter.",
+        problem_hash=store._hash_problem(problem),
+        codebase_hash="hash1",
+    )
+
+    ctx = ToolContext(base_path=temp_dir)
+    obs = execute(Action("thinking_query", {"problem": problem}, ""), ctx)
+
+    assert "Use exponential backoff with jitter." in obs
+    assert "use_directly" in obs
+
+
 def test_write_allowed_with_flag(temp_dir):
     ctx = ToolContext(base_path=temp_dir, allow_writes=True)
     obs = execute(Action("write_file", {"path": "x.py", "content": "y=1\n"}, ""), ctx)

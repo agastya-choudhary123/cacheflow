@@ -72,6 +72,12 @@ def _build_agentic_preamble(session: "AgentSession", task: str) -> str:
         "run syntax_check on it. Treat both SYNTAX ERROR and LOGIC WARNING as "
         "things you must fix before continuing — the code must be both "
         "syntactically AND logically correct.\n"
+        "Before reading a file you haven't seen yet, try knowledge_query first — "
+        "a prior agent (local or cloud) may have already summarized it, saving "
+        "you a full read. Before reasoning at length about a problem, try "
+        "thinking_query first — it may already be cached. After a meaningful "
+        "unit of work (not every micro-edit), use knowledge_submit so the next "
+        "agent gets the same benefit.\n"
         "When the task is complete, use ACTION: finish with ARGS "
         '{"answer": "<final answer>"}.\n\n'
         f"Task: {task}"
@@ -146,6 +152,8 @@ def run_agentic(
             base_path=workspace_path or session.base_path,
             allow_writes=allow_writes,
             allow_bash=allow_bash,
+            agent_name=session.agent_name,
+            store=session.store,
         )
 
         convo = _build_agentic_preamble(session, task)
