@@ -105,33 +105,18 @@ def test_fix2_binary_snapshot_format():
     the full-context buffer, so writing reads the seq state off the model's ctx.
     """
     import numpy as np
-    import cacheflow.llama_server_custom as lsc
-    from cacheflow.llama_server_custom import _write_snapshot, _read_snapshot, _SNAPSHOT_MAGIC, _SNAPSHOT_VERSION
+    from cacheflow.llama_server_custom import _Snapshot, _write_snapshot, _read_snapshot, _SNAPSHOT_MAGIC, _SNAPSHOT_VERSION
 
     seq_payload = os.urandom(4096)
+    input_ids = np.array([1, 2, 3, 4], dtype=np.int32)
 
-    state = MagicMock()
-    state.input_ids = np.array([1, 2, 3, 4], dtype=np.int32)
-    state.n_tokens = 4
-    state.seed = 42
-
-    model = MagicMock()
-    model._ctx.ctx = object()  # opaque ctx pointer
-
-    def fake_get_size(ctx, seq_id):
-        return len(seq_payload)
-
-    def fake_get_data(ctx, dst, size, seq_id):
-        dst[: len(seq_payload)] = seq_payload
-        return len(seq_payload)
+    snap = _Snapshot(n_tokens=4, seed=42, input_ids=input_ids, seq_data=seq_payload)
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as f:
         tmp = Path(f.name)
 
     try:
-        with patch.object(lsc.llama_cpp, "llama_state_seq_get_size", fake_get_size), \
-             patch.object(lsc.llama_cpp, "llama_state_seq_get_data", fake_get_data):
-            _write_snapshot(tmp, model, state)
+        _write_snapshot(tmp, snap)
 
         # Verify header
         with open(tmp, "rb") as f:
@@ -143,10 +128,10 @@ def test_fix2_binary_snapshot_format():
 
         # Round-trip
         recovered = _read_snapshot(tmp)
-        assert recovered.n_tokens == state.n_tokens
-        assert recovered.seed == state.seed
+        assert recovered.n_tokens == snap.n_tokens
+        assert recovered.seed == snap.seed
         assert recovered.seq_data == seq_payload
-        assert list(recovered.input_ids) == list(state.input_ids)
+        assert list(recovered.input_ids) == list(snap.input_ids)
 
     finally:
         tmp.unlink(missing_ok=True)

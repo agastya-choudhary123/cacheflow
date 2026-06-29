@@ -80,11 +80,15 @@ class _Snapshot:
         model._seed = self.seed
 
 
-def _write_snapshot(filepath: Path, model: "Llama", state: "LlamaState") -> None:
-    """Serialize the active slot's KV cache to disk in compact per-sequence form.
+def _capture_compact(model: "Llama") -> "_Snapshot":
+    """Capture the active slot's KV into a compact in-memory _Snapshot.
 
-    `model` must currently hold this slot's KV (caller switches to it first);
-    `state` supplies n_tokens / input_ids / seed bookkeeping.
+    Uses the per-sequence API (llama_state_seq_get_data) — the same path as
+    v4 disk snapshots — so only the live tokens are captured, not the full
+    n_ctx-sized buffer that model.save_state() / llama_copy_state_data returns.
+    For a typical primed codebase (several thousand tokens) this is ~8 MB
+    instead of several hundred MB per slot, which matters a lot when 8 agents
+    are active concurrently.
     """
     ctx = model._ctx.ctx
     seq_size = llama_cpp.llama_state_seq_get_size(ctx, 0)
@@ -92,17 +96,31 @@ def _write_snapshot(filepath: Path, model: "Llama", state: "LlamaState") -> None
     nwritten = llama_cpp.llama_state_seq_get_data(ctx, buf, seq_size, 0)
     if nwritten == 0:
         raise RuntimeError("llama_state_seq_get_data returned no data")
-    seq_bytes = bytes(buf[:nwritten])
-    input_ids_bytes = state.input_ids.astype("<i4").tobytes()
+    n = model.n_tokens
+    return _Snapshot(
+        n_tokens=n,
+        seed=model._seed,
+        input_ids=model.input_ids[:n].copy(),
+        seq_data=bytes(buf[:nwritten]),
+    )
+
+
+def _write_snapshot(filepath: Path, snap: "_Snapshot") -> None:
+    """Write a compact _Snapshot to disk.
+
+    `snap` must have been captured via _capture_compact (seq_data populated).
+    Writing from the already-captured bytes avoids a second C-API round-trip.
+    """
+    input_ids_bytes = snap.input_ids[:snap.n_tokens].astype("<i4").tobytes()
 
     with open(filepath, "wb") as f:
         f.write(_SNAPSHOT_MAGIC)
         f.write(struct.pack("<I", _SNAPSHOT_VERSION))
-        f.write(struct.pack("<Q", state.n_tokens))
-        f.write(struct.pack("<Q", state.seed))
-        f.write(struct.pack("<Q", len(seq_bytes)))
-        f.write(seq_bytes)
-        f.write(struct.pack("<Q", len(state.input_ids)))
+        f.write(struct.pack("<Q", snap.n_tokens))
+        f.write(struct.pack("<Q", snap.seed))
+        f.write(struct.pack("<Q", len(snap.seq_data)))
+        f.write(snap.seq_data)
+        f.write(struct.pack("<Q", snap.n_tokens))
         f.write(input_ids_bytes)
 
 
@@ -169,14 +187,19 @@ class CooperativeSlotManager:
 
     Analogous to an OS scheduler: each agent's KV cache is its "process state,"
     saved/restored on context switch. Only one agent runs at a time.
-    Each context switch costs one save_state + one load_state (~50-200 ms for
-    a 7B model). This is acceptable for agent-scale workloads.
+
+    _slot_states stores compact _Snapshot objects (per-sequence KV bytes, same
+    format as v4 disk snapshots) rather than full LlamaState objects from
+    model.save_state(). model.save_state() copies the entire n_ctx-sized KV
+    buffer regardless of how many tokens are populated; _capture_compact only
+    serializes the live tokens via llama_state_seq_get_data. For 8 primed agents
+    at 8192 ctx this is ~64 MB total in Python heap instead of several GB.
     """
 
     def __init__(self, model: "Llama"):
         self.model = model
         self._active_slot: Optional[int] = None
-        self._slot_states: Dict[int, Optional["LlamaState"]] = {}
+        self._slot_states: Dict[int, Optional["_Snapshot"]] = {}
         self._lock = threading.Lock()
 
     def switch_to(self, slot_id: int) -> None:
@@ -185,10 +208,10 @@ class CooperativeSlotManager:
             if self._active_slot == slot_id:
                 return
             if self._active_slot is not None:
-                self._slot_states[self._active_slot] = self.model.save_state()
+                self._slot_states[self._active_slot] = _capture_compact(self.model)
             target = self._slot_states.get(slot_id)
             if target is not None:
-                self.model.load_state(target)
+                target.apply_to(self.model)
             else:
                 self.model.reset()
             self._active_slot = slot_id
@@ -200,13 +223,13 @@ class CooperativeSlotManager:
             if self._active_slot == slot_id:
                 self._active_slot = None
 
-    def snapshot_state(self, slot_id: int) -> Optional["LlamaState"]:
-        """Return the current in-memory LlamaState for a slot."""
+    def snapshot_state(self, slot_id: int) -> Optional["_Snapshot"]:
+        """Return the current compact in-memory snapshot for a slot."""
         with self._lock:
             if self._active_slot == slot_id:
-                state = self.model.save_state()
-                self._slot_states[slot_id] = state
-                return state
+                snap = _capture_compact(self.model)
+                self._slot_states[slot_id] = snap
+                return snap
             return self._slot_states.get(slot_id)
 
 

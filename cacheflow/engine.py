@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 from cacheflow.llama_server_custom import (
     CooperativeSlotManager,
     Slot,
+    _capture_compact,
     _write_snapshot,
     _read_snapshot,
 )
@@ -193,7 +194,7 @@ class LlamaEngine:
             self.slot_manager.invalidate(slot_id)
             self.slot_manager.switch_to(slot_id)
             snap.apply_to(self.model)
-            self.slot_manager._slot_states[slot_id] = self.model.save_state()
+            self.slot_manager._slot_states[slot_id] = snap
             self.slot_manager._active_slot = slot_id
             return {"filename": filename, "restore_time_ms": int((time.time() - start) * 1000)}
 
@@ -201,13 +202,13 @@ class LlamaEngine:
         """Save the slot's KV cache state to disk."""
         with self._exec_lock:
             self.slot_manager.switch_to(slot_id)
-            state = self.model.save_state()
-            self.slot_manager._slot_states[slot_id] = state
+            snap = _capture_compact(self.model)
+            self.slot_manager._slot_states[slot_id] = snap
 
             filename = f"slot_{slot_id}_{uuid.uuid4().hex[:8]}.bin"
             filepath = self.slot_save_path / filename
             start = time.time()
-            _write_snapshot(filepath, self.model, state)
+            _write_snapshot(filepath, snap)
             return {
                 "filename": filename,
                 "save_time_ms": int((time.time() - start) * 1000),
