@@ -18,6 +18,7 @@ it.
 
 from __future__ import annotations
 
+import collections
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -99,6 +100,7 @@ def run_agentic(
     allow_bash: bool = False,
     on_token: Optional[Callable[[str], None]] = None,
     workspace_path: Optional[Path] = None,
+    max_history_turns: int = 4,
 ) -> AgentLoopResult:
     """Run a multi-step agentic task: observe -> act -> observe over the codebase.
 
@@ -149,7 +151,12 @@ def run_agentic(
             store=session.store,
         )
 
-        convo = _build_agentic_preamble(session, task)
+        preamble = _build_agentic_preamble(session, task)
+        # Keep only the last `max_history_turns` (assistant, observation) pairs
+        # in the prompt so the agentic conversation can't grow unbounded and
+        # blow the context window on real codebases at small ctx_size. The
+        # stable codebase prefix stays cached; only this bounded tail re-prefills.
+        history: collections.deque = collections.deque(maxlen=max_history_turns)
         stop_tokens = ["OBSERVATION:", session._get_template().stop_token]
         steps: list[AgentStep] = []
         tokens_evaluated = 0
@@ -161,6 +168,9 @@ def run_agentic(
         repeat_count = 0
 
         for _ in range(max_steps):
+            convo = preamble
+            for entry in history:
+                convo = _append_observation(session, convo, entry["assistant"], entry["observation"])
             prompt = stable_prefix + convo
             # A model stuck repeating the same malformed action (e.g. unescaped
             # quotes in ARGS JSON) grows convo every step without making
@@ -240,7 +250,7 @@ def run_agentic(
                         "where ARGS is a one-line JSON object."
                     )
                 steps.append(AgentStep("(parse_error)", {}, obs))
-                convo = _append_observation(session, convo, content, obs)
+                history.append({"assistant": content, "observation": obs})
                 continue
 
             if action.tool == "finish":
@@ -251,7 +261,7 @@ def run_agentic(
 
             obs = execute(action, ctx)
             steps.append(AgentStep(action.tool, action.args, obs))
-            convo = _append_observation(session, convo, content, obs)
+            history.append({"assistant": content, "observation": obs})
 
         return AgentLoopResult(
             agent_name=session.agent_name,

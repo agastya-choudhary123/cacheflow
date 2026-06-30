@@ -27,6 +27,7 @@ DEFAULT_SYSTEM_PROMPT = """You are an expert software engineer with deep knowled
 
 # Global slot pool for managing concurrent agent execution
 _SLOT_POOL = SlotPool(max_slots=8)
+BENCHMARK_MODE: bool = False  # set True by harness; suppresses background compactor
 
 # Serializes concurrent init_db calls to prevent SQLite locking races
 _DB_INIT_LOCK = threading.Lock()

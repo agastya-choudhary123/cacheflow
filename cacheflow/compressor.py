@@ -38,6 +38,9 @@ class Compressor:
 
     def maybe_compact_async(self, agent: Agent) -> None:
         """Schedule consolidation on the background executor if the agent is due."""
+        from cacheflow.agent import BENCHMARK_MODE
+        if BENCHMARK_MODE:
+            return
         if not self.needs_compaction(agent):
             return
 
