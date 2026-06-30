@@ -16,7 +16,18 @@ REPO_CORPUS = {
 }
 
 ALL_WORKLOADS = ["W1", "W2", "W3", "W4", "W5", "W6", "W7", "W8"]
-ALL_BENCHMARKS = ["humaneval", "bigcodebench", "repobench", "custom-qa", "custom-agentic-chain"]
+
+# Primary benchmarks for Tier 2/3 runs
+BENCHMARKS_PRIMARY = ["swebench-lite", "swebench-verified", "prodcodebench", "gaia", "agentbench", "featbench"]
+
+# Secondary benchmarks for Tier 4 (optional)
+BENCHMARKS_SECONDARY = ["repomod-bench", "octobench", "ml-bench", "repodebug"]
+
+# Legacy single-turn / QA benchmarks
+BENCHMARKS_LEGACY = ["humaneval", "bigcodebench", "repobench", "custom-qa", "custom-agentic-chain"]
+
+# All benchmarks (default for harness)
+ALL_BENCHMARKS = BENCHMARKS_PRIMARY + BENCHMARKS_SECONDARY + BENCHMARKS_LEGACY
 
 LOCAL_MODEL = "qwen3:8b"
 CLOUD_MODEL = "claude-opus-4-8"

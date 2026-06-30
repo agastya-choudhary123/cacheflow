@@ -135,6 +135,7 @@ class MetricsCollector:
             "tool_calls_by_type": tool_calls_by_type,
             "tokens_evaluated_per_step": tokens_evaluated_per_step,
             "tokens_generated_per_step": tokens_generated_per_step,
+            "response_text": response_text,
             "duration_ms": duration_ms,
             "error": error,
         }
