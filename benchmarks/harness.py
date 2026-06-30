@@ -1,12 +1,11 @@
-"""CacheFlow benchmark harness.
+"""CacheFlow benchmark harness - simple direct execution.
 
-Run benchmarks on both local (qwen3:8b) and cloud (claude-opus-4-8) backends.
-Report pass rates for each benchmark.
+Run benchmarks on local model (qwen3:8b) and cloud model (claude-opus-4-8).
+Report pass rates directly by executing models on tasks.
 
 Usage:
     python benchmarks/harness.py --bench humaneval swebench-lite --max-tasks 5
     python benchmarks/harness.py --bench all --max-tasks 2
-    python benchmarks/harness.py --bench humaneval --backends local
 """
 
 import argparse
@@ -14,7 +13,6 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional
-import json
 
 REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -77,9 +75,8 @@ def run_local(adapter, bench: str, max_tasks: Optional[int] = None) -> dict:
     print(f"  [local] Loading tasks...", end="", flush=True)
 
     try:
-        from benchmarks.runners.local import LocalRunner
-        from benchmarks.config import BenchConfig
-        from benchmarks.metrics import MetricsCollector
+        from cacheflow.agent import AgentSession
+        from cacheflow.config import load_config
 
         tasks = list(adapter.tasks(Path.cwd(), max_tasks=max_tasks))
         if not tasks:
@@ -89,40 +86,32 @@ def run_local(adapter, bench: str, max_tasks: Optional[int] = None) -> dict:
         print(f" {len(tasks)} tasks")
         print(f"  [local] Running...", end="", flush=True)
 
-        # Create minimal config for local runner
-        cfg = BenchConfig(
-            repos=["_dummy"],
-            workloads=["W1"],
-            benchmarks=[bench],
-            backend="local",
-            output_dir=Path("benchmarks/results"),
-            repos_dir=Path.home() / ".cache" / "cacheflow-bench-repos",
-            max_tasks=max_tasks,
-            ctx_size=8192,
-        )
+        # Load model
+        try:
+            config = load_config(Path.home() / ".cacheflow")
+        except:
+            print(" [error] Could not load CacheFlow config")
+            return {"bench": bench, "backend": "local", "status": "error", "error": "config"}
 
-        # Create runner (without repo setup, just for execution)
-        runner = LocalRunner(cfg, Path.cwd(), "_dummy", None, "main")
+        # Create agent session
+        agent = AgentSession.load_or_init(config, "benchmark_local")
 
         pass_count = 0
         for i, task in enumerate(tasks):
             if (i + 1) % max(1, len(tasks) // 5) == 0:
                 print(f" {i+1}/{len(tasks)}", end="", flush=True)
             try:
-                # Run task through local runner (actually executes qwen3:8b)
-                result = runner.run_single(
-                    task.task_text,
-                    task.task_id,
-                    f"bench_{bench}_{i}",
-                    bench,
-                    "W1"
-                )
-                response = result.get("response_text", "")
+                # Run task through CacheFlow agent
+                result = agent.run(task.task_text, timeout_secs=30)
+                response = result.response if result else ""
+
+                # Evaluate
                 eval_result = adapter.evaluate(task, response)
                 if eval_result is True:
                     pass_count += 1
-            except Exception:
-                pass
+            except Exception as e:
+                if i == 0:
+                    print(f"\n  [debug] {str(e)[:80]}")
 
         pass_rate = 100 * pass_count / len(tasks) if tasks else 0
         print(f" ✓ {pass_count}/{len(tasks)} ({pass_rate:.1f}%)")
@@ -138,7 +127,7 @@ def run_local(adapter, bench: str, max_tasks: Optional[int] = None) -> dict:
         }
     except Exception as e:
         print(f" [error] {str(e)[:60]}")
-        return {"bench": bench, "backend": "local", "status": "error", "error": str(e)}
+        return {"bench": bench, "backend": "local", "status": "error", "error": str(e)[:40]}
 
 
 def run_cloud(adapter, bench: str, max_tasks: Optional[int] = None) -> dict:
@@ -146,8 +135,7 @@ def run_cloud(adapter, bench: str, max_tasks: Optional[int] = None) -> dict:
     print(f"  [cloud] Loading tasks...", end="", flush=True)
 
     try:
-        from benchmarks.runners.cloud import CloudRunner
-        from benchmarks.config import BenchConfig
+        import anthropic
 
         tasks = list(adapter.tasks(Path.cwd(), max_tasks=max_tasks))
         if not tasks:
@@ -157,40 +145,29 @@ def run_cloud(adapter, bench: str, max_tasks: Optional[int] = None) -> dict:
         print(f" {len(tasks)} tasks")
         print(f"  [cloud] Running...", end="", flush=True)
 
-        # Create minimal config for cloud runner
-        cfg = BenchConfig(
-            repos=["_dummy"],
-            workloads=["W1"],
-            benchmarks=[bench],
-            backend="cloud",
-            output_dir=Path("benchmarks/results"),
-            repos_dir=Path.home() / ".cache" / "cacheflow-bench-repos",
-            max_tasks=max_tasks,
-            ctx_size=8192,
-        )
-
-        # Create runner
-        runner = CloudRunner(cfg, Path.cwd(), "_dummy", None, "main")
+        # Initialize client
+        client = anthropic.Anthropic()
 
         pass_count = 0
         for i, task in enumerate(tasks):
             if (i + 1) % max(1, len(tasks) // 5) == 0:
                 print(f" {i+1}/{len(tasks)}", end="", flush=True)
             try:
-                # Run task through cloud runner (actually executes claude-opus-4-8)
-                result = runner.run_single(
-                    task.task_text,
-                    task.task_id,
-                    f"bench_{bench}_{i}",
-                    bench,
-                    "W1"
+                # Run task through Claude API
+                message = client.messages.create(
+                    model="claude-opus-4-8",
+                    max_tokens=2048,
+                    messages=[{"role": "user", "content": task.task_text}],
                 )
-                response = result.get("response_text", "")
+                response = message.content[0].text if message.content else ""
+
+                # Evaluate
                 eval_result = adapter.evaluate(task, response)
                 if eval_result is True:
                     pass_count += 1
-            except Exception:
-                pass
+            except Exception as e:
+                if i == 0:
+                    print(f"\n  [debug] {str(e)[:80]}")
 
         pass_rate = 100 * pass_count / len(tasks) if tasks else 0
         print(f" ✓ {pass_count}/{len(tasks)} ({pass_rate:.1f}%)")
@@ -206,7 +183,7 @@ def run_cloud(adapter, bench: str, max_tasks: Optional[int] = None) -> dict:
         }
     except Exception as e:
         print(f" [error] {str(e)[:60]}")
-        return {"bench": bench, "backend": "cloud", "status": "error", "error": str(e)}
+        return {"bench": bench, "backend": "cloud", "status": "error", "error": str(e)[:40]}
 
 
 def main():
