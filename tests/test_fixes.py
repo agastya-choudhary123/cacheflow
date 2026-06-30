@@ -453,7 +453,7 @@ def test_gc_removes_unreferenced_snapshots(store, snapshots_dir):
     orphan = snapshots_dir / "orphan_abc12345.bin"
     orphan.write_bytes(os.urandom(512))
 
-    gc = SnapshotGC(store, snapshots_dir)
+    gc = SnapshotGC(store, snapshots_dir, grace_seconds=0)
     deleted = gc.collect(dry_run=False)
 
     assert orphan in deleted
@@ -469,7 +469,7 @@ def test_gc_dry_run_does_not_delete(store, snapshots_dir):
     orphan = snapshots_dir / "orphan_dryrun.bin"
     orphan.write_bytes(os.urandom(512))
 
-    gc = SnapshotGC(store, snapshots_dir)
+    gc = SnapshotGC(store, snapshots_dir, grace_seconds=0)
     deleted = gc.collect(dry_run=True)
 
     assert orphan in deleted
@@ -484,7 +484,7 @@ def test_gc_removes_tmp_orphans(store, snapshots_dir):
     tmp_file = snapshots_dir / ".tmp_orphan_crash.bin"
     tmp_file.write_bytes(os.urandom(512))
 
-    gc = SnapshotGC(store, snapshots_dir)
+    gc = SnapshotGC(store, snapshots_dir, grace_seconds=0)
     deleted = gc.collect()
     assert tmp_file in deleted
     assert not tmp_file.exists()
@@ -500,7 +500,7 @@ def test_gc_keeps_head_for_every_agent(store, snapshots_dir):
     new_a = _set_head_snapshot(store, store.get_agent("a"), snapshots_dir)
     head_b = _set_head_snapshot(store, agent_b, snapshots_dir)
 
-    gc = SnapshotGC(store, snapshots_dir)
+    gc = SnapshotGC(store, snapshots_dir, grace_seconds=0)
     deleted = gc.collect()
 
     # Both agents' current HEADs survive
@@ -509,3 +509,29 @@ def test_gc_keeps_head_for_every_agent(store, snapshots_dir):
     # The superseded snapshot is collected
     assert old_a in deleted
     assert not old_a.exists()
+
+
+def test_gc_grace_period_spares_in_flight_save(store, snapshots_dir):
+    """A just-written unreferenced snapshot (a concurrent session's in-flight
+    save, not yet promoted to its agent HEAD) is spared while within the grace
+    period, then reaped once it ages past it. Guards the W3 concurrency race
+    where one agent's GC deleted another agent's mid-rename snapshot."""
+    agent = store.create_agent("a", "model", "hash", 8192)
+    _set_head_snapshot(store, agent, snapshots_dir, size=0 or 1024)
+
+    # Mimic engine.save_slot's transient pre-rename output filename.
+    in_flight = snapshots_dir / "slot_0_deadbeef.bin"
+    in_flight.write_bytes(os.urandom(512))
+
+    # Default grace: the fresh file is too young to reap.
+    gc = SnapshotGC(store, snapshots_dir)
+    deleted = gc.collect()
+    assert in_flight not in deleted
+    assert in_flight.exists()
+
+    # Once it ages past the grace window it becomes reapable.
+    old = time.time() - 120
+    os.utime(in_flight, (old, old))
+    deleted = gc.collect()
+    assert in_flight in deleted
+    assert not in_flight.exists()
