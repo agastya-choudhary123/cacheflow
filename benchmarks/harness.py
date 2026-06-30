@@ -86,15 +86,22 @@ def run_local(adapter, bench: str, max_tasks: Optional[int] = None) -> dict:
         print(f" {len(tasks)} tasks")
         print(f"  [local] Running...", end="", flush=True)
 
-        # Load model
-        try:
-            config = load_config(Path.home() / ".cacheflow")
-        except:
+        # Load config - try repo root first, then home
+        base_path = None
+        for path in [REPO_ROOT, Path.home()]:
+            try:
+                config = load_config(path)
+                base_path = path
+                break
+            except:
+                pass
+
+        if not base_path:
             print(" [error] Could not load CacheFlow config")
             return {"bench": bench, "backend": "local", "status": "error", "error": "config"}
 
         # Create agent session
-        agent = AgentSession.load_or_init(config, "benchmark_local")
+        agent = AgentSession(f"benchmark_{bench}_local", base_path)
 
         pass_count = 0
         for i, task in enumerate(tasks):
@@ -102,7 +109,7 @@ def run_local(adapter, bench: str, max_tasks: Optional[int] = None) -> dict:
                 print(f" {i+1}/{len(tasks)}", end="", flush=True)
             try:
                 # Run task through CacheFlow agent
-                result = agent.run(task.task_text, timeout_secs=30)
+                result = agent.run(task.task_text)
                 response = result.response if result else ""
 
                 # Evaluate
