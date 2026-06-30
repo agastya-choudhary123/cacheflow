@@ -53,6 +53,7 @@ class SlotPool:
         self.slots: Dict[int, SlotState] = {}
         self.agent_slot_map: Dict[UUID, int] = {}  # agent_id -> slot_id
         self._lock = threading.RLock()
+        self.eviction_count: int = 0  # total LRU evictions; read by benchmark harness
 
         # Initialize slots
         for i in range(max_slots):
@@ -97,6 +98,7 @@ class SlotPool:
             # Remove LRU agent's mapping
             if lru_agent_id:
                 del self.agent_slot_map[lru_agent_id]
+            self.eviction_count += 1
 
             # Reuse slot for new agent
             lru_state.agent_id = agent_id
@@ -190,6 +192,7 @@ class SlotPool:
             "max_slots": self.max_slots,
             "active_agents": total_agents,
             "dirty_slots": dirty_slots,
+            "eviction_count": self.eviction_count,
             "slot_states": {
                 sid: {
                     "agent_id": str(state.agent_id) if state.agent_id else None,
