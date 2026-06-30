@@ -205,29 +205,39 @@ def test_fix6_hash_context_helper():
 # ── Issue 10: CooperativeSlotManager ─────────────────────────────────────────
 
 def test_fix10_cooperative_slot_manager_switch():
-    """CooperativeSlotManager context-switches between slots correctly."""
+    """CooperativeSlotManager context-switches between slots correctly.
+
+    The manager saves the active slot via the compact per-sequence capture
+    (`_capture_compact`, the v4 path) and restores a target slot by applying
+    its stored `_Snapshot` back onto the model — so we patch `_capture_compact`
+    rather than the old `save_state`/`load_state` API it used to call.
+    """
     from cacheflow.llama_server_custom import CooperativeSlotManager
 
     mock_model = MagicMock()
-    mock_model.save_state.return_value = b"state_0"
-    mock_model.load_state = MagicMock()
     mock_model.reset = MagicMock()
+    snap_0 = MagicMock(name="snapshot_slot_0")
 
-    manager = CooperativeSlotManager(mock_model)
+    with patch("cacheflow.llama_server_custom._capture_compact",
+               return_value=snap_0) as capture:
+        manager = CooperativeSlotManager(mock_model)
 
-    # Switch to slot 0 — no active slot, should reset
-    manager.switch_to(0)
-    mock_model.reset.assert_called_once()
+        # Switch to slot 0 — no active slot, should reset (no state to apply).
+        manager.switch_to(0)
+        mock_model.reset.assert_called_once()
+        capture.assert_not_called()
 
-    # Switch to slot 1 — should save slot 0 state first, then reset (no state for slot 1)
-    mock_model.reset.reset_mock()
-    manager.switch_to(1)
-    mock_model.save_state.assert_called()
-    assert 0 in manager._slot_states
+        # Switch to slot 1 — should capture slot 0's state first, then reset
+        # (slot 1 has no saved state yet).
+        mock_model.reset.reset_mock()
+        manager.switch_to(1)
+        capture.assert_called_once_with(mock_model)
+        assert manager._slot_states[0] is snap_0
+        mock_model.reset.assert_called_once()
 
-    # Switch back to slot 0 — should restore slot 0's state
-    manager.switch_to(0)
-    mock_model.load_state.assert_called_with(b"state_0")
+        # Switch back to slot 0 — should restore slot 0's snapshot.
+        manager.switch_to(0)
+        snap_0.apply_to.assert_called_once_with(mock_model)
 
 
 def test_fix10_same_slot_noop():
@@ -235,15 +245,16 @@ def test_fix10_same_slot_noop():
     from cacheflow.llama_server_custom import CooperativeSlotManager
 
     mock_model = MagicMock()
-    mock_model.save_state.return_value = b"state"
     mock_model.reset = MagicMock()
 
-    manager = CooperativeSlotManager(mock_model)
-    manager.switch_to(0)
-    call_count_before = mock_model.reset.call_count
+    with patch("cacheflow.llama_server_custom._capture_compact",
+               return_value=MagicMock()):
+        manager = CooperativeSlotManager(mock_model)
+        manager.switch_to(0)
+        call_count_before = mock_model.reset.call_count
 
-    manager.switch_to(0)  # same slot
-    assert mock_model.reset.call_count == call_count_before  # no extra reset
+        manager.switch_to(0)  # same slot
+        assert mock_model.reset.call_count == call_count_before  # no extra reset
 
 
 def test_fix10_invalidate_clears_state():
@@ -251,14 +262,15 @@ def test_fix10_invalidate_clears_state():
     from cacheflow.llama_server_custom import CooperativeSlotManager
 
     mock_model = MagicMock()
-    mock_model.save_state.return_value = b"state"
     mock_model.reset = MagicMock()
 
-    manager = CooperativeSlotManager(mock_model)
-    manager.switch_to(0)
-    manager._slot_states[0] = b"some state"
-    manager.invalidate(0)
-    assert 0 not in manager._slot_states
+    with patch("cacheflow.llama_server_custom._capture_compact",
+               return_value=MagicMock()):
+        manager = CooperativeSlotManager(mock_model)
+        manager.switch_to(0)
+        manager._slot_states[0] = MagicMock(name="some state")
+        manager.invalidate(0)
+        assert 0 not in manager._slot_states
 
 
 # ── Issue 11: mark_dirty / load_commit are now locked ────────────────────────
