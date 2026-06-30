@@ -178,6 +178,8 @@ The model's own tool palette includes `cacheflow_status`, which reports its curr
 
 Snapshots use a compact binary format (`CFKV`, version 4) defined in `llama_server_custom.py`. Instead of `model.save_state()` — which serializes the **entire** `n_ctx` buffer (e.g. 16384 tokens) regardless of occupancy — v4 serializes only the live KV via `llama_state_seq_get_data`. A 9k-token prime no longer writes the full 16384-ctx buffer, shrinking both the save write and the restore read. Restore splices the sequence back in with `llama_state_seq_set_data` after clearing the KV. Older v3 (full-state) snapshots remain readable; agents upgrade transparently on their next prime.
 
+The same compact format is used for **in-memory slot states** in `CooperativeSlotManager`. Previously, context switches called `model.save_state()` — copying the full n_ctx-sized KV buffer per slot into Python heap (hundreds of MB each). `_slot_states` now holds `_Snapshot` objects captured via `_capture_compact()` (the same `llama_state_seq_get_data` path as disk snapshots), so a primed slot costs ~8 MB of RAM instead of several hundred. With 8 active agents that difference is the gap between ~64 MB and potentially multiple GB of Python heap on top of the model weights.
+
 ### Time, CPU, Compute, and Token Metrics
 
 Wall-clock time is the headline metric (it's what's actually scarce on local hardware), but nothing here is estimated or guessed — every figure is either a direct OS/library measurement or exact arithmetic over measured inputs:
@@ -194,7 +196,7 @@ Wall-clock time is the headline metric (it's what's actually scarce on local har
 - Up to 8 concurrent agents via `SlotPool`
 - Each agent gets an exclusive slot during its session; the `SlotLease` context manager guarantees cleanup on crash or exception
 - LRU eviction only reclaims idle agents' slots, never an actively-running one
-- All agents share a single in-memory model; `CooperativeSlotManager` swaps KV state on context switch
+- All agents share a single in-memory model; `CooperativeSlotManager` swaps KV state on context switch using compact per-sequence snapshots (~8 MB each) — not full-context state copies
 
 ### Semantic RAG for Stable Context
 
@@ -300,7 +302,7 @@ cacheflow/
 
 **Flat store, HEAD per agent**: each agent points at a single current snapshot (`current_snapshot_path`); there is no commit DAG. Forking copies the parent's HEAD and records `parent_agent_id`.
 
-**Per-sequence snapshots**: serialize only the live KV (v4), not the full context buffer.
+**Per-sequence snapshots everywhere**: serialize only the live KV (v4) for both disk snapshots and in-memory slot states. `model.save_state()` copies the entire n_ctx buffer regardless of occupancy; `llama_state_seq_get_data` copies only the populated tokens. Applied consistently so context switches between 8 agents don't accumulate GB of Python heap.
 
 **Skip the redundant warm-path save**: on restore, the HEAD on disk is already identical, so no re-write.
 
@@ -351,7 +353,8 @@ A shared `tests/conftest.py` autouse fixture patches `cacheflow.agent.get_tokeni
 **Memory:**
 - Model weights: ~4–8 GB (7B model at 4-bit quantization)
 - Model tokenizer (vocab_only): ~50–100 MB (main process)
-- KV cache per slot: ~1–2 GB at 8192 context
+- GPU KV cache: sized for one active context (n_ctx tokens); only the currently-running agent's KV lives on the GPU at a time
+- In-memory slot states (inactive agents): ~8 MB each via compact per-sequence serialization; 8 idle agents ≈ ~64 MB total Python heap
 
 **Time/compute efficiency (measured on this repo, 16384 ctx, qwen2.5-coder:7b):**
 - Cold prime (baseline): ~1.8s wall-clock, 9,064 prompt tokens evaluated
