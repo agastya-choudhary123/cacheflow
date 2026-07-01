@@ -8,7 +8,6 @@ generated solution in a sandbox via exec() and checks test assertions.
 import ast
 import re
 import sys
-import textwrap
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -35,10 +34,31 @@ def _extract_code(response: str, func_name: str) -> str:
     return "\n".join(lines)
 
 
-def _run_solution(full_code: str, test_code: str, timeout: int = 10) -> bool:
+def _indent_body(body: str) -> str:
+    """Indent a function body for insertion after the signature.
+
+    Models asked for "only the function body" commonly write the first line
+    with no leading whitespace (as if it were being typed at the insertion
+    point) while every subsequent line already carries its real, absolute
+    indentation relative to the function (since after a newline there's no
+    insertion point left to imply it). Uniformly indenting every line with
+    textwrap.indent() double-indents everything but the first line and
+    breaks the block's structure. Only the first line needs a nudge to the
+    function-body level; later lines are left as the model wrote them.
+    """
+    lines = body.split("\n")
+    if lines and not lines[0].startswith(" "):
+        lines[0] = "    " + lines[0]
+    return "\n".join(lines)
+
+
+def _run_solution(full_code: str, test_code: str, entry_point: str, timeout: int = 10) -> bool:
     """Execute solution + tests in a subprocess; return True if exit 0."""
     import subprocess, tempfile, os
-    combined = full_code + "\n\n" + test_code + "\ncheck(candidate)\n"
+    combined = (
+        full_code + "\n\n" + test_code
+        + f"\ncandidate = {entry_point}\ncheck(candidate)\n"
+    )
     with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
         f.write(combined)
         fname = f.name
@@ -100,8 +120,8 @@ class HumanEvalAdapter(BenchmarkAdapter):
 
         extracted = _extract_code(response, entry_point)
         # Build full solution: original prompt + extracted body
-        full_code = prompt + "\n" + textwrap.indent(extracted, "    ")
-        return _run_solution(full_code, test_code)
+        full_code = prompt + "\n" + _indent_body(extracted)
+        return _run_solution(full_code, test_code, entry_point)
 
 
 class HumanEvalFallbackAdapter(BenchmarkAdapter):
@@ -136,8 +156,8 @@ class HumanEvalFallbackAdapter(BenchmarkAdapter):
         if task.metadata is None:
             return None
         extracted = _extract_code(response, task.metadata["entry_point"])
-        full_code = task.metadata["prompt"] + "\n" + textwrap.indent(extracted, "    ")
-        return _run_solution(full_code, task.metadata["test"])
+        full_code = task.metadata["prompt"] + "\n" + _indent_body(extracted)
+        return _run_solution(full_code, task.metadata["test"], task.metadata["entry_point"])
 
 
 def get_adapter() -> BenchmarkAdapter:

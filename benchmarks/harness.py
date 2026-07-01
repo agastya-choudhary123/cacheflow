@@ -19,6 +19,37 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from benchmarks.config import ALL_BENCHMARKS
 
+# Scratch dir with no source files, used as AgentSession.base_path for benchmark
+# tasks. Benchmark tasks (HumanEval, swebench-lite, etc.) are self-contained
+# prompts that need no codebase context — pointing AgentSession at REPO_ROOT
+# would make it stuff CacheFlow's own ~13K-line source tree into the stable
+# prefix as fake "codebase" context, blowing past ctx_size and crashing
+# llama_decode (-3) before the task itself is even evaluated.
+SCRATCH_PATH = REPO_ROOT / ".bench_scratch"
+
+
+def _ensure_scratch_config() -> Path:
+    """Ensure SCRATCH_PATH has a .cacheflow/config.json, copied from an existing
+    CacheFlow project config (repo root or home), and return SCRATCH_PATH."""
+    import json
+    import shutil
+
+    scratch_cf = SCRATCH_PATH / ".cacheflow"
+    scratch_cf.mkdir(parents=True, exist_ok=True)
+    scratch_config = scratch_cf / "config.json"
+    if scratch_config.exists():
+        return SCRATCH_PATH
+
+    for source in [REPO_ROOT / ".cacheflow" / "config.json",
+                   Path.home() / ".cacheflow" / "config.json"]:
+        if source.exists():
+            shutil.copy(source, scratch_config)
+            return SCRATCH_PATH
+
+    raise FileNotFoundError(
+        "No CacheFlow config found at repo root or home. Run 'cf init' first."
+    )
+
 
 def _get_adapter(bench: str):
     """Get benchmark adapter by name."""
@@ -76,7 +107,6 @@ def run_local(adapter, bench: str, max_tasks: Optional[int] = None) -> dict:
 
     try:
         from cacheflow.agent import AgentSession
-        from cacheflow.config import load_config
 
         tasks = list(adapter.tasks(Path.cwd(), max_tasks=max_tasks))
         if not tasks:
@@ -86,21 +116,13 @@ def run_local(adapter, bench: str, max_tasks: Optional[int] = None) -> dict:
         print(f" {len(tasks)} tasks")
         print(f"  [local] Running...", end="", flush=True)
 
-        # Load config - try repo root first, then home
-        base_path = None
-        for path in [REPO_ROOT, Path.home()]:
-            try:
-                config = load_config(path)
-                base_path = path
-                break
-            except:
-                pass
-
-        if not base_path:
-            print(" [error] Could not load CacheFlow config")
+        try:
+            base_path = _ensure_scratch_config()
+        except FileNotFoundError as e:
+            print(f" [error] {e}")
             return {"bench": bench, "backend": "local", "status": "error", "error": "config"}
 
-        # Create agent session
+        # Create agent session against an empty scratch dir (no codebase context)
         agent = AgentSession(f"benchmark_{bench}_local", base_path)
 
         pass_count = 0

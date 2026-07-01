@@ -11,6 +11,7 @@ build/
 *.db-*
 *.bin
 .cacheflow/
+.bench_scratch/
 .claude/
 *.log
 session_log.md
