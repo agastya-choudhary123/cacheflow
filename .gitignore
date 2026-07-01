@@ -13,6 +13,9 @@ build/
 .cacheflow/
 .bench_scratch/
 .claude/
+logs/
+*.swebench-lite_*.json
+*.swebench-verified_*.json
 *.log
 session_log.md
 *_TEST_LOG.txt

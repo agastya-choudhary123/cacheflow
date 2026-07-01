@@ -101,9 +101,50 @@ def _get_adapter(bench: str):
     raise ValueError(f"Unknown benchmark: {bench}")
 
 
+def _score(adapter, bench: str, backend: str, model: str,
+           task_responses: list) -> dict:
+    """Score (task, response) pairs, either per-task via adapter.evaluate()
+    or, when the adapter exposes it (SWE-bench), batched through
+    adapter.evaluate_predictions() — grading a patch needs the instance's own
+    Docker image plus its FAIL_TO_PASS/PASS_TO_PASS test sets, which only a
+    batched, Docker-backed call can provide; there's no meaningful per-task
+    evaluate() for it.
+    """
+    n = len(task_responses)
+    if hasattr(adapter, "evaluate_predictions"):
+        predictions = [
+            {
+                "instance_id": task.task_id,
+                "model_name_or_path": model,
+                "model_patch": response,
+            }
+            for task, response in task_responses
+        ]
+        run_id = f"{bench}_{backend}_{int(time.time())}"
+        results = adapter.evaluate_predictions(predictions, run_id=run_id)
+        pass_count = sum(1 for v in results.values() if v)
+    else:
+        pass_count = 0
+        for task, response in task_responses:
+            try:
+                if adapter.evaluate(task, response) is True:
+                    pass_count += 1
+            except Exception:
+                pass
+
+    pass_rate = 100 * pass_count / n if n else 0
+    print(f" ✓ {pass_count}/{n} ({pass_rate:.1f}%)")
+    return {
+        "bench": bench, "backend": backend, "model": model,
+        "tasks": n, "passed": pass_count, "pass_rate": pass_rate,
+        "status": "ok",
+    }
+
+
 def run_local(adapter, bench: str, max_tasks: Optional[int] = None) -> dict:
     """Run benchmark on local model (qwen3:8b via CacheFlow)."""
     print(f"  [local] Loading tasks...", end="", flush=True)
+    model = "qwen3:8b"
 
     try:
         from cacheflow.agent import AgentSession
@@ -125,35 +166,20 @@ def run_local(adapter, bench: str, max_tasks: Optional[int] = None) -> dict:
         # Create agent session against an empty scratch dir (no codebase context)
         agent = AgentSession(f"benchmark_{bench}_local", base_path)
 
-        pass_count = 0
+        task_responses = []
         for i, task in enumerate(tasks):
             if (i + 1) % max(1, len(tasks) // 5) == 0:
                 print(f" {i+1}/{len(tasks)}", end="", flush=True)
             try:
-                # Run task through CacheFlow agent
                 result = agent.run(task.task_text)
                 response = result.response if result else ""
-
-                # Evaluate
-                eval_result = adapter.evaluate(task, response)
-                if eval_result is True:
-                    pass_count += 1
             except Exception as e:
+                response = ""
                 if i == 0:
                     print(f"\n  [debug] {str(e)[:80]}")
+            task_responses.append((task, response))
 
-        pass_rate = 100 * pass_count / len(tasks) if tasks else 0
-        print(f" ✓ {pass_count}/{len(tasks)} ({pass_rate:.1f}%)")
-
-        return {
-            "bench": bench,
-            "backend": "local",
-            "model": "qwen3:8b",
-            "tasks": len(tasks),
-            "passed": pass_count,
-            "pass_rate": pass_rate,
-            "status": "ok"
-        }
+        return _score(adapter, bench, "local", model, task_responses)
     except Exception as e:
         print(f" [error] {str(e)[:60]}")
         return {"bench": bench, "backend": "local", "status": "error", "error": str(e)[:40]}
@@ -162,6 +188,7 @@ def run_local(adapter, bench: str, max_tasks: Optional[int] = None) -> dict:
 def run_cloud(adapter, bench: str, max_tasks: Optional[int] = None) -> dict:
     """Run benchmark on cloud model (claude-opus-4-8)."""
     print(f"  [cloud] Loading tasks...", end="", flush=True)
+    model = "claude-opus-4-8"
 
     try:
         import anthropic
@@ -174,42 +201,26 @@ def run_cloud(adapter, bench: str, max_tasks: Optional[int] = None) -> dict:
         print(f" {len(tasks)} tasks")
         print(f"  [cloud] Running...", end="", flush=True)
 
-        # Initialize client
         client = anthropic.Anthropic()
 
-        pass_count = 0
+        task_responses = []
         for i, task in enumerate(tasks):
             if (i + 1) % max(1, len(tasks) // 5) == 0:
                 print(f" {i+1}/{len(tasks)}", end="", flush=True)
             try:
-                # Run task through Claude API
                 message = client.messages.create(
-                    model="claude-opus-4-8",
+                    model=model,
                     max_tokens=2048,
                     messages=[{"role": "user", "content": task.task_text}],
                 )
                 response = message.content[0].text if message.content else ""
-
-                # Evaluate
-                eval_result = adapter.evaluate(task, response)
-                if eval_result is True:
-                    pass_count += 1
             except Exception as e:
+                response = ""
                 if i == 0:
                     print(f"\n  [debug] {str(e)[:80]}")
+            task_responses.append((task, response))
 
-        pass_rate = 100 * pass_count / len(tasks) if tasks else 0
-        print(f" ✓ {pass_count}/{len(tasks)} ({pass_rate:.1f}%)")
-
-        return {
-            "bench": bench,
-            "backend": "cloud",
-            "model": "claude-opus-4-8",
-            "tasks": len(tasks),
-            "passed": pass_count,
-            "pass_rate": pass_rate,
-            "status": "ok"
-        }
+        return _score(adapter, bench, "cloud", model, task_responses)
     except Exception as e:
         print(f" [error] {str(e)[:60]}")
         return {"bench": bench, "backend": "cloud", "status": "error", "error": str(e)[:40]}

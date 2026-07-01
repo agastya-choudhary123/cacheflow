@@ -5,9 +5,6 @@ Maps each instance to an agentic task description; evaluation uses the
 swebench eval harness to check the generated patch against test suite.
 """
 
-import subprocess
-import sys
-import tempfile
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -15,7 +12,7 @@ from benchmarks.adapters.base import BenchmarkAdapter, BenchTask
 
 
 TASK_TEMPLATE = """\
-Fix the following GitHub issue in this repository.
+Fix the following GitHub issue in the {repo} repository.
 
 Issue title: {title}
 Issue body:
@@ -23,7 +20,9 @@ Issue body:
 
 Relevant failing tests (if known): {tests}
 
-Write the minimal code change needed to fix the issue. After editing, run the tests to confirm.
+Output ONLY a unified diff patch (the output of `git diff`) that fixes the issue —
+no explanation, no markdown fences, nothing but the patch itself, starting with
+"diff --git" or "--- a/..." lines.
 """
 
 
@@ -64,6 +63,7 @@ class SWEBenchAdapter(BenchmarkAdapter):
                 pass
 
             task_text = TASK_TEMPLATE.format(
+                repo=inst.get("repo", ""),
                 title=inst.get("problem_statement", "")[:200],
                 body=inst.get("problem_statement", ""),
                 tests=", ".join(inst.get("FAIL_TO_PASS", [])[:3]),
@@ -83,33 +83,58 @@ class SWEBenchAdapter(BenchmarkAdapter):
             count += 1
 
     def evaluate(self, task: BenchTask, response: str) -> Optional[bool]:
-        # Full eval requires the swebench Docker/subprocess harness — return None here;
-        # the harness.py orchestrator runs swebench evaluation separately via subprocess.
+        # Single-task evaluate() can't grade SWE-bench: correctness requires the
+        # instance's own Docker image (exact dependency pins) and both its
+        # FAIL_TO_PASS and PASS_TO_PASS test sets, which only the batched,
+        # Docker-backed evaluate_predictions() below can provide. Per-task
+        # callers (see harness.py's per-adapter evaluate loop) get None here;
+        # harness.py special-cases swebench-lite/verified to batch through
+        # evaluate_predictions() instead.
         return None
 
+    def evaluate_predictions(
+        self, predictions: list[dict], run_id: str, max_workers: int = 4,
+        timeout: int = 1800,
+    ) -> dict[str, bool]:
+        """Grade a batch of {instance_id, model_patch} predictions via the
+        official swebench Docker harness. Returns {instance_id: resolved}.
 
-def evaluate_patch(instance_id: str, patch: str, repo_path: Path) -> Optional[bool]:
-    """Apply a patch and run the instance's FAIL_TO_PASS tests. Returns pass/fail/None."""
-    with tempfile.NamedTemporaryFile(suffix=".patch", mode="w", delete=False) as f:
-        f.write(patch)
-        patch_file = f.name
-    try:
-        apply = subprocess.run(
-            ["git", "apply", patch_file],
-            cwd=repo_path, capture_output=True
-        )
-        if apply.returncode != 0:
-            return False
-        # Run tests (instance-specific; best-effort)
-        test_result = subprocess.run(
-            [sys.executable, "-m", "pytest", "--tb=no", "-q"],
-            cwd=repo_path, capture_output=True, timeout=120
-        )
-        return test_result.returncode == 0
-    except Exception:
-        return None
-    finally:
-        import os
-        os.unlink(patch_file)
-        # Revert patch
-        subprocess.run(["git", "checkout", "."], cwd=repo_path, capture_output=True)
+        Building/pulling each instance's environment image is the expensive
+        part (can be slow and disk-heavy on a first run); the harness caches
+        images across runs, so repeat runs against the same instances are
+        much faster.
+        """
+        import json
+        import tempfile
+        from swebench.harness.run_evaluation import main as run_evaluation
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".json", mode="w", delete=False
+        ) as f:
+            json.dump(predictions, f)
+            predictions_path = f.name
+
+        try:
+            report_file = run_evaluation(
+                dataset_name=self._dataset_name(),
+                split="test",
+                instance_ids=[p["instance_id"] for p in predictions],
+                predictions_path=predictions_path,
+                max_workers=max_workers,
+                force_rebuild=False,
+                cache_level="env",
+                clean=False,
+                open_file_limit=4096,
+                run_id=run_id,
+                timeout=timeout,
+                namespace=None,
+                rewrite_reports=False,
+                modal=False,
+            )
+            report = json.loads(Path(report_file).read_text())
+        finally:
+            import os
+            os.unlink(predictions_path)
+
+        resolved = set(report.get("resolved_ids", []))
+        return {p["instance_id"]: p["instance_id"] in resolved for p in predictions}
