@@ -34,22 +34,30 @@ def _extract_code(response: str, func_name: str) -> str:
     return "\n".join(lines)
 
 
-def _indent_body(body: str) -> str:
-    """Indent a function body for insertion after the signature.
+def _candidate_bodies(body: str) -> list[str]:
+    """Return candidate re-indentations of a "function body only" completion.
 
-    Models asked for "only the function body" commonly write the first line
-    with no leading whitespace (as if it were being typed at the insertion
-    point) while every subsequent line already carries its real, absolute
-    indentation relative to the function (since after a newline there's no
-    insertion point left to imply it). Uniformly indenting every line with
-    textwrap.indent() double-indents everything but the first line and
-    breaks the block's structure. Only the first line needs a nudge to the
-    function-body level; later lines are left as the model wrote them.
+    Models asked for "only the function body" don't agree on one indentation
+    convention: some write the first line unindented while every later line
+    already carries its true, absolute indentation (needs +4 on line 1 only);
+    others write every line relative to column 0 as if starting fresh (needs
+    +4 applied uniformly). Guessing wrong breaks the block's structure — see
+    git history for two real generations from the same model that each broke
+    under the other's fix. Rather than pick one convention, produce both
+    candidates and let the caller try each until one actually parses/passes.
     """
+    import textwrap
+
     lines = body.split("\n")
-    if lines and not lines[0].startswith(" "):
-        lines[0] = "    " + lines[0]
-    return "\n".join(lines)
+    first_line_nudged = list(lines)
+    if first_line_nudged and not first_line_nudged[0].startswith(" "):
+        first_line_nudged[0] = "    " + first_line_nudged[0]
+
+    return [
+        "\n".join(first_line_nudged),
+        textwrap.indent(body, "    "),
+        body,  # last resort: model already indented everything correctly itself
+    ]
 
 
 def _run_solution(full_code: str, test_code: str, entry_point: str, timeout: int = 10) -> bool:
@@ -119,9 +127,15 @@ class HumanEvalAdapter(BenchmarkAdapter):
             return None
 
         extracted = _extract_code(response, entry_point)
-        # Build full solution: original prompt + extracted body
-        full_code = prompt + "\n" + _indent_body(extracted)
-        return _run_solution(full_code, test_code, entry_point)
+        for body in _candidate_bodies(extracted):
+            full_code = prompt + "\n" + body
+            try:
+                ast.parse(full_code)
+            except SyntaxError:
+                continue
+            if _run_solution(full_code, test_code, entry_point):
+                return True
+        return False
 
 
 class HumanEvalFallbackAdapter(BenchmarkAdapter):
@@ -156,8 +170,15 @@ class HumanEvalFallbackAdapter(BenchmarkAdapter):
         if task.metadata is None:
             return None
         extracted = _extract_code(response, task.metadata["entry_point"])
-        full_code = task.metadata["prompt"] + "\n" + _indent_body(extracted)
-        return _run_solution(full_code, task.metadata["test"], task.metadata["entry_point"])
+        for body in _candidate_bodies(extracted):
+            full_code = task.metadata["prompt"] + "\n" + body
+            try:
+                ast.parse(full_code)
+            except SyntaxError:
+                continue
+            if _run_solution(full_code, task.metadata["test"], task.metadata["entry_point"]):
+                return True
+        return False
 
 
 def get_adapter() -> BenchmarkAdapter:
