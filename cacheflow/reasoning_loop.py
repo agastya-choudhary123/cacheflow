@@ -53,6 +53,18 @@ class AgentLoopResult:
     tokens_generated: int
     duration_ms: int
     tokens_per_sec: float = 0.0
+    # KV-cache metrics from the initial restore-or-prime for the whole loop.
+    # (The loop stays in one slot with the codebase KV hot for every step, so
+    # these describe how the codebase context was loaded once at the top.)
+    is_first_session: bool = True
+    prime_time_ms: int = 0
+    restore_time_ms: int = 0
+    time_saved_ms: int = 0
+    prime_cpu_ms: float = 0.0
+    restore_cpu_ms: float = 0.0
+    cpu_time_saved_ms: float = 0.0
+    tokens_saved: int = 0
+    snapshot_size_bytes: int = 0
 
 
 def _build_agentic_preamble(session: "AgentSession", task: str) -> str:
@@ -142,7 +154,7 @@ def run_agentic(
             n_gpu_layers=session.config.n_gpu_layers,
         )
 
-        stable_prefix = session._restore_or_prime(agent, system_prompt)
+        stable_prefix, rp_metrics = session._restore_or_prime(agent, system_prompt)
         ctx = ToolContext(
             base_path=workspace_path or session.base_path,
             allow_writes=allow_writes,
@@ -273,6 +285,15 @@ def run_agentic(
             tokens_generated=tokens_generated,
             duration_ms=int((time.time() - start_time) * 1000),
             tokens_per_sec=tokens_generated / max(gen_time_ms / 1000, 1e-6) if gen_time_ms else 0.0,
+            is_first_session=rp_metrics["is_first_session"],
+            prime_time_ms=rp_metrics["prime_time_ms"],
+            restore_time_ms=rp_metrics["restore_time_ms"],
+            time_saved_ms=rp_metrics["time_saved_ms"],
+            prime_cpu_ms=rp_metrics["prime_cpu_ms"],
+            restore_cpu_ms=rp_metrics["restore_cpu_ms"],
+            cpu_time_saved_ms=rp_metrics["cpu_time_saved_ms"],
+            tokens_saved=rp_metrics["tokens_saved"],
+            snapshot_size_bytes=rp_metrics["snapshot_size_bytes"],
         )
     finally:
         session._release_lock()

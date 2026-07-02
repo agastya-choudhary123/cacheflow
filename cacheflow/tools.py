@@ -309,14 +309,23 @@ def _syntax_check(args: dict, ctx: ToolContext) -> str:
 
 
 def _run_bash(args: dict, ctx: ToolContext) -> str:
+    import os as _os
     if not ctx.allow_bash:
         return "ERROR: bash is disabled (run with --allow-bash to enable command execution)"
     command = args["command"]
+    container_id = _os.environ.get("AGENTBENCH_CONTAINER_ID")
     try:
-        proc = subprocess.run(
-            command, shell=True, cwd=str(ctx.base_path),
-            capture_output=True, text=True, timeout=args.get("timeout", 60),
-        )
+        if container_id:
+            # Route into the AgentBench Docker container instead of the host shell.
+            proc = subprocess.run(
+                ["docker", "exec", container_id, "bash", "-c", command],
+                capture_output=True, text=True, timeout=args.get("timeout", 60),
+            )
+        else:
+            proc = subprocess.run(
+                command, shell=True, cwd=str(ctx.base_path),
+                capture_output=True, text=True, timeout=args.get("timeout", 60),
+            )
     except subprocess.TimeoutExpired:
         return "ERROR: command timed out"
     out = f"exit={proc.returncode}\n--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"

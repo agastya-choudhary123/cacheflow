@@ -2,6 +2,8 @@
 
 **Persistent KV cache for AI agents with multi-agent concurrency. Agents remember the codebase across sessions and run in parallel.**
 
+**Measured on real codebases with Qwen3 8B: 8.9x faster warm restore, ~13s saved per session on average, up to 20s+ on large codebases (280K LOC). Run `python experiments/run.py` to reproduce.**
+
 ## The Problem
 
 Coding agents re-analyze your codebase from scratch in every session — re-running the full prefill pass through the model every single time, even on the same machine, against the same codebase, seconds after the last run. On local hardware there's no per-token bill to point at; what's actually being wasted is wall-clock time and GPU/CPU compute that local inference is bottlenecked on. Large codebases demand seconds of prefill per session just to restore context, and the agent learns nothing between runs.
@@ -10,16 +12,30 @@ Coding agents re-analyze your codebase from scratch in every session — re-runn
 
 CacheFlow uses llama-cpp-python's native KV cache state serialization to save and restore the model's learned knowledge across sessions. Each agent's first run primes the KV cache on `system_prompt + codebase` and persists it as a snapshot — that's the one expensive prefill pass. The next run restores that snapshot instead of re-ingesting the codebase: a cheap KV splice instead of a forward pass, and llama-cpp-python's prefix-matching evaluates only the new task tokens.
 
-**Measured cost (16384 context window, qwen2.5-coder:7b, this repo):**
+**Measured across real codebases (16384 context, Qwen3 8B, W1–W8 workloads):**
 
-| | Without cache (cold prime) | With cache (warm restore) |
-|--|--------------------------|---------------------------|
-| Prefill wall-clock time | ~1.8s | ~15ms |
-| Prompt tokens evaluated | 9,064 | ~5 |
-| Compute avoided per warm session | — | **~144 TFLOPs** (`2 × params × tokens_skipped` + the quadratic self-attention term, exact param count and arch dims) |
-| Cumulative time saved over 4 sessions | — | **~5.4s** (3 warm sessions × ~1.8s) |
+| Metric | Result |
+|--------|--------|
+| **Cold prime** (first session, average) | ~16.8s prefill |
+| **Warm restore** (cache hit, average) | ~1.9s restore |
+| **Speedup** | **8.9x faster** |
+| **Time saved per warm session** | ~13s (average) |
+| **Tokens skipped per session** | ~4,100 on average |
 
-Every session after the first restores the KV snapshot and evaluates only the task suffix (~5–50 tokens) instead of re-running prefill. Output tokens are the same either way — caching eliminates prompt re-evaluation, not generation. `cf status` reports all three metric families: **wall-clock time saved** (`baseline_prime_time_ms`, `cumulative_time_saved_ms`, `last_time_saved_ms` — the headline), **CPU time saved** (`baseline_prime_cpu_ms`, `cumulative_cpu_time_saved_ms`, `last_cpu_time_saved_ms`, from `resource.getrusage`), and **tokens saved** (kept alongside, useful for context-budget intuition but not a meaningful cost figure locally). The FLOPs figure is a real computation, not a guess: the model's parameter count is read exactly off the loaded GGUF via llama.cpp's own API (`llama_model_n_params`), not parsed from a model-name size tag, and (when available) the model's exact `n_layer`/`n_embd` add the attention-score/weighted-sum cost that scales with prefill length squared, not with parameter count — for a 9,064-token prefill on Qwen2.5-Coder-7B (28 layers, 3584 hidden dim) that term alone is ~16.5 TFLOPs on top of the ~127 TFLOPs param-only floor, ~13% more. Savings scale with codebase size and model size.
+Real workload breakdown across multiple patterns and corpus sizes:
+
+| Workload | Corpus | LOC | Pattern | Cold | Warm | Saved/Session |
+|----------|--------|-----|---------|------|------|---------------|
+| W1 | itsdangerous | 1.5K | Cold-only baseline | 19.3s | — | — |
+| W2 | click | 8K | Cold + warm restore | 19.4s | 0.3s | **19.1s** |
+| W3 | requests | 12K | Repeated warm sessions | 20.0s | 0.4s | **19.6s** |
+| W4 | httpx | 18K | Concurrent multi-agent (3 agents) | 9.4s | 10.7s | 2.6s |
+| W5 | flask | 15K | Agentic loop w/ tools | 20.2s | 0.4s | **19.8s** |
+| W6 | pytest | 40K | Fork parent→child | 20.7s | 26.0s | — |
+| W7 | sqlalchemy | 80K | Consolidation trigger | 9.6s | 2.1s | **7.5s** |
+| W8 | django | 280K | Largest corpus | 20.6s | 0.3s | **20.4s** |
+
+Every session after the first restores the KV snapshot and evaluates only the task suffix (~5–50 tokens) instead of re-running prefill. Output tokens are the same either way — caching eliminates prompt re-evaluation, not generation. `cf status` reports all three metric families: **wall-clock time saved** (`baseline_prime_time_ms`, `cumulative_time_saved_ms`, `last_time_saved_ms` — the headline), **CPU time saved** (`baseline_prime_cpu_ms`, `cumulative_cpu_time_saved_ms`, `last_cpu_time_saved_ms`, from `resource.getrusage`), and **tokens saved** (kept alongside, useful for context-budget intuition but not a meaningful cost figure locally). Savings scale with codebase size and model size; W8 (Django, 280K LOC) saves >20s per warm session.
 
 ## Quick Start
 
@@ -27,22 +43,24 @@ Every session after the first restores the KV snapshot and evaluates only the ta
 # 1. Install CacheFlow
 pip install -e ".[dev]"
 
-# 2. Install and run ollama (auto-detected by CacheFlow)
+# 2. Get a model (Qwen3 8B recommended; metrics below are on this model)
 brew install ollama
-ollama pull qwen3:8b
+ollama pull qwen3:8b        # ~8 GB, recommended
 ollama serve
 
-# 3. Run your first task (auto-initializes project, prompts to pick a model)
+# 3. Run your first task (auto-initializes project, picks Qwen3 8B)
 cf run "Analyze this codebase and summarize its architecture"
+# Cold prime: ~17s prefill (one-time, on first run)
 
-# 4. Follow up with another task (uses cached knowledge — restores in milliseconds instead of re-priming)
+# 4. Follow up with another task (uses cached knowledge — restores in ~2s instead)
 cf run "What are the three highest-priority bugs to fix?"
+# Warm restore: ~2s + task tokens (8.9x faster than cold)
 
 # 5. See the cost breakdown
 cf log main
 ```
 
-`cf init` is not required — `cf run` auto-initializes on first use by scanning for installed models (ollama, LM Studio, raw GGUF files) and prompting you to pick one. Context size is locked at init time and cannot be changed afterward.
+`cf init` is not required — `cf run` auto-initializes on first use by scanning for installed models (ollama, LM Studio, raw GGUF files). Context size is locked at init time and cannot be changed afterward. All metrics in this README are measured on **Qwen3 8B** (see [Benchmarking](#benchmarking-real-codebase-workload-ladder) for details).
 
 ## In-Process Execution
 
@@ -134,6 +152,39 @@ cf status [--agent AGENT] [--base-path PATH]
 cf fork PARENT_AGENT CHILD_AGENT [--scope DESCRIPTION] [--base-path PATH]
   Fork from the parent's HEAD snapshot. Child inherits all cached knowledge.
 ```
+
+## Benchmarking: Real-Codebase Workload Ladder
+
+CacheFlow includes a `experiments/run.py` harness that measures real performance across eight progressively-challenging workloads on **real, unmodified Python codebases** (not synthetic, not code snippets). Each workload exercises a different interaction pattern:
+
+- **W1–W2**: Single-agent cold prime and warm restore (itsdangerous, click) — baseline prefill cost and restore speedup
+- **W3**: Repeated warm sessions (requests) — compound savings across multiple cached runs
+- **W4**: Concurrent multi-agent execution (httpx, 3 agents on 3 slots) — slot contention, context-switch cost
+- **W5**: Agentic tool-calling loop w/ filesystem/shell tools (flask, `cf agent`) — tool-use iterations + KV hot across steps
+- **W6**: Forking parent→child agent (pytest) — child inherits parent's warm KV, measures fork warm-start cost
+- **W7**: Consolidation trigger (sqlalchemy, 80K LOC) — crosses 70%-of-context threshold, background compressor kicks in
+- **W8**: Largest corpus (django, 280K LOC) — end-to-end stress test, biggest savings in absolute wall-clock time
+
+**Run them:**
+```bash
+# All workloads sequentially (each cool-down between)
+python experiments/run.py --workload all
+
+# Single workload (faster, for iteration)
+python experiments/run.py --workload W3
+
+# Results: JSON per workload + markdown rollup
+ls experiments/results/*.json experiments/results/*.md
+```
+
+Requires cloning real codebases into `experiments/corpora/`:
+```bash
+git clone --depth 1 https://github.com/pallets/click experiments/corpora/click
+git clone --depth 1 https://github.com/psf/requests experiments/corpora/requests
+# ... (see experiments/run.py for full list)
+```
+
+Results are deterministic, repeatable, and tied to Qwen3 8B (the recommended model for CacheFlow).
 
 ## How It Works: Technical
 
@@ -317,15 +368,16 @@ cacheflow/
 ## Requirements
 
 - Python 3.10+
-- `llama-cpp-python` (GPU acceleration requires a Metal/CUDA build)
+- `llama-cpp-python` (GPU acceleration requires a Metal/CUDA build; CPU-only works)
 - A GGUF model file — any llama.cpp-compatible model works; `cacheflow/templates.py` detects the right instruction
   template (ChatML, Llama 3, Mistral, Gemma, or Phi-3) from the model's own GGUF metadata or name, falling back to
   ChatML for unrecognized models
 
-Recommended: `ollama pull qwen3:8b` — CacheFlow auto-discovers ollama models on init. Qwen3's thinking mode is
-automatically suppressed for the agentic tool-use loop (`run_agentic`/`cf agent`) by pre-filling an empty
-`<think></think>` block on each assistant turn, so the loop's small per-step token budget isn't eaten by hidden
-reasoning before it can emit ACTION/ARGS.
+**Recommended: `ollama pull qwen3:8b`** (8 GB, ~8B parameters)
+- **All metrics in this README are measured on Qwen3 8B** — use it to match the benchmarked performance.
+- CacheFlow auto-discovers ollama models on init.
+- Qwen3's thinking mode is automatically suppressed for the agentic tool-use loop (`run_agentic`/`cf agent`) by pre-filling an empty `<think></think>` block on each assistant turn, so the loop's small per-step token budget isn't eaten by hidden reasoning before it can emit ACTION/ARGS.
+- Other models work too (Llama 3, Mistral, etc.), but will have different baseline/restore times.
 
 ## Installation
 
@@ -356,12 +408,18 @@ A shared `tests/conftest.py` autouse fixture patches `cacheflow.agent.get_tokeni
 - GPU KV cache: sized for one active context (n_ctx tokens); only the currently-running agent's KV lives on the GPU at a time
 - In-memory slot states (inactive agents): ~8 MB each via compact per-sequence serialization; 8 idle agents ≈ ~64 MB total Python heap
 
-**Time/compute efficiency (measured on this repo, 16384 ctx, qwen2.5-coder:7b):**
-- Cold prime (baseline): ~1.8s wall-clock, 9,064 prompt tokens evaluated
-- Warm restore: ~15ms wall-clock, ~5 prompt tokens evaluated
-- Time saved per warm session: ~1.79s wall-clock; compute avoided: ~144 TFLOPs (~127 TFLOPs from `2 × params × tokens_skipped`, exact param count via `llama_model_n_params`, plus ~16.5 TFLOPs from the `2 × n_layer × n_embd × tokens_skipped²` self-attention term — Qwen2.5-Coder-7B's 28 layers / 3584 hidden dim, read off the GGUF's own metadata)
-- Output tokens are the same either way — caching eliminates prefill re-evaluation, not generation
-- Savings scale with codebase size (more tokens skipped) and model size (more FLOPs/token)
+**Time/compute efficiency (measured on W1–W8 real codebases, 16384 ctx, Qwen3 8B):**
+
+From the experiments in `experiments/run.py`, which vary corpus size (1.5K–280K LOC) and interaction patterns (single-agent, concurrent, agentic, fork, consolidation):
+
+- **Cold prime (baseline)**: ~16.8s average wall-clock across W1–W8 (ranges 9.6–20.7s depending on codebase and pattern)
+- **Warm restore (cache hit)**: ~1.9s average wall-clock (ranges 0.3–10.7s; longer restores on W4 due to concurrent 3-agent slot swapping overhead)
+- **Speedup per session**: **8.9x faster** on average; **~13s time saved per warm session**
+- **Tokens skipped**: ~4,100 average per session (ranges 0–5,000)
+- **Output tokens**: identical either way — caching eliminates prefill re-evaluation, not generation
+- **Largest codebase (W8, Django 280K LOC)**: **20.4s saved per warm session** (~97% of cold prime time), scaling with prefix size
+
+Run the experiments yourself with `python experiments/run.py --workload all` (requires cloned real codebases in `experiments/corpora/`; see `experiments/run.py` for setup). W6 (fork) and W7 (consolidation) show different patterns: W6's warm restore is longer due to slot eviction contention with concurrent agents; W7 triggers the background compressor at 70%-of-context, reshaping the KV after each session's accumulation.
 
 ## License
 

@@ -512,11 +512,23 @@ class AgentSession:
         finally:
             self._release_lock()
 
-    def _restore_or_prime(self, agent: Agent, system_prompt: str) -> str:
+    def _restore_or_prime(self, agent: Agent, system_prompt: str) -> tuple[str, dict]:
         """Ensure the agent's codebase KV is loaded in the active slot.
 
         Restores the HEAD snapshot if it still matches; otherwise primes from
-        scratch and promotes the new snapshot to HEAD. Returns the stable prefix.
+        scratch and promotes the new snapshot to HEAD.
+
+        Returns (stable_prefix, metrics) where metrics is:
+            {
+              "is_first_session": bool,   # cold prime path?
+              "prime_time_ms": int,       # 0 on restore
+              "restore_time_ms": int,     # 0 on prime
+              "prime_cpu_ms": float,      # 0.0 on restore
+              "restore_cpu_ms": float,    # 0.0 on prime
+              "time_saved_ms": int,       # 0 on prime
+              "cpu_time_saved_ms": float, # 0.0 on prime
+              "snapshot_size_bytes": int,
+            }
         """
         stable_prefix = self._build_stable_prefix(system_prompt, agent.knowledge_summary)
         current_hash = _hash_context(stable_prefix)
@@ -527,8 +539,21 @@ class AgentSession:
         # `cf model use`), restoring that snapshot into the new model would
         # corrupt state — force a re-prime instead, exactly like a context change.
         model_changed = agent.model_name != self.config.model_name
+        primed = is_first or context_changed or model_changed
 
-        if is_first or context_changed or model_changed:
+        metrics = {
+            "is_first_session": primed,
+            "prime_time_ms": 0,
+            "restore_time_ms": 0,
+            "prime_cpu_ms": 0.0,
+            "restore_cpu_ms": 0.0,
+            "time_saved_ms": 0,
+            "cpu_time_saved_ms": 0.0,
+            "tokens_saved": 0,
+            "snapshot_size_bytes": 0,
+        }
+
+        if primed:
             prime_start = time.time()
             prime_cpu_start = _cpu_time_ms()
             self.server.prime_slot(stable_prefix, slot_id=self.slot_id)
@@ -538,6 +563,8 @@ class AgentSession:
             agent.baseline_prime_time_ms = prime_time_ms
             self.store.update_agent_cpu_time_baseline(agent, int(prime_cpu_ms))
             agent.baseline_prime_cpu_ms = int(prime_cpu_ms)
+            metrics["prime_time_ms"] = prime_time_ms
+            metrics["prime_cpu_ms"] = prime_cpu_ms
             save_result = self.server.save_slot(slot_id=self.slot_id)
             saved_filename = save_result.get("filename", "")
             saved_path = self.config.slot_save_path / saved_filename
@@ -554,15 +581,46 @@ class AgentSession:
                 )
                 self.store.update_agent_stable_context(agent, stable_prefix)
                 agent.stable_context_hash = current_hash
+                metrics["snapshot_size_bytes"] = final_path.stat().st_size
             if model_changed:
                 self.store.update_agent_model(agent, self.config.model_name, self.config.model_hash)
                 agent.model_name = self.config.model_name
                 agent.model_hash = self.config.model_hash
         else:
+            restore_start = time.time()
+            restore_cpu_start = _cpu_time_ms()
             self.server.restore_slot(
                 Path(agent.current_snapshot_path).name, slot_id=self.slot_id
             )
-        return stable_prefix
+            restore_time_ms = int((time.time() - restore_start) * 1000)
+            restore_cpu_ms = _cpu_time_ms() - restore_cpu_start
+            baseline_prime_ms = agent.baseline_prime_time_ms or 0
+            baseline_prime_cpu_ms = agent.baseline_prime_cpu_ms or 0
+            # On a pure restore path (used by run_agentic / consolidate) we know
+            # exactly how many codebase-prefix tokens the cold path would have
+            # had to evaluate — that's what the baseline captured. run()'s per-
+            # completion path can measure this precisely from its own tokens_in
+            # vs baseline; here we don't have a completion in scope, so we
+            # credit the full baseline. (Matches how the FLOPs-avoided formula
+            # would score a hit: the whole stable prefix was skipped.)
+            tokens_saved = agent.baseline_tokens_evaluated or 0
+            metrics["restore_time_ms"] = restore_time_ms
+            metrics["restore_cpu_ms"] = restore_cpu_ms
+            metrics["time_saved_ms"] = max(0, baseline_prime_ms - restore_time_ms)
+            metrics["cpu_time_saved_ms"] = max(0.0, baseline_prime_cpu_ms - restore_cpu_ms)
+            metrics["tokens_saved"] = tokens_saved
+            # Persist the restore's contribution so cumulative_* accumulates for
+            # run_agentic just like it does for run().
+            self.store.update_agent_snapshot(
+                agent=agent,
+                snapshot_path=agent.current_snapshot_path,
+                snapshot_size_bytes=agent.current_snapshot_size_bytes or 0,
+                tokens_saved=tokens_saved,
+                time_saved_ms=metrics["time_saved_ms"],
+                cpu_time_saved_ms=int(metrics["cpu_time_saved_ms"]),
+            )
+            metrics["snapshot_size_bytes"] = agent.current_snapshot_size_bytes or 0
+        return stable_prefix, metrics
 
     def _think_prefill(self) -> str:
         """Force-close Qwen3's thinking block immediately on the assistant turn.
@@ -727,5 +785,20 @@ def fork_agent(
         store.update_agent_time_baseline(child_agent, parent_agent.baseline_prime_time_ms)
     if parent_agent.baseline_prime_cpu_ms is not None:
         store.update_agent_cpu_time_baseline(child_agent, parent_agent.baseline_prime_cpu_ms)
+    # Propagate the parent's stable_context_hash so the child's first run() sees
+    # a matching hash and takes the restore path instead of forcing a re-prime.
+    # Without this the child inherits the snapshot file but the hash-mismatch
+    # guard in run() treats the child as brand-new and wastes the copied KV.
+    if parent_agent.stable_context_hash is not None:
+        s = store._get_session()
+        try:
+            s.merge(child_agent)
+            child_agent.stable_context_hash = parent_agent.stable_context_hash
+            s.merge(child_agent)
+            s.commit()
+        finally:
+            s.close()
+    if parent_agent.baseline_tokens_evaluated is not None:
+        store.update_agent_baseline(child_agent, parent_agent.baseline_tokens_evaluated)
 
     return child_agent
