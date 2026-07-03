@@ -28,12 +28,16 @@ class KnowledgeStore:
                 summary TEXT NOT NULL,
                 source_agent TEXT NOT NULL,
                 token_count INTEGER,
+                full_cost_tokens INTEGER,
                 supersedes_id INTEGER,
                 created_at TIMESTAMP NOT NULL,
                 FOREIGN KEY (supersedes_id) REFERENCES knowledge_entries(id)
             )
         """
         )
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(knowledge_entries)")}
+        if "full_cost_tokens" not in cols:
+            conn.execute("ALTER TABLE knowledge_entries ADD COLUMN full_cost_tokens INTEGER")
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_region_hash
@@ -51,7 +55,7 @@ class KnowledgeStore:
 
     def submit(
         self, region: str, summary: str, source_agent: str, region_hash: str, role: Optional[str] = None,
-        token_count: Optional[int] = None,
+        token_count: Optional[int] = None, full_cost_tokens: Optional[int] = None,
     ) -> int:
         """Store a knowledge summary for a region.
 
@@ -60,6 +64,13 @@ class KnowledgeStore:
         from `len(summary)` here, since character count isn't a token count.
         If the caller doesn't have an exact figure, leave it None; it's
         stored as NULL rather than a fabricated number.
+
+        `full_cost_tokens` is the total cost of the derivation that PRODUCED this
+        summary (codebase input context + full output of the consolidation call).
+        This -- not the ~500-token summary size -- is what a reuse actually saves:
+        an agent injects the small summary instead of re-reading and re-analyzing
+        the whole region from scratch. That is the real, exact figure to credit
+        on a knowledge hit.
         """
         conn = sqlite3.connect(self.db_path)
 
@@ -75,10 +86,12 @@ class KnowledgeStore:
             cursor = conn.execute(
                 """
                 INSERT INTO knowledge_entries
-                (region, region_hash, role, summary, source_agent, token_count, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (region, region_hash, role, summary, source_agent, token_count,
+                 full_cost_tokens, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-                (region, region_hash, role, summary, source_agent, token_count, datetime.now()),
+                (region, region_hash, role, summary, source_agent, token_count,
+                 full_cost_tokens, datetime.now()),
             )
             entry_id = cursor.lastrowid
 
@@ -99,13 +112,18 @@ class KnowledgeStore:
         Query for valid knowledge summaries for a region.
         Returns: summary text if valid (region_hash matches), else None
         """
+        # Exposed on a hit so the caller can credit the real saving: the full
+        # re-derivation cost avoided (last_full_cost_saved), plus the summary's
+        # own token size (last_summary_tokens) as the narrow secondary metric.
+        self.last_full_cost_saved = None
+        self.last_summary_tokens = None
         conn = sqlite3.connect(self.db_path)
 
         # Try exact role match first
         query_role = role
         cursor = conn.execute(
             """
-            SELECT summary FROM knowledge_entries
+            SELECT summary, token_count, full_cost_tokens FROM knowledge_entries
             WHERE region = ? AND region_hash = ? AND role IS ?
             ORDER BY created_at DESC LIMIT 1
         """,
@@ -117,7 +135,7 @@ class KnowledgeStore:
         if not result and role is not None:
             cursor = conn.execute(
                 """
-                SELECT summary FROM knowledge_entries
+                SELECT summary, token_count, full_cost_tokens FROM knowledge_entries
                 WHERE region = ? AND region_hash = ? AND role IS NULL
                 ORDER BY created_at DESC LIMIT 1
             """,
@@ -128,7 +146,7 @@ class KnowledgeStore:
         conn.close()
 
         if result:
-            summary = result[0]
+            summary, self.last_summary_tokens, self.last_full_cost_saved = result
             if max_tokens and len(summary) > max_tokens:
                 summary = summary[:max_tokens]
             return summary
