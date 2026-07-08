@@ -3,7 +3,7 @@
 The local W1..W8 experiments (run.py) measure KV-cache prefill time saved on a
 self-hosted model. This module measures the *cloud* analogue: extended-thinking
 (reasoning) tokens NOT regenerated because a prior agent's reasoning was reused
-from the ThinkingStore / KnowledgeStore instead of re-derived from scratch.
+from the ThinkingStore instead of re-derived from scratch.
 
 Path C (chosen): the Anthropic SDK with extended thinking enabled. This is the
 only capture route that hands us BOTH the raw reasoning text (`ThinkingBlock.
@@ -12,12 +12,10 @@ thinking`) and the *exact, isolated* reasoning-token count
 transcript scraping, no PTY, and no local tokenizer approximation. It costs real
 API tokens for the cold calls we actually make; every warm reuse avoids one.
 
-The two SQLite pools do the accounting, exactly as on the feature branch:
-  - ThinkingStore: submit(thinking_text, token_count=thinking_tokens) on a cold
-    reasoning turn; query() before a warm one. An exact-hash hit logs the reused
-    block's real token_count into thinking_reuse_log — that IS the reasoning
-    tokens saved, never estimated from text length.
-  - KnowledgeStore: region summaries for the consolidation workloads (W7).
+The ThinkingStore does the accounting: submit(thinking_text,
+token_count=thinking_tokens) on a cold reasoning turn; query() before a warm one.
+A reuse hit logs the reused block's real token_count into thinking_reuse_log —
+that IS the reasoning tokens saved, never estimated from text length.
 
 Run:
     export ANTHROPIC_API_KEY=sk-ant-...
@@ -55,7 +53,6 @@ from dotenv import load_dotenv
 load_dotenv(REPO_ROOT / ".env")
 
 from cacheflow.thinking_store import ThinkingStore
-from cacheflow.knowledge_store import KnowledgeStore
 
 CORPORA_DIR = REPO_ROOT / "experiments" / "corpora"
 RESULTS_DIR = REPO_ROOT / "experiments" / "results"
@@ -69,7 +66,7 @@ CORPUS: dict[str, str] = {
     "W4": "httpx",          # ~18K LOC — concurrent agents share one pool
     "W5": "flask",          # ~15K LOC — multi-step reasoning, each step cached
     "W6": "pytest",         # ~40K LOC — fork: agent B reuses agent A's reasoning
-    "W7": "sqlalchemy",     # ~80K LOC — consolidation into the KnowledgeStore
+    "W7": "sqlalchemy",     # ~80K LOC — biggest ORM; compounding reuse + a miss
     "W8": "django",         # ~280K LOC — largest prefix, hardest task
 }
 
@@ -83,7 +80,7 @@ VALIDATOR_MODEL = "claude-haiku-4-5"
 # is not supported for this model") — they use adaptive thinking, controlled by
 # output_config.effort instead of an explicit token budget. --budget still
 # exists as a CLI knob but now selects an effort tier, kept modest to bound cost.
-DEFAULT_THINKING_EFFORT = "low"
+DEFAULT_THINKING_EFFORT = "high"
 _EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 ANSWER_BUDGET = 1024
 MAX_TOKENS_TOTAL = 4096  # ceiling on thinking + answer tokens for one cold call
@@ -123,9 +120,6 @@ class CloudMetric:
     thinking_store_hit: bool = False
     had_thinking_block: bool = False            # did the model actually reason?
     confidence: Optional[float] = None          # store's reuse confidence (1.0 exact)
-    # Knowledge pool (W7 consolidation).
-    knowledge_tokens_saved: int = 0
-    knowledge_store_hit: bool = False
     # Real dollars spent on the cold calls we did make (input+output priced).
     # input_tokens is the UNCACHED input only; the cached codebase prefix is
     # counted separately (billed at 1.25x on create, 0.1x on read) so total
@@ -158,9 +152,7 @@ class CloudWorkloadRunner:
         # KV-engine's databases. Reset per-workload (see _reset_stores) so a
         # "cold" reasoning call is genuinely cold.
         self._thinking_db = str(self.repo_root / ".cacheflow" / "cloud_thinking.db")
-        self._knowledge_db = str(self.repo_root / ".cacheflow" / "cloud_knowledge.db")
         self.thinking_store = ThinkingStore(self._thinking_db)
-        self.knowledge_store = KnowledgeStore(self._knowledge_db)
 
     # -- Anthropic client (lazy) --------------------------------------------
 
@@ -172,13 +164,11 @@ class CloudWorkloadRunner:
         return self._client
 
     def _reset_stores(self) -> None:
-        """Delete and recreate both pools so cold calls in a workload are cold."""
-        for p in (self._thinking_db, self._knowledge_db):
-            fp = Path(p)
-            if fp.exists():
-                fp.unlink()
+        """Delete and recreate the pool so cold calls in a workload are cold."""
+        fp = Path(self._thinking_db)
+        if fp.exists():
+            fp.unlink()
         self.thinking_store = ThinkingStore(self._thinking_db)
-        self.knowledge_store = KnowledgeStore(self._knowledge_db)
 
     # -- Corpus / hashing ----------------------------------------------------
 
@@ -443,67 +433,92 @@ class CloudWorkloadRunner:
 
     # -- Workloads (mirror the local ladder; harder tasks) ------------------
 
-    # Workloads model how a human actually drives a coding agent: imperative,
-    # action-oriented tasks (debug / add / refactor / plan / implement), and
-    # reuse that happens when a *later* teammate or session asks for the same
-    # underlying work in DIFFERENT words -- never a byte-identical repeat. Warm
-    # turns pass a paraphrase to _warm(); the semantic gate decides whether the
-    # cached reasoning is close enough to reuse (use_directly / validate) or too
-    # different to trust (re_think -> a real cold call). Some turns are genuine
-    # new work and are expected to miss -- an honest, sub-100% hit rate.
+    # Workloads model an AUTONOMOUS coding agent being handed a full build/refactor
+    # directive -- not asked a question. Each cold task is a multi-part imperative
+    # ("implement X: do A, B, C, D, wire in E, write the tests") that forces the
+    # model to reason across the whole codebase before acting. Reuse happens when a
+    # LATER directive -- genuinely different work -- needs that SAME hard-won
+    # codebase understanding (the framework's command/session/lifecycle/plugin
+    # machinery), so the cached reasoning is reused instead of re-derived. Some
+    # turns are genuinely unrelated new work and are expected to miss -- an honest,
+    # sub-100% hit rate. Warm turns go through _warm(); the semantic gate decides
+    # use_directly / validate / re_think (a real cold call).
 
     def w1(self, corpus_path):
-        """W1 — one real task; baseline reasoning cost (nothing to reuse yet)."""
+        """W1 — one autonomous build; baseline reasoning cost (nothing to reuse yet)."""
         return [self._cold("W1", corpus_path,
-            "I'm about to depend on this library to sign our session cookies. "
-            "Walk me through how signing and verification actually work here, and "
-            "where I could footgun myself around key rotation.")]
+            "Implement a complete, production-ready password-reset token flow on top "
+            "of this library. Generate signed, time-limited reset tokens; verify them "
+            "with support for secret rotation (multiple valid keys during a rollover "
+            "window); and reject tampered, expired, and replayed tokens. Write the "
+            "actual module: the token-issuing function, the verification function, the "
+            "key-rotation strategy, and a test suite proving that tampered and expired "
+            "tokens are refused. Use this library's signing primitives correctly.")]
 
     def w2(self, corpus_path):
-        """W2 — a task, then a teammate asks for the same thing in other words."""
-        cold = ("Add a global --verbose flag to our CLI that turns on debug "
-                "logging across every subcommand. How do I wire it in cleanly "
-                "with this framework?")
-        warm = ("I need every subcommand to share one debug/logging switch — "
-                "what's the clean way to add that here?")
+        """W2 — deep command/context understanding reused across a different build."""
+        cold = ("Build a full multi-command CLI for our deploy tool on top of this "
+                "framework. Implement a top-level group with shared --config and "
+                "--verbose options; three subcommands (deploy, rollback, status) that "
+                "inherit a shared context object; a custom parameter type that validates "
+                "an environment name; and a plugin mechanism that lets external packages "
+                "register new subcommands via entry points. Write the group, the "
+                "commands, the context object, the custom param type, and the entry-point "
+                "loader.")
+        warm = ("Add shell autocompletion and rich --help output to our existing CLI "
+                "built on this framework. Implement completion for subcommands, options, "
+                "and dynamic choice values resolved at runtime, plus grouped/colorized "
+                "help formatting. Wire it into the same group/command/context machinery.")
         return [self._cold("W2", corpus_path, cold, step="cold"),
-                self._warm("W2", corpus_path, warm, step="warm_rephrased")]
+                self._warm("W2", corpus_path, warm, step="warm_different_build")]
 
     def w3(self, corpus_path):
-        """W3 — one diagnosis, re-asked by several people in different words
-        (compounding reuse), with an unrelated ask that correctly stays cold."""
-        cold = ("Our client built on this library hangs forever when the server "
-                "stops responding mid-body. Diagnose the timeout handling and "
-                "tell me how to make it fail fast.")
+        """W3 — one deep build, re-tasked several ways (compounding reuse of the same
+        transport/timeout understanding), plus unrelated work that stays cold."""
+        cold = ("Implement a resilient HTTP client wrapper on top of this library for "
+                "our service. Add connection pooling with a bounded connection lifetime, "
+                "enforce connect and read timeouts on every code path, reuse sessions "
+                "across calls, and guarantee that no request can hang forever. Write the "
+                "wrapper class, the session/adapter configuration, and the timeout "
+                "enforcement.")
         rephrasings = [
-            "Why does a dead connection make our calls block indefinitely, and "
-            "how do we bound that?",
-            "Requests sometimes just never return on flaky servers — where do I "
-            "set timeouts so it can't hang?",
-            "Make the client give up instead of blocking when the peer goes "
-            "silent on us.",
+            "Harden our client so a dead or slow server can never block a worker: wire "
+            "connect and read timeouts through every request path and make stalled "
+            "calls fail fast. Implement the changes.",
+            "Configure the session and transport adapters so connections are pooled, "
+            "reused, and bounded in lifetime — implement it against this library's "
+            "adapter API.",
+            "Make every outbound call in our client bounded and cancellable; add the "
+            "timeout plumbing end-to-end and show the code.",
         ]
         out = [self._cold("W3", corpus_path, cold, step="cold")]
         for i, r in enumerate(rephrasings):
             out.append(self._warm("W3", corpus_path, r, step=f"reask_{i+1}"))
-        # Genuinely different follow-up work: should NOT reuse the timeout
+        # Genuinely different follow-up work: should NOT reuse the timeout/pooling
         # reasoning, so the gate re-thinks (a real cold call).
         out.append(self._warm("W3", corpus_path,
-            "Separately, add automatic retry with exponential backoff on 503s.",
+            "Separately, implement streaming multipart file upload so we never buffer "
+            "large files in memory. Write the upload function.",
             step="unrelated_expected_miss"))
         return out
 
     def w4(self, corpus_path):
-        """W4 — one agent does the audit; N concurrent teammates ask for it
-        differently and reuse the same reasoning."""
-        cold = ("Audit how this codebase handles errors around the network layer "
-                "and point out where it swallows exceptions inconsistently.")
+        """W4 — one agent builds the error-handling layer; N concurrent teammates are
+        tasked with related work that reuses the same understanding."""
+        cold = ("Refactor our async HTTP layer built on this library to have "
+                "centralized, consistent error handling. Catch and classify transport "
+                "errors, map them to our domain exception hierarchy, ensure no exception "
+                "is ever silently swallowed, and add structured logging at each boundary. "
+                "Implement the error-handling wrapper/middleware and the exception "
+                "hierarchy.")
         rephrasings = [
-            "Where does our error handling around requests hide failures we "
-            "should be surfacing?",
-            "Find the spots where exceptions get silently eaten in the transport "
-            "code.",
-            "Is exception handling in the HTTP path consistent? Where isn't it?",
+            "Wrap every async request in our transport so failures are classified and "
+            "surfaced, never eaten — implement the centralized handler and the domain "
+            "exception mapping.",
+            "Add a uniform exception-mapping layer over this library's async client so "
+            "every call site raises our domain errors; implement it.",
+            "Build structured error logging and domain-exception mapping into our async "
+            "transport layer and show the implementation.",
         ]
         out = [self._cold("W4", corpus_path, cold, step="cold_prime")]
 
@@ -521,103 +536,87 @@ class CloudWorkloadRunner:
         return out
 
     def w5(self, corpus_path):
-        """W5 — multi-step: plan, then later recall of that plan (reworded, reuse),
-        then a genuinely new sub-task (cold)."""
-        step1 = ("I want to add full type annotations to this app. Give me a "
-                 "sequenced plan: what to annotate first, what's risky, and how "
-                 "to validate each stage.")
-        step2 = ("Remind me the sequenced plan we made for adding type hints "
-                 "here — the order to annotate in and the risks at each stage.")
-        out = [self._cold("W5", corpus_path, step1, step="step1_plan_cold")]
-        out.append(self._warm("W5", corpus_path, step2, step="step2_recall_plan"))
-        # A concretely different sub-task still costs reasoning (cold).
+        """W5 — multi-step build: implement observability (cold), reuse that lifecycle
+        understanding for related instrumentation (warm), then genuinely new work (cold)."""
+        step1 = ("Add full request-scoped observability to our app on this framework. "
+                 "Implement middleware that assigns a trace id per request, times each "
+                 "request, emits structured logs, and expose a /metrics endpoint. Wire it "
+                 "into the framework's app/blueprint/context lifecycle and implement the "
+                 "middleware and the metrics endpoint.")
+        step2 = ("Wire per-request tracing and timing into our app using the same "
+                 "before/after-request and app-context hooks — implement the "
+                 "instrumentation against this framework's request lifecycle.")
+        out = [self._cold("W5", corpus_path, step1, step="step1_build_cold")]
+        out.append(self._warm("W5", corpus_path, step2, step="step2_reuse_lifecycle"))
+        # A concretely different feature still costs reasoning (cold).
         out.append(self._cold("W5", corpus_path,
-            "Now actually write the annotated signature for the request-dispatch "
-            "function and justify the types you chose.", step="step3_new_cold"))
+            "Now add per-client rate limiting keyed on the auth/trace context, backed by "
+            "a pluggable store. Implement the decorator and the storage interface.",
+            step="step3_new_cold"))
         return out
 
     def w6(self, corpus_path):
-        """W6 — 'fork': agent A reasons about the plugin system; agent B, building
-        an extension, asks about it differently and reuses A's reasoning."""
-        parent = ("Explain how third-party plugins hook into this framework so I "
-                  "can write one that adds a new report section.")
-        child = ("I'm writing a plugin — how does a third-party plugin hook into "
-                 "this framework and register itself?")
+        """W6 — 'fork': agent A builds a plugin; agent B, tasked with a DIFFERENT plugin,
+        reuses A's understanding of the same hook/fixture/entry-point machinery."""
+        parent = ("Build a pytest plugin for our team on top of this framework. It must "
+                  "add a --slow flag that skips tests marked slow, a fixture that spins "
+                  "up and tears down a temporary database, and a hook that writes a JSON "
+                  "report of every test outcome. Implement the full plugin: the hooks, the "
+                  "fixture, the marker, and entry-point registration.")
+        child = ("Build a different pytest plugin on this framework that adds a --retries "
+                 "flag to automatically rerun flaky tests and a fixture that snapshots and "
+                 "restores environment variables. Implement it against the same hook, "
+                 "fixture, and entry-point system.")
         return [self._cold("W6", corpus_path, parent, role="parent", step="parent_cold"),
                 # child shares the role so the (role-scoped) semantic lookup can hit
                 self._warm("W6", corpus_path, child, role="parent", step="child_reuse")]
 
     def w7(self, corpus_path):
-        """W7 — accumulate reasoning, consolidate into the KnowledgeStore, reuse it."""
-        # Four genuinely distinct onboarding investigations — they should NOT
-        # reuse each other (different questions); their reasoning is what gets
-        # consolidated into one summary a later agent can reuse instead.
-        tasks = [
-            "I'm onboarding onto this ORM. Trace how a query object actually "
-            "becomes SQL under the hood so I know where to debug.",
-            "Walk me through how sessions and the unit-of-work track dirty state "
-            "and decide what to flush.",
-            "How do connection pooling and transaction scoping fit together here? "
-            "I need to reason about where connections come from.",
-            "Where do I hook in custom column types or dialect-specific behavior?",
+        """W7 — biggest ORM corpus: one deep build derives the session/transaction
+        internals; several DIFFERENT builds reuse that understanding (compounding),
+        with an unrelated build that correctly stays cold."""
+        cold = ("Implement a repository and unit-of-work layer over this ORM. Provide a "
+                "base repository with typed CRUD, explicit session lifecycle management, "
+                "correct transaction boundaries (begin/commit/rollback), and query-builder "
+                "helpers. Write the actual classes and show how flush/commit ordering is "
+                "handled.")
+        rephrasings = [
+            "Add optimistic-concurrency version columns and a retry-on-conflict wrapper "
+            "across our models, hooking into this ORM's session flush and event "
+            "lifecycle. Implement it.",
+            "Build a multi-tenant scoped-session strategy on this ORM: per-tenant "
+            "session and transaction scoping with correct begin/commit/rollback "
+            "boundaries. Implement the scoping layer.",
+            "Wrap all our writes in a savepoint-based nested-transaction helper using "
+            "this ORM's session and transaction API so partial failures roll back "
+            "cleanly. Implement the helper.",
         ]
-        out = [self._cold("W7", corpus_path, t, step=f"accumulate_{i+1}")
-               for i, t in enumerate(tasks)]
-
-        # Consolidation: one call distills everything into a dense summary, stored
-        # in the KnowledgeStore with its EXACT output_tokens as the cost.
-        context = self._load_context(corpus_path)
-        t0 = time.time()
-        r = self._call_claude(context,
-            "Produce a dense ~300-token knowledge summary of this codebase's "
-            "architecture that a new agent could use INSTEAD of re-reading the "
-            "source. Cover execution model, config, extension points, lifecycle.")
-        dur = int((time.time() - t0) * 1000)
-        region = CORPUS["W7"]
-        rhash = self._codebase_hash(corpus_path)
-        summary_tokens = r["output_tokens"]  # exact, from usage
-        # Full re-derivation cost this summary lets a later agent skip: the whole
-        # consolidation call (codebase input context + output), not the ~500-token
-        # summary size. That is what a knowledge hit actually avoids.
-        consolidation_cost = (r["input_tokens"] + r["cache_creation_input_tokens"]
-                              + r["cache_read_input_tokens"] + r["output_tokens"])
-        self.knowledge_store.submit(
-            region=region, summary=r["answer_text"], region_hash=rhash,
-            source_agent="cloud-W7", token_count=summary_tokens,
-            full_cost_tokens=consolidation_cost, role="analyzer",
-        )
-        out.append(CloudMetric(
-            workload="W7", corpus=corpus_path.name, step="consolidate",
-            agent=self.model, is_first_session=True, duration_ms=dur,
-            reasoning_tokens=r["thinking_tokens"], had_thinking_block=r["had_thinking_block"],
-            input_tokens=r["input_tokens"],
-            cache_creation_input_tokens=r["cache_creation_input_tokens"],
-            cache_read_input_tokens=r["cache_read_input_tokens"],
-            output_tokens=r["output_tokens"],
-            extra={"summary_token_count": summary_tokens},
-        ))
-
-        # A later agent queries the knowledge pool instead of re-analyzing.
-        hit = self.knowledge_store.query(region, rhash, role="analyzer")
-        out.append(CloudMetric(
-            workload="W7", corpus=corpus_path.name, step="knowledge_reuse",
-            agent=self.model, is_first_session=False, duration_ms=0,
-            knowledge_store_hit=hit is not None,
-            knowledge_tokens_saved=(self.knowledge_store.last_summary_tokens or 0) if hit else 0,
-            total_tokens_avoided=(self.knowledge_store.last_full_cost_saved or 0) if hit else 0,
-        ))
+        out = [self._cold("W7", corpus_path, cold, step="cold")]
+        for i, r in enumerate(rephrasings):
+            out.append(self._warm("W7", corpus_path, r, step=f"reask_{i+1}"))
+        # Genuinely different subsystem (column types, not sessions): should NOT
+        # reuse the session/transaction reasoning, so the gate re-thinks.
+        out.append(self._warm("W7", corpus_path,
+            "Separately, implement a dialect-aware encrypted-JSON column type using this "
+            "ORM's TypeDecorator, with tests proving round-trip and query behavior.",
+            step="unrelated_expected_miss"))
         return out
 
     def w8(self, corpus_path):
-        """W8 — largest corpus, hardest task; cold cost + one reworded reuse."""
-        cold = ("We need to modernize this codebase: type hints, tighter error "
-                "handling, and a cleaner public API. Give me a phased plan with "
-                "sequencing, blast radius, and how to validate each phase.")
-        warm = ("Lay out a staged roadmap for bringing this project up to date — "
-                "typing, error handling, API cleanup — and how we de-risk each "
-                "stage.")
+        """W8 — largest corpus: cold build multi-tenant billing app; warm builds reuse
+        the same tenant-isolation/model/permission machinery for a different feature."""
+        cold = ("Add a new multi-tenant billing app to this project. Implement models "
+                "with strict tenant isolation, API endpoints for creating and listing "
+                "invoices, the migrations, admin integration, and per-tenant permission "
+                "checks. Sequence the work and implement the core models plus the first "
+                "endpoint end-to-end, wired into the project's existing app/settings/URL "
+                "structure.")
+        warm = ("Add a subscription/pricing tier feature to the billing system. Implement "
+                "pricing tier models with tenant isolation, API endpoints to list and assign "
+                "tiers to accounts, and enforce per-tenant permission checks on tier changes. "
+                "Use the same model structure and middleware hooks as the billing app.")
         return [self._cold("W8", corpus_path, cold, step="cold_large"),
-                self._warm("W8", corpus_path, warm, step="warm_reworded_large")]
+                self._warm("W8", corpus_path, warm, step="warm_pricing_feature")]
 
     # -- Dispatch ------------------------------------------------------------
 
@@ -645,7 +644,6 @@ def summarize_cloud(metrics: list[CloudMetric]) -> dict:
         "n_thinking_hits": len(thinking_hits),
         "thinking_hit_rate": (len(thinking_hits) / len(metrics)) if metrics else 0.0,
         "total_reasoning_tokens_saved": sum(m.reasoning_tokens_saved for m in metrics),
-        "total_knowledge_tokens_saved": sum(m.knowledge_tokens_saved for m in metrics),
         # The headline: full derivation cost avoided by reuse (codebase input +
         # output), which scales with codebase size -- not the thinking sliver.
         "total_tokens_avoided": sum(m.total_tokens_avoided for m in metrics),
@@ -683,11 +681,11 @@ def write_rollup(all_metrics: dict[str, list[CloudMetric]], model: str) -> Path:
         f"Timestamp: {ts}",
         "",
         "Reasoning-token reuse: extended-thinking tokens NOT regenerated because a "
-        "prior agent's reasoning was reused from the ThinkingStore/KnowledgeStore. "
+        "prior agent's reasoning was reused from the ThinkingStore. "
         "All token counts are exact (from the Anthropic `usage` object), never estimated.",
         "",
-        "| Workload | Corpus | Sessions | Cold Calls | Thinking Hits | Baseline Reasoning | Reasoning Saved | Knowledge Saved | Tokens Avoided |",
-        "|----------|--------|----------|------------|---------------|--------------------|-----------------|-----------------|----------------|",
+        "| Workload | Corpus | Sessions | Cold Calls | Thinking Hits | Baseline Reasoning | Reasoning Saved | Tokens Avoided |",
+        "|----------|--------|----------|------------|---------------|--------------------|-----------------|----------------|",
     ]
     for w in sorted(all_metrics):
         s = summarize_cloud(all_metrics[w])
@@ -695,7 +693,7 @@ def write_rollup(all_metrics: dict[str, list[CloudMetric]], model: str) -> Path:
             f"| {w} | {CORPUS.get(w, 'n/a')} | {s['n_sessions']} | {s['n_cold_calls']} | "
             f"{s['n_thinking_hits']} ({s['thinking_hit_rate']*100:.0f}%) | "
             f"{s['baseline_reasoning_tokens']} | {s['total_reasoning_tokens_saved']} | "
-            f"{s['total_knowledge_tokens_saved']} | {s['total_tokens_avoided']} |"
+            f"{s['total_tokens_avoided']} |"
         )
     path.write_text("\n".join(lines) + "\n")
     return path
@@ -707,7 +705,6 @@ def _print_summary(workload: str, metrics: list[CloudMetric]):
           f"{s['n_sessions']} sessions, {s['n_cold_calls']} cold, "
           f"{s['n_thinking_hits']} thinking hits, "
           f"reasoning_saved={s['total_reasoning_tokens_saved']}, "
-          f"knowledge_saved={s['total_knowledge_tokens_saved']}, "
           f"TOKENS_AVOIDED={s['total_tokens_avoided']}, "
           f"in={s['total_input_tokens']}(+{s['total_cache_creation_input_tokens']}c "
           f"+{s['total_cache_read_input_tokens']}r) out={s['total_output_tokens']}")
