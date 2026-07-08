@@ -53,7 +53,7 @@ Every token-count figure here comes from the model provider's own usage accounti
 ```bash
 cf thinking stats
 # Reuses: 12
-# Total tokens saved (exact): 6380
+# Total tokens saved (exact): 5981
 ```
 
 ## Measured Results: Extended-Thinking Token Reuse
@@ -70,9 +70,9 @@ Measured on **Anthropic Claude Opus 4.8** across 24 sessions (8 workloads, 1.5K�
 | W6 | pytest | 40K | 2 | 1 | 1 | 50% | **258** | **19,119** |
 | W7 | sqlalchemy | 80K | 5 | 2 | 3 | 60% | **534** | **58,650** |
 | W8 | django | 280K | 2 | 1 | 1 | 50% | **642** | **19,471** |
-| **TOTAL** | | | **24** | **12** | **12** | **50%** | **6,380** | **252,150** |
+| **TOTAL** | | | **24** | **12** | **12** | **50%** | **5,981** | **232,050** |
 
-**Summary:** 50% average hit rate; 6,380 reasoning tokens saved; 252K total tokens avoided. W1–W2 establish baseline (0% reuse), W3–W8 demonstrate 50–75% reuse on related problems.
+**Summary:** 50% average hit rate; 5,981 reasoning tokens saved; 232K total tokens avoided. W1–W2 establish baseline (0% reuse), W3–W8 demonstrate 50–75% reuse on related problems.
 
 ## Quick Start
 
