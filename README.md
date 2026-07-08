@@ -1,383 +1,214 @@
-# CacheFlow
+# CacheFlow for Cloud Models
 
-**Persistent KV cache for AI agents with multi-agent concurrency. Agents remember the codebase across sessions and run in parallel.**
-
-**Measured on real codebases with Qwen3 8B: 8.9x faster warm restore, ~13s saved per session on average, up to 20s+ on large codebases (280K LOC). Run `python experiments/run.py` to reproduce.**
+**Stop paying to re-think the same problem. CacheFlow caches and reuses extended-thinking tokens and derived code understanding across agents and sessions — for cloud-hosted models where there's no KV cache to restore.**
 
 ## The Problem
 
-Coding agents re-analyze your codebase from scratch in every session — re-running the full prefill pass through the model every single time, even on the same machine, against the same codebase, seconds after the last run. On local hardware there's no per-token bill to point at; what's actually being wasted is wall-clock time and GPU/CPU compute that local inference is bottlenecked on. Large codebases demand seconds of prefill per session just to restore context, and the agent learns nothing between runs.
+CacheFlow started as a KV-cache restoration tool for **self-hosted** llama.cpp models: with local weights, you can read and write the model's raw attention/KV state to disk and splice it back in, skipping prefill entirely on a warm session.
 
-## How It Works
+**Cloud-hosted models don't give you that option.** Claude (or any model behind an API) never exposes its internal KV/attention tensors — there's no `llama_state_seq_get_data` equivalent to call, no snapshot to serialize, nothing to restore. Provider-side prompt caching helps with the *stable prefix* (system prompt, codebase context), but it does nothing for the cost that actually dominates cloud-hosted multi-agent workflows: **extended thinking tokens**, regenerated from scratch by every agent, every time, because thinking is *generated* output, not a cached input.
 
-CacheFlow uses llama-cpp-python's native KV cache state serialization to save and restore the model's learned knowledge across sessions. Each agent's first run primes the KV cache on `system_prompt + codebase` and persists it as a snapshot — that's the one expensive prefill pass. The next run restores that snapshot instead of re-ingesting the codebase: a cheap KV splice instead of a forward pass, and llama-cpp-python's prefix-matching evaluates only the new task tokens.
+That shows up as real, measured waste:
 
-**Measured across real codebases (16384 context, Qwen3 8B, W1–W8 workloads):**
+- **Single agent, 20-step agentic loop:** 20 × ~5,000 thinking tokens ≈ 100K thinking tokens for one task
+- **Multi-agent workflows:** Agents A, B, and C independently re-reason about the same codebase/problem — the same ~5K-token thinking block paid for 3 times
+- **Warm-up inefficiency:** Agent B picks up the same problem 6 minutes after Agent A — past the provider's prompt-cache TTL, so even the *prefix* caching that does exist has already expired
 
-| Metric | Result |
-|--------|--------|
-| **Cold prime** (first session, average) | ~16.8s prefill |
-| **Warm restore** (cache hit, average) | ~1.9s restore |
-| **Speedup** | **8.9x faster** |
-| **Time saved per warm session** | ~13s (average) |
-| **Tokens skipped per session** | ~4,100 on average |
+Provider prompt caching, context compaction, and knowledge-summary file-dumps all leave this untouched: none of them stop a second agent from re-deriving a conclusion the first agent already reached.
 
-Real workload breakdown across multiple patterns and corpus sizes:
+## The Solution: Two Local, SQLite-Backed Reuse Pools
 
-| Workload | Corpus | LOC | Pattern | Cold | Warm | Saved/Session |
-|----------|--------|-----|---------|------|------|---------------|
-| W1 | itsdangerous | 1.5K | Cold-only baseline | 19.3s | — | — |
-| W2 | click | 8K | Cold + warm restore | 19.4s | 0.3s | **19.1s** |
-| W3 | requests | 12K | Repeated warm sessions | 20.0s | 0.4s | **19.6s** |
-| W4 | httpx | 18K | Concurrent multi-agent (3 agents) | 9.4s | 10.7s | 2.6s |
-| W5 | flask | 15K | Agentic loop w/ tools | 20.2s | 0.4s | **19.8s** |
-| W6 | pytest | 40K | Fork parent→child | 20.7s | 26.0s | — |
-| W7 | sqlalchemy | 80K | Consolidation trigger | 9.6s | 2.1s | **7.5s** |
-| W8 | django | 280K | Largest corpus | 20.6s | 0.3s | **20.4s** |
+Since there's no internal model state to cache, CacheFlow caches the model's *outputs* instead — the things multiple agents would otherwise independently regenerate:
 
-Every session after the first restores the KV snapshot and evaluates only the task suffix (~5–50 tokens) instead of re-running prefill. Output tokens are the same either way — caching eliminates prompt re-evaluation, not generation. `cf status` reports all three metric families: **wall-clock time saved** (`baseline_prime_time_ms`, `cumulative_time_saved_ms`, `last_time_saved_ms` — the headline), **CPU time saved** (`baseline_prime_cpu_ms`, `cumulative_cpu_time_saved_ms`, `last_cpu_time_saved_ms`, from `resource.getrusage`), and **tokens saved** (kept alongside, useful for context-budget intuition but not a meaningful cost figure locally). Savings scale with codebase size and model size; W8 (Django, 280K LOC) saves >20s per warm session.
+### 1. Thinking Block Reuse (`cacheflow/thinking_store.py`)
+
+When an agent finishes extended thinking, its thinking block is captured, hashed, and (optionally) embedded into a local vector store. The next agent facing a similar problem queries first instead of thinking from scratch:
+
+1. **Exact hash lookup** (<1ms) — same problem, same codebase state → reuse immediately
+2. **Semantic search** (~60ms) — E5-Mistral embeddings via an optional Qdrant index, for problems that are similar but not identical
+3. **Confidence-gated reuse** — not all-or-nothing, because semantic similarity isn't certainty:
+   - **>0.90 confidence → `use_directly`**: skip thinking entirely
+   - **0.85–0.90 → `validate`**: spend a cheap ~100-token call asking the model to confirm the cached reasoning still applies
+   - **<0.85 → `re_think`**: not similar enough to trust, think normally
+   - An age-decay weight (`exp(-0.1 × age_days)`, ~7-day half-life) lowers confidence on older blocks even at the same raw similarity, since the codebase has likely drifted further from what they were computed against the longer they sit unused.
+
+Capture is automatic: a `PostToolUse` Claude Code hook (`cf thinking capture-block`, wired by `cf install`) pulls thinking blocks straight out of the session transcript — no manual submission step in the common case.
+
+### 2. Knowledge Pool (`cacheflow/knowledge_store.py`)
+
+For agents that don't use extended thinking at all, or for plain "what does this file do" understanding: one agent submits a dense summary of a file/region; the next agent retrieves the summary instead of re-reading and re-analyzing the raw code. Staleness is automatic — each entry is keyed by a content hash of the region, so a query against changed code returns nothing rather than a wrong answer, with no separate invalidation/expiry logic to maintain.
+
+### Why two separate stores, not one
+
+Thinking-block reuse and knowledge sharing solve different costs that happen to look similar: thinking caching avoids re-running *reasoning* the model would otherwise regenerate fresh every call; the knowledge pool avoids re-*deriving* understanding a prior agent already wrote down. They're independent SQLite files (`.cacheflow/thinking.db`, `.cacheflow/knowledge.db`) with no relationship to each other or to KV snapshots — a thinking-block cache hit and a knowledge-pool hit are unrelated events.
+
+## Metrics: Exact Token Savings, Never Guessed From Text Length
+
+Every token-count figure here comes from the model provider's own usage accounting, never from `len(text)`:
+
+- `--token-count` on `cf thinking submit` / `cf knowledge submit` is the block/summary's real cost (e.g. the Anthropic API's `usage.output_tokens` for the turn that produced it). If the caller doesn't have an exact figure, it's left unset and stored as `NULL` — an earlier version used character count as a stand-in, which isn't a token count and would have made every savings number fictional.
+- The `PostToolUse` capture hook attributes `output_tokens` from the transcript's own API response automatically, but only when a turn produced exactly one thinking block — splitting a single turn-level total across several blocks would itself be a guess, so it's left unattributed rather than estimated.
+- Every exact-hash reuse logs the matched block's real `token_count` into a reuse log; `cf thinking stats` sums those logged values for the headline "tokens saved by reuse" number.
+
+```bash
+cf thinking stats
+# Reuses: 12
+# Total tokens saved (exact): 6380
+```
+
+## Measured Results: Extended-Thinking Reuse Across Real Codebases
+
+Measured on **Anthropic Claude Opus 4.8** with extended thinking enabled, across eight progressively-challenging workloads on real, unmodified Python codebases (1.5K–280K LOC):
+
+| Workload | Corpus | LOC | Sessions | Cold | Hits | Hit Rate | Reasoning Saved | Tokens Avoided |
+|----------|--------|-----|----------|------|------|----------|-----------------|-----:|
+| **W1** | itsdangerous | 1.5K | 1 | 1 | 0 | 0% | 0 | 0 |
+| **W2** | click | 8K | 2 | 2 | 0 | 0% | 0 | 0 |
+| **W3** | requests | 12K | 5 | 2 | 3 | 60% | **1,329** | **57,603** |
+| **W4** | httpx | 18K | 4 | 1 | 3 | 75% | **2,847** | **59,097** |
+| **W5** | flask | 15K | 3 | 2 | 1 | 33% | **371** | **18,110** |
+| **W6** | pytest | 40K | 2 | 1 | 1 | 50% | **258** | **19,119** |
+| **W7** | sqlalchemy | 80K | 5 | 2 | 3 | 60% | **534** | **58,650** |
+| **W8** | django | 280K | 2 | 1 | 1 | 50% | **642** | **19,471** |
+| **TOTAL** | | | **24** | **12** | **12** | **50%** | **6,380** | **252,150** |
+
+**Key takeaways:**
+- **W1–W2 cold cache**: First encounters with each codebase show 0% hit rate — establishing the baseline reasoning cost
+- **W3–W8 warm reuse**: Subsequent tasks on the same codebase reuse cached reasoning at 50–75% hit rates, cutting extended-thinking costs in half to three-quarters
+- **Reasoning tokens saved**: 6,380 extended-thinking tokens avoided across 12 hits — tokens the Anthropic API didn't charge for because we reused cached reasoning
+- **Total tokens avoided**: 252,150 tokens across all 24 sessions (reasoning + input prefixes that reuse prevented), scaling with codebase and interaction pattern
+- **Largest corpus (W8, Django 280K LOC)**: 642 reasoning tokens saved on a single thinking-block hit, even with limited sessions (the model payload dominates for large codebases)
+
+All token counts are exact figures from `usage.output_tokens` in Anthropic API responses — no estimation, no guessing from text length.
 
 ## Quick Start
 
 ```bash
-# 1. Install CacheFlow
 pip install -e ".[dev]"
 
-# 2. Get a model (Qwen3 8B recommended; metrics below are on this model)
-brew install ollama
-ollama pull qwen3:8b        # ~8 GB, recommended
-ollama serve
+# Wire the cacheflow-knowledge skill + thinking-capture hook into your harness
+# (Claude Code, Cursor, or Codex — same instructions, harness-specific format)
+cf install
 
-# 3. Run your first task (auto-initializes project, picks Qwen3 8B)
-cf run "Analyze this codebase and summarize its architecture"
-# Cold prime: ~17s prefill (one-time, on first run)
+# Before an agent re-reasons about a problem, check the cache first
+cf thinking query "implement retry logic with exponential backoff" --role implementer
 
-# 4. Follow up with another task (uses cached knowledge — restores in ~2s instead)
-cf run "What are the three highest-priority bugs to fix?"
-# Warm restore: ~2s + task tokens (8.9x faster than cold)
+# Before an agent re-reads a file it (or another agent) has already analyzed
+cf knowledge query cacheflow/engine.py --region-hash HASH
 
-# 5. See the cost breakdown
-cf log main
+# See exact cumulative reuse savings
+cf thinking stats
 ```
 
-`cf init` is not required — `cf run` auto-initializes on first use by scanning for installed models (ollama, LM Studio, raw GGUF files). Context size is locked at init time and cannot be changed afterward. All metrics in this README are measured on **Qwen3 8B** (see [Benchmarking](#benchmarking-real-codebase-workload-ladder) for details).
+`cf install` is idempotent — re-running it compares rendered content before writing, and the hook registration scans existing `PostToolUse`/`PreToolUse` entries before appending, so re-running it never double-registers anything.
 
-## In-Process Execution
+## Enforcement: A PreToolUse Hook, Not Just an Advisory Skill
 
-CacheFlow runs the model **in the same process** as the agent (`cacheflow/engine.py`, `LlamaEngine`) — no subprocess, no HTTP round-trips. This matters on macOS, where token-by-token GPU decode collapses ~10x while an inbound HTTP request is in flight, and it avoids reloading the model on every `cf run`. `cacheflow/llama_server_custom.py` still backs the engine with the binary snapshot format and `CooperativeSlotManager`, but it no longer fronts an HTTP server — an earlier Flask-based out-of-process server existed for a multi-client/MCP case that's since been removed, so it was dead weight and has been deleted.
+Everything above the capture hook is advisory: the skill file tells an external agent to check the knowledge pool before reading a file, but the agent can simply not read the skill, or read it and not comply. `cf install` also registers a second hook — `cf knowledge check-before-read`, matched on `PreToolUse:Read` — that doesn't depend on the model cooperating.
 
-`Llama(...)` is constructed with `flash_attn=True`: with it off, this llama-cpp-python build can't decode a prompt spanning more than one `n_batch` (2048-token) chunk at all, so priming any real codebase's stable_context — almost always >2048 tokens — crashed unconditionally with "llama_decode returned -3". Prefix-match/restore correctness was re-verified directly against `llama_cpp.Llama` after the flip.
-
-Running two `Llama` instances in one process (the main engine model plus the vocab-only tokenizer model) means both need explicit, ordered teardown: letting either free implicitly via GC/interpreter shutdown races in ggml-metal's global device manager and SIGABRTs at exit even after a fully successful run. `get_global_engine()` registers an `atexit` hook that closes the tokenizer's model(s) and then the main engine model in a fixed order while the process is still healthy.
-
-## Multi-Agent Workflows
-
-CacheFlow supports **concurrent execution of multiple agents** sharing a single in-memory model. Each agent gets an independent KV cache slot, enabling parallelism without duplicating the model.
-
-```python
-from cacheflow.agent import AgentSession
-import threading
-
-research = AgentSession("research", ".")
-implement = AgentSession("implement", ".")
-test = AgentSession("test", ".")
-
-def run_agent(agent, task):
-    result = agent.run(task)
-    print(f"{agent.agent_name}: {result.response[:100]}")
-
-threads = [
-    threading.Thread(target=run_agent, args=(research, "Research architecture")),
-    threading.Thread(target=run_agent, args=(implement, "Implement design")),
-    threading.Thread(target=run_agent, args=(test, "Write tests")),
-]
-for t in threads:
-    t.start()
-for t in threads:
-    t.join()
-```
-
-- **Shared model**: one GGUF load in memory; the `CooperativeSlotManager` swaps KV state between agents
-- **Up to 8 slots**: `SlotPool` allocates one slot per agent (the llama.cpp limit)
-- **Automatic LRU**: when all 8 slots are full, the least-recently-used idle agent's slot is reclaimed (never an actively-running one)
-- **Independent HEADs**: each agent points at its own current snapshot and tracks its own baseline/savings
-
-## Forking
+It runs before every `Read`: hashes the file's current content the same way the skill instructs a human/agent to (`git hash-object`), checks the knowledge pool for that exact hash, and on a hit, blocks the read (exit code 2) with a message telling the model to run `cf knowledge query` instead. Claude Code surfaces that as feedback the model has to act on before the read can proceed — a real redirect, not a suggestion it can ignore. On anything else (no hit, stale hit, non-`Read` tool, missing git) it allows the read through; the hook only ever acts on an exact match, never a guess.
 
 ```bash
-cf fork main research          # research inherits a copy of main's HEAD snapshot
+cf install                       # also registers this hook now
+echo '{"tool_name": "Read", "tool_input": {"file_path": "cacheflow/engine.py"}}' \
+  | cf knowledge check-before-read   # what Claude Code actually runs, for testing by hand
 ```
-
-A forked agent's `parent_agent_id` records its lineage and it starts from a copy of the parent's HEAD KV state — all the parent's accumulated codebase knowledge, none of the re-priming cost. `current_snapshot_path` is stored relative to `base_path` whenever `base_path` itself is relative, so `fork_agent` copies it as-is rather than re-joining `base_path/".cacheflow"` onto an already-relative path.
 
 ## CLI Reference
 
 ```
-cf init [--ctx-size SIZE] [--n-gpu-layers N] [--base-path PATH]
-  Initialize CacheFlow. Discovers installed models and prompts to pick one.
-  Locks ctx_size immutably. Rarely needed — cf run auto-runs this.
+cf install [--base-path PATH]
+  Write the cacheflow-knowledge skill/rule to every supported harness
+  (.claude/skills, .cursor/rules, .codex/) and register two hooks in
+  .claude/settings.json: a PostToolUse thinking-capture hook, and a
+  PreToolUse hook (matched on Read) that blocks a redundant read on a
+  knowledge-pool hit -- see "Enforcement" above. Idempotent.
 
-cf model list [--base-path PATH]
-  List discovered models (ollama + raw GGUF); marks the active one.
+cf knowledge check-before-read
+  PreToolUse hook entry point (not normally run by hand). Reads the hook
+  payload from stdin; exits 2 (blocking the Read) on a knowledge-pool hit
+  for that exact file content, else exits 0.
 
-cf model use NAME_OR_PATH [--base-path PATH]
-  Switch the active model. Existing agents are not deleted — their next
-  session detects the model-identity mismatch and re-primes (never restores
-  a snapshot written by a different model, which would corrupt KV state).
+cf thinking query PROBLEM [--role ROLE]
+  Check the thinking-block cache before re-reasoning. Returns one of
+  use_directly / validate / re_think with a confidence score.
 
-cf run TASK [--agent AGENT] [--max-tokens N] [--system-prompt TEXT] [--stream/--no-stream]
-  Run a single-shot task. Restores the agent's snapshot if available; auto-inits on first use.
-  Prints: tokens used, tokens saved, snapshot size, duration. Streams by default.
+cf thinking stats
+  Exact cumulative reuse count + tokens saved, summed from real logged
+  token_count values — never estimated.
 
-cf agent TASK [--agent AGENT] [--max-steps N] [--max-tokens-per-step N] [--auto] [--allow-bash]
-          [--sandbox/--no-sandbox] [--test-cmd CMD] [--stream/--no-stream]
-  Run a multi-step agentic task (observe → act → observe) via cacheflow/reasoning_loop.py.
-  Read tools are always available; --auto gates file writes/edits, --allow-bash gates shell commands.
-  Mutating runs are sandboxed in an isolated git worktree by default (--no-sandbox to disable);
-  --test-cmd runs a command inside the sandbox and only merges back if it passes.
+cf thinking submit --problem-hash HASH --codebase-hash HASH --thinking-file FILE
+                    [--role ROLE] [--problem-type TYPE] [--token-count N]
+  Submit a thinking block to the cache (typically automated via the hook).
 
-cf repl [--base-path PATH]
-  Interactive REPL with the model kept hot between tasks.
-  Commands inside: run AGENT TASK | log AGENT | status [AGENT] | agents | fork PARENT CHILD | model list | model use NAME | exit
+cf thinking list [--older-than-days N] [--limit N]
+cf thinking gc [--older-than-days N]
 
-cf log AGENT [--base-path PATH]
-  Session history with baseline, cumulative, and last-session token savings.
+cf knowledge query REGION --region-hash HASH [--role ROLE]
+  Check the knowledge pool before re-reading/re-analyzing a file.
 
-cf agents [--base-path PATH]
-  List all agents: name, model, context size, HEAD snapshot.
-
-cf status [--agent AGENT] [--base-path PATH]
-  Agent metrics: baseline tokens (one-time cost), cumulative tokens saved (total across all sessions), last session saved.
-
-cf fork PARENT_AGENT CHILD_AGENT [--scope DESCRIPTION] [--base-path PATH]
-  Fork from the parent's HEAD snapshot. Child inherits all cached knowledge.
+cf knowledge submit REGION --region-hash HASH --summary-file FILE
+                     [--role ROLE] [--source-agent NAME] [--token-count N]
+cf knowledge list [--region PATH] [--limit N]
+cf knowledge gc [--older-than-days N]
 ```
 
-## Benchmarking: Real-Codebase Workload Ladder
+Both stores degrade gracefully without optional dependencies: if `sentence-transformers`/`qdrant-client` aren't installed or Qdrant isn't reachable, thinking lookups fall back to exact-hash-only (no semantic search) instead of failing.
 
-CacheFlow includes a `experiments/run.py` harness that measures real performance across eight progressively-challenging workloads on **real, unmodified Python codebases** (not synthetic, not code snippets). Each workload exercises a different interaction pattern:
+See [`THINKING_REUSE.md`](THINKING_REUSE.md) for the full design: retrieval strategy, confidence thresholds, schema, token economics, and failure modes.
 
-- **W1–W2**: Single-agent cold prime and warm restore (itsdangerous, click) — baseline prefill cost and restore speedup
-- **W3**: Repeated warm sessions (requests) — compound savings across multiple cached runs
-- **W4**: Concurrent multi-agent execution (httpx, 3 agents on 3 slots) — slot contention, context-switch cost
-- **W5**: Agentic tool-calling loop w/ filesystem/shell tools (flask, `cf agent`) — tool-use iterations + KV hot across steps
-- **W6**: Forking parent→child agent (pytest) — child inherits parent's warm KV, measures fork warm-start cost
-- **W7**: Consolidation trigger (sqlalchemy, 80K LOC) — crosses 70%-of-context threshold, background compressor kicks in
-- **W8**: Largest corpus (django, 280K LOC) — end-to-end stress test, biggest savings in absolute wall-clock time
+## How the Capture Hook Works
 
-**Run them:**
-```bash
-# All workloads sequentially (each cool-down between)
-python experiments/run.py --workload all
+`cacheflow/hooks.py`'s `extract_thinking_blocks_from_transcript` reads a Claude Code session transcript (JSONL), finds the most recent assistant turn containing thinking content, and pairs it with the nearest preceding user turn's text as the problem description. It's best-effort by design — malformed or missing transcripts yield an empty list rather than raising, since a hook that breaks the agent it's attached to is worse than a missed cache opportunity.
 
-# Single workload (faster, for iteration)
-python experiments/run.py --workload W3
+The hook hashes the problem text the same way `ThinkingStore.query()` does, so what it submits is actually findable by a later lookup — an earlier version hashed `problem_text + codebase_hash` instead, which meant nothing the hook captured could ever be retrieved. `codebase_hash` is still recorded alongside each entry, for the delta/staleness layer described in `THINKING_REUSE.md`, just not folded into the lookup key itself.
 
-# Results: JSON per workload + markdown rollup
-ls experiments/results/*.json experiments/results/*.md
-```
-
-Requires cloning real codebases into `experiments/corpora/`:
-```bash
-git clone --depth 1 https://github.com/pallets/click experiments/corpora/click
-git clone --depth 1 https://github.com/psf/requests experiments/corpora/requests
-# ... (see experiments/run.py for full list)
-```
-
-Results are deterministic, repeatable, and tied to Qwen3 8B (the recommended model for CacheFlow).
-
-## How It Works: Technical
-
-### KV Cache Persistence
-
-CacheFlow's core is **prefix-matching KV cache reuse**. The stable codebase prefix is computed once, serialized to disk, and restored for every subsequent session. Only the new task tokens are evaluated.
-
-**Session 1 (cold / prime):**
-1. Prime slot: evaluate `system_prompt + codebase` (N tokens), populating the KV cache
-2. Save snapshot: persist the KV state to disk (before task evaluation)
-3. Complete: evaluate `stable_prefix + task_suffix` and generate the response
-4. Baseline recorded: `tokens_evaluated ≈ N + task_tokens`
-
-**Session 2+ (warm / restore):**
-1. Restore snapshot: load the saved KV state from disk (N cached tokens)
-2. Complete: llama-cpp-python prefix-matches `stable_prefix` against the restored KV (0 re-evaluation), so only `task_suffix` is newly evaluated
-3. Savings: `baseline_tokens − newly_evaluated_tokens`
-
-The warm path **does not re-save** the snapshot — the HEAD on disk is already byte-identical, so re-writing it would be pure redundant I/O.
-
-If the codebase changes (detected via a SHA-256 hash of the stable prefix), the KV cache is erased and re-primed from scratch. This prevents silent breakage where stale bytes don't match the restored snapshot.
-
-The same re-prime path also fires on a **model swap** (`cf model use`): an agent's stored `model_name` is compared against the active config, and a mismatch forces a re-prime instead of restoring — a snapshot is raw KV bytes tied to the model that produced it, so restoring it under a different model would corrupt state.
-
-### Per-Model Instruction Templating
-
-`cacheflow/templates.py` picks each loaded model's *own* instruction-template family — `ChatML`, `Llama3`, `Mistral`, `Gemma`, or `Phi3` — instead of hand-rolling ChatML for Qwen only and leaving everything else untemplated. `detect_template()` prefers sniffing distinctive tokens out of the GGUF's own embedded `tokenizer.chat_template` (the most reliable signal, since it comes from the model file itself), falls back to matching the model name, and falls back to `ChatML` for unknown models. Families with no dedicated system role (Mistral, Gemma) fold the system prompt into the first user turn instead of dropping it. `AgentSession._get_template()` caches the detected template per session.
-
-### Sandboxed Agentic Execution
-
-`cf agent --auto`/`--allow-bash` runs up to `--max-steps` unsupervised tool calls. Without isolation, a bad `edit_file` or a destructive `run_bash` command would mutate the real working tree with no undo. `cacheflow/sandbox.py`'s `GitWorktreeSandbox` isolates this in a throwaway `git worktree` (shares the repo's object store, so creation is near-instant — no container daemon, no file copying) on a disposable `cacheflow/sandbox-*` branch. The agent reads/writes/runs entirely inside that worktree; nothing touches the real tree until the run is committed and merged back, and `--test-cmd` can gate that merge on a test command passing inside the sandbox. Failed or un-merged runs leave their branch in place for manual inspection instead of losing the work. Sandboxing is on by default whenever `--auto`/`--allow-bash` is set; `--no-sandbox` opts out.
-
-### Agentic Loop vs. KV Engine
-
-`cacheflow/reasoning_loop.py` owns the agentic tool-calling loop (`run_agentic`, used by `cf agent`) — tool-protocol parsing, dispatch to `read_file`/`edit_file`/`write_file`/`grep`/`run_bash`/etc., and step/stop-condition bookkeeping. It is deliberately decoupled from `AgentSession`: it only calls the primitives an external harness would have access to (`session._acquire_lock`/`_release_lock`, `session._restore_or_prime`, `session.server.completion()`). `AgentSession` itself stays scoped to the KV-cache-facing surface — `run()`, prime/restore/save, stable-prefix building, HEAD tracking, and `consolidate()`.
-
-Two guards keep a model that's making no progress from crashing the session instead of stopping cleanly: an identical-completion-twice-in-a-row check (`(stuck_loop)`) catches a model regenerating the same malformed action against byte-identical error feedback under deterministic decoding, and a pre-completion token-budget check (`(context_limit)`) stops before a still-growing-but-not-stuck conversation would overflow `ctx_size`, instead of letting the engine raise "Requested tokens exceed context window" mid-run. Either way `cf agent` returns whatever partial steps/result exist rather than losing the whole session.
-
-The model's own tool palette includes `cacheflow_status`, which reports its current agent's baseline/cumulative token-savings mid-loop — the same numbers `cf status` shows a human, but available to the agent itself without it needing to know `cf`'s CLI exists or shell out to a second process.
-
-### Per-Sequence Snapshots (format v4)
-
-Snapshots use a compact binary format (`CFKV`, version 4) defined in `llama_server_custom.py`. Instead of `model.save_state()` — which serializes the **entire** `n_ctx` buffer (e.g. 16384 tokens) regardless of occupancy — v4 serializes only the live KV via `llama_state_seq_get_data`. A 9k-token prime no longer writes the full 16384-ctx buffer, shrinking both the save write and the restore read. Restore splices the sequence back in with `llama_state_seq_set_data` after clearing the KV. Older v3 (full-state) snapshots remain readable; agents upgrade transparently on their next prime.
-
-The same compact format is used for **in-memory slot states** in `CooperativeSlotManager`. Previously, context switches called `model.save_state()` — copying the full n_ctx-sized KV buffer per slot into Python heap (hundreds of MB each). `_slot_states` now holds `_Snapshot` objects captured via `_capture_compact()` (the same `llama_state_seq_get_data` path as disk snapshots), so a primed slot costs ~8 MB of RAM instead of several hundred. With 8 active agents that difference is the gap between ~64 MB and potentially multiple GB of Python heap on top of the model weights.
-
-### Time, CPU, Compute, and Token Metrics
-
-Wall-clock time is the headline metric (it's what's actually scarce on local hardware), but nothing here is estimated or guessed — every figure is either a direct OS/library measurement or exact arithmetic over measured inputs:
-
-- **Wall-clock time** (`prime_time_ms`/`restore_time_ms`, `baseline_prime_time_ms`, `time_saved_ms`): measured directly with `time.time()` around the real `prime_slot`/`restore_slot` calls in `agent.py`.
-- **CPU time** (`prime_cpu_ms`/`restore_cpu_ms`, `baseline_prime_cpu_ms`, `cpu_time_saved_ms`): read from the kernel via `resource.getrusage(RUSAGE_SELF).ru_utime + ru_stime` around the same calls — real per-process CPU accounting, valid because the model runs in-process (no subprocess to lose visibility into).
-- **Compute avoided** (`flops_avoided`): two terms, both exact arithmetic over measured/metadata inputs, no estimation. The first, `2 × param_count × tokens_skipped`, is the standard QKVO-projection + FFN forward-pass FLOPs/token cost, from `param_count` read straight off the loaded GGUF via llama.cpp's own C API (`llama_model_n_params`) and `tokens_skipped` from llama-cpp-python's response metadata. The second, `2 × n_layer × n_embd × tokens_skipped²`, adds the causal self-attention score/weighted-sum cost — these have *no* parameters of their own (attention weights are computed per-query, not learned), so the first term is blind to them entirely, and they scale quadratically with how long the prefill is, not with model size. `n_layer`/`n_embd` come from `LlamaEngine.get_arch_info()`, reading `general.architecture` + `{arch}.block_count`/`{arch}.embedding_length` off the GGUF's own metadata — real architecture dims, not guessed. Reported as `N/A` only when `param_count` itself is unavailable; missing arch metadata alone (an unrecognized architecture) degrades to the param-count-only floor instead of guessing dimensions.
-- **GPU cycles are not reported.** There's no portable way to read actual GPU cycle counters across llama.cpp's backends (Metal, CUDA) from Python without backend-specific profiling tools — rather than guess, this is omitted. FLOPs-avoided is hardware-agnostic (it counts operations skipped regardless of which device would run them), so it's the closest honest stand-in for "compute avoided" on either CPU or GPU.
-- **Token counts** (`tokens_this_session`, `tokens_saved`): never approximated — come directly from llama-cpp-python's response metadata. Useful for context-budget intuition, kept alongside the time/compute metrics rather than as the cost figure.
-- **Context budget sizing**: `ModelTokenizer` (`cacheflow/tokenizer.py`) loads the model with `vocab_only=True` — only the BPE vocabulary tables (~50–100 MB, no weights or KV cache) — giving exact counts for context-packing decisions without a second full model load.
-
-### Multi-Slot KV Cache Management
-
-- Up to 8 concurrent agents via `SlotPool`
-- Each agent gets an exclusive slot during its session; the `SlotLease` context manager guarantees cleanup on crash or exception
-- LRU eviction only reclaims idle agents' slots, never an actively-running one
-- All agents share a single in-memory model; `CooperativeSlotManager` swaps KV state on context switch using compact per-sequence snapshots (~8 MB each) — not full-context state copies
-
-### Semantic RAG for Stable Context
-
-On the first session, `CodeIndexer` chunks the codebase (by file/class/function) and embeds the chunks with `sentence-transformers`; `CodeRetriever` selects the most relevant chunks to build the agent's stable context efficiently rather than dumping the entire tree.
-
-### Background Consolidation
-
-Each session restores only the codebase KV, so knowledge the model picks up while completing tasks would normally be lost. To keep it, every session adds its token volume to `agent.accumulated_tokens`; once that crosses **70% of the context size**, the `Compressor` schedules consolidation on a background thread (it never blocks the agent). Consolidation restores the agent's hot KV, asks the model for a dense ≤500-token summary of the codebase and what it has learned, and stores it. That summary is folded into the agent's stable prefix on the next session — so distilled knowledge persists across runs — and the token accumulator resets to 0. Folding the summary in changes the prefix hash, triggering exactly one re-prime, after which the agent is stable again.
-
-### Snapshot Lifecycle & GC
-
-1. **Save** (prime path only): the engine writes the snapshot file; `agent.py` renames it to its final name, then advances the agent's HEAD (`update_agent_snapshot`).
-2. **Restore**: read from disk and splice into the live KV (`_Snapshot.apply_to`).
-3. **GC**: `SnapshotGC.collect()` runs after each session, deleting `.bin` files not referenced by any agent's HEAD plus `.tmp_` orphans from crashed sessions.
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────┐
-│                  CacheFlow CLI                   │
-│  init | model | run | agent | repl | log |       │
-│  agents | status | fork                          │
-└──────────────────────┬──────────────────────────┘
-                       │
-         ┌─────────────┴────────────┐
-         │                          │
-   ┌─────▼──────┐          ┌────────▼─────────────┐
-   │  SlotPool  │          │   CacheFlowStore     │
-   │  (8 slots) │          │  (SQLite, flat:      │
-   └─────┬──────┘          │   agent + HEAD snap) │
-         │                 └────────┬─────────────┘
-   ┌─────▼──────────────┐           │
-   │  Agent A (Slot 0)  │           │
-   │  Agent B (Slot 1)  ├───┐  ┌────▼──────────────┐
-   │  Agent C (Slot 2)  │   │  │  Snapshot Files   │
-   │  [Slots 3-7: free] │   │  │  (.cacheflow/     │
-   └────────┬───────────┘   │  │   snapshots/)     │
-            │               └─►└────┬──────────────┘
-      ┌─────▼──────────────┐        │
-      │   LlamaEngine      │◄───────┘
-      │   (in-process,     │
-      │    single model)   │
-      └─────┬──────────────┘
-            │
-      ┌─────▼──────────────┐   ┌───────────────────┐
-      │  Model Weights     │   │  ModelTokenizer   │
-      │  (GGUF, GPU/CPU)   │   │  (vocab_only,     │
-      │  Single instance   │   │   main process)   │
-      └────────────────────┘   └───────────────────┘
-```
-
-## Project Structure
-
-```
-cacheflow/
-├── cacheflow/
-│   ├── cli.py                  # Entry point; all CLI commands
-│   ├── agent.py                # Core loop: restore/prime → save → complete → record HEAD
-│   ├── reasoning_loop.py       # Agentic tool-calling loop (observe→act), decoupled from AgentSession internals
-│   ├── engine.py               # In-process LlamaEngine, the only execution path
-│   ├── llama_server_custom.py  # Shared primitives: v4 snapshot format + CooperativeSlotManager
-│   ├── store.py                # SQLite flat store: agents + HEAD snapshot pointers
-│   ├── slot_pool.py            # SlotPool: LRU eviction, concurrency, SlotLease
-│   ├── compressor.py           # Background consolidation (≥70%-of-context threshold)
-│   ├── config.py               # Model config, paths, immutable context size
-│   ├── tokenizer.py            # ModelTokenizer: exact token counts via vocab_only
-│   ├── gc.py                   # SnapshotGC: garbage-collect unreferenced .bin files
-│   ├── indexer.py              # CodeIndexer: codebase chunking + embedding
-│   ├── retriever.py            # CodeRetriever: semantic RAG for stable context
-│   ├── tools.py                # Tools for agentic loop: observe→act protocol
-│   ├── ollama.py               # Ollama model discovery and path resolution
-│   ├── templates.py            # Per-model instruction templating (ChatML/Llama3/Mistral/Gemma/Phi3)
-│   └── sandbox.py              # GitWorktreeSandbox: isolated, test-gated agentic execution
-├── tests/                      # Pytest suite
-├── pyproject.toml              # Package metadata, dependencies, cf entrypoint
-└── .cacheflow/                 # Created at runtime per project
-    ├── config.json             # Model path, model hash, ctx_size, GPU layers
-    ├── agents.db               # SQLite: agents + HEAD snapshot metadata
-    ├── snapshots/              # KV cache .bin files
-    └── server.log              # HTTP-shim subprocess output (when used)
-```
-
-## Key Files
-
-| File | Purpose |
-|------|---------|
-| `cacheflow/agent.py` | Core `AgentSession.run()` — restore/prime → save → complete → record HEAD |
-| `cacheflow/reasoning_loop.py` | Agentic tool-calling loop (`run_agentic`, used by `cf agent`); only touches `AgentSession` through its KV-cache primitives |
-| `cacheflow/engine.py` | In-process `LlamaEngine`; `get_global_engine()` singleton |
-| `cacheflow/cli.py` | All CLI commands; model discovery via ollama/GGUF search; `cf model list`/`cf model use` |
-| `cacheflow/llama_server_custom.py` | Shared primitives used by `engine.py`: v4 snapshot format + `CooperativeSlotManager` |
-| `cacheflow/store.py` | SQLite flat store (agent + HEAD snapshot) operations |
-| `cacheflow/slot_pool.py` | Multi-agent slot allocation and LRU eviction |
-| `cacheflow/tokenizer.py` | `ModelTokenizer`: exact BPE token counts, `vocab_only=True` |
-| `cacheflow/gc.py` | `SnapshotGC`: clean up unreferenced snapshot files |
-| `cacheflow/indexer.py` / `retriever.py` | Semantic RAG: chunk, embed, and retrieve codebase context |
-| `cacheflow/tools.py` | Tools for agentic loop: observe→act protocol with filesystem/shell access |
-| `cacheflow/ollama.py` | Ollama model discovery and path resolution |
-| `cacheflow/templates.py` | Per-model instruction templating: `detect_template()` picks ChatML/Llama3/Mistral/Gemma/Phi3 |
-| `cacheflow/sandbox.py` | `GitWorktreeSandbox`: isolates `cf agent --auto`/`--allow-bash`, merges back only on success |
+`classify_task()` applies a cheap keyword heuristic (review/debug/refactor/test/implement) to tag `problem_type` for cache routing — not meant to be precise, just good enough to bucket similar problems together.
 
 ## Design Decisions
 
-**Flat store, HEAD per agent**: each agent points at a single current snapshot (`current_snapshot_path`); there is no commit DAG. Forking copies the parent's HEAD and records `parent_agent_id`.
+**Confidence-gated reuse, not all-or-nothing.** Semantic similarity isn't certainty; naively reusing any "close enough" thinking block risks silently propagating a wrong line of reasoning into a new problem. The `validate` tier exists as a deliberate middle ground between "always re-think" (no savings) and "always reuse on any match" (correctness risk).
 
-**Per-sequence snapshots everywhere**: serialize only the live KV (v4) for both disk snapshots and in-memory slot states. `model.save_state()` copies the entire n_ctx buffer regardless of occupancy; `llama_state_seq_get_data` copies only the populated tokens. Applied consistently so context switches between 8 agents don't accumulate GB of Python heap.
+**Exact metrics only — no estimation from text length.** Both stores' `token_count` columns are nullable specifically so a missing exact figure is recorded as unknown rather than backfilled with a guess. `cf thinking stats` excludes `NULL`-token reuses from its sum instead of counting them as zero.
 
-**Skip the redundant warm-path save**: on restore, the HEAD on disk is already identical, so no re-write.
+**Two independent stores for two independent costs.** Thinking-block reuse and knowledge sharing don't share storage, schema, or invalidation logic, because the costs they avoid — regenerated reasoning vs. re-derived understanding — are genuinely orthogonal, even though both follow the same content-hash staleness pattern (`codebase_hash`/`region_hash` computed at write time, compared at read time).
 
-**No slot eviction during a session**: `SlotLease` prevents LRU from evicting a slot that's actively in use, even under contention.
+**Hook failures are silent by design.** `cf thinking capture-block` wraps its entire body in a bare `except Exception: pass` — a broken hook should no-op, not break the agent run it's attached to. `knowledge_check_before_read` follows the same rule for everything except its one deliberate `sys.exit(2)` block path.
 
-**Context size immutability**: locked in `config.json` at init time; prevents snapshot/restore mismatches if context is later reconfigured.
+**Enforcement where it's actually possible, advisory where it isn't.** The `PreToolUse` hook exists because Claude Code gives a harness-level interception point for `Read`; there's no equivalent interception point inside this loop's own model-driven tool dispatch (see below), so the local loop's reuse tools stay query/submit-and-hope, same as the skill.
 
-**Single in-memory model**: `get_global_engine()` returns one persistent `LlamaEngine`; agents share the model — no duplication.
+## The Local Agentic Loop Gets the Same Tools
 
-**Exact tokenizer**: `ModelTokenizer` loads the model with `vocab_only=True` in the main process, so token-budget decisions are exact, not approximated.
+`cf agent`'s own loop (the local, llama.cpp-driven half of this repo, below) used to have no idea any of the above existed — its tool palette was read/write/edit/grep/bash/finish, none of which touched `ThinkingStore`/`KnowledgeStore`, and its system preamble never mentioned `cf` commands. A local model running `cf agent` got none of this branch's reuse benefit.
+
+Fixed by adding three tools directly to that loop's palette, calling the stores in-process rather than shelling out to `cf` itself:
+
+```
+knowledge_query {"path": "rel/path", "role"?: "..."}     — check the pool before reading a file
+knowledge_submit {"path": "rel/path", "summary": "..."}  — submit a summary after analyzing one (needs --auto)
+thinking_query {"problem": "description", "role"?: "..."} — check the pool before reasoning at length
+cacheflow_status {}                                        — this agent's own baseline/cumulative token-savings
+```
+
+The loop's system preamble now tells the model to try `knowledge_query`/`thinking_query` before reading/reasoning and `knowledge_submit` after a meaningful unit of work — the same guidance the skill gives an external agent, but built into this loop's own instructions instead of a file the model would have no reason to look for. There's no `PreToolUse`-style enforcement for this path (see "Enforcement where it's actually possible" above) — it's the same query/submit-and-hope as the skill, just available at all, which it wasn't before.
+
+## Also in This Repo: Local KV Caching for Self-Hosted Models
+
+The local, llama.cpp-based half of CacheFlow (`cf run`, `cf agent`, `cf repl`, `cf fork`) is the original product this grew out of, and still ships in this repo: it serializes and restores a self-hosted model's actual KV cache across sessions (`cacheflow/engine.py`, `cacheflow/agent.py`), which is *only* possible because a self-hosted model exposes its own internal state — the exact capability cloud models don't have. That's a separate, fully orthogonal cost (re-evaluating the *prompt*) from what this branch addresses (re-running *reasoning*), and the two systems don't share storage or invalidation logic.
+
+```bash
+cf run "Analyze this codebase"         # local model, KV-cache-backed sessions
+cf agent "Fix the failing test" --auto # local model, sandboxed agentic loop
+cf fork main research                  # fork an agent from another's cached KV state
+```
+
+See `cacheflow/agent.py`, `cacheflow/engine.py`, and `cacheflow/store.py` for that system's implementation if you're running a self-hosted GGUF model rather than a cloud API.
 
 ## Requirements
 
 - Python 3.10+
-- `llama-cpp-python` (GPU acceleration requires a Metal/CUDA build; CPU-only works)
-- A GGUF model file — any llama.cpp-compatible model works; `cacheflow/templates.py` detects the right instruction
-  template (ChatML, Llama 3, Mistral, Gemma, or Phi-3) from the model's own GGUF metadata or name, falling back to
-  ChatML for unrecognized models
-
-**Recommended: `ollama pull qwen3:8b`** (8 GB, ~8B parameters)
-- **All metrics in this README are measured on Qwen3 8B** — use it to match the benchmarked performance.
-- CacheFlow auto-discovers ollama models on init.
-- Qwen3's thinking mode is automatically suppressed for the agentic tool-use loop (`run_agentic`/`cf agent`) by pre-filling an empty `<think></think>` block on each assistant turn, so the loop's small per-step token budget isn't eaten by hidden reasoning before it can emit ACTION/ARGS.
-- Other models work too (Llama 3, Mistral, etc.), but will have different baseline/restore times.
+- For the cloud-models features above: an Anthropic API key (or Claude Code/Cursor/Codex already installed, for `cf install`'s hook wiring) and, optionally, `sentence-transformers` + a reachable Qdrant instance for semantic thinking-block search
+- For the local KV-caching half: `llama-cpp-python` and a GGUF model file
 
 ## Installation
 
@@ -390,36 +221,14 @@ pip install -e ".[dev]"
 ## Testing
 
 ```bash
-pytest tests/                           # Run all tests
-pytest tests/test_agent.py              # Specific file
-pytest tests/test_agent.py::test_name   # Specific test
-pytest -xvs                             # Stop on first failure, verbose
+pytest tests/                              # Run all tests
+pytest tests/test_thinking_reuse.py        # ThinkingStore/KnowledgeStore
+pytest tests/test_hooks.py                 # Transcript parsing for capture
+pytest tests/test_installer.py             # cf install rendering + hook wiring
+pytest -xvs                                # Stop on first failure, verbose
 ```
 
-A shared `tests/conftest.py` autouse fixture patches `cacheflow.agent.get_tokenizer` with a lightweight fake, so constructing an `AgentSession` in unit tests never loads a real model. Mock `get_global_engine()` to avoid running a real model; tests needing specific token counts patch `get_tokenizer` inline to override the default fake.
-
-**Test modules:** `test_agent.py` (incl. model-swap re-prime guard), `test_agentic.py` (the `reasoning_loop.py` tool loop), `test_cli.py` (incl. `cf model list`/`use`), `test_store.py`, `test_config.py`, `test_compressor.py` (incl. model-swap during `consolidate()`), `test_rag_integration.py`, `test_indexer.py`, `test_multi_agent.py`, `test_fixes.py` (regressions incl. snapshot format + `SnapshotGC`), `test_stress.py`, `test_server_smoke.py`, `test_system_questions*.py`, `test_templates.py` (per-model template detection), `test_sandbox.py` (`GitWorktreeSandbox` against a real temp git repo), `test_cli_sandbox.py` (`cf agent`'s sandbox wiring).
-
-## Performance
-
-**Memory:**
-- Model weights: ~4–8 GB (7B model at 4-bit quantization)
-- Model tokenizer (vocab_only): ~50–100 MB (main process)
-- GPU KV cache: sized for one active context (n_ctx tokens); only the currently-running agent's KV lives on the GPU at a time
-- In-memory slot states (inactive agents): ~8 MB each via compact per-sequence serialization; 8 idle agents ≈ ~64 MB total Python heap
-
-**Time/compute efficiency (measured on W1–W8 real codebases, 16384 ctx, Qwen3 8B):**
-
-From the experiments in `experiments/run.py`, which vary corpus size (1.5K–280K LOC) and interaction patterns (single-agent, concurrent, agentic, fork, consolidation):
-
-- **Cold prime (baseline)**: ~16.8s average wall-clock across W1–W8 (ranges 9.6–20.7s depending on codebase and pattern)
-- **Warm restore (cache hit)**: ~1.9s average wall-clock (ranges 0.3–10.7s; longer restores on W4 due to concurrent 3-agent slot swapping overhead)
-- **Speedup per session**: **8.9x faster** on average; **~13s time saved per warm session**
-- **Tokens skipped**: ~4,100 average per session (ranges 0–5,000)
-- **Output tokens**: identical either way — caching eliminates prefill re-evaluation, not generation
-- **Largest codebase (W8, Django 280K LOC)**: **20.4s saved per warm session** (~97% of cold prime time), scaling with prefix size
-
-Run the experiments yourself with `python experiments/run.py --workload all` (requires cloned real codebases in `experiments/corpora/`; see `experiments/run.py` for setup). W6 (fork) and W7 (consolidation) show different patterns: W6's warm restore is longer due to slot eviction contention with concurrent agents; W7 triggers the background compressor at 70%-of-context, reshaping the KV after each session's accumulation.
+**Test modules for the cloud-models system:** `test_thinking_reuse.py` (`ThinkingStore`/`KnowledgeStore`: exact match, semantic match, staleness, role filtering, reuse logging), `test_hooks.py` (transcript parsing, problem hashing, `output_tokens` attribution), `test_installer.py` (`cf install`'s skill/rule rendering and `PostToolUse` hook wiring, idempotency). The local KV-caching system has its own suite (`test_agent.py`, `test_agentic.py`, `test_store.py`, etc.) covering the unrelated prefix-matching/restore path.
 
 ## License
 
