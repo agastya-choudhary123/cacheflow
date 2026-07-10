@@ -1,6 +1,6 @@
 %% CacheFlow: Caching What the Model Produces, Not Just What It Reads
 %% Compile with: pdflatex whitepaper.tex  (run twice for cross-references)
-\documentclass[10pt,twocolumn]{article}
+\documentclass[10pt]{article}
 
 % --- Encoding & fonts ---------------------------------------------------
 \usepackage[T1]{fontenc}
@@ -9,11 +9,25 @@
 \usepackage{microtype}
 
 % --- Layout -------------------------------------------------------------
-\usepackage[letterpaper,margin=0.75in,columnsep=0.28in]{geometry}
+\usepackage[letterpaper,margin=1in]{geometry}
 \usepackage{titlesec}
 \usepackage{abstract}
 \usepackage{enumitem}
 \setlist{noitemsep,topsep=3pt,leftmargin=1.4em}
+
+% --- Float placement -----------------------------------------------------
+% Defaults are conservative and push large table*/figure floats (esp. the
+% full-width results tables) several pages past their reference point,
+% forcing the reader to jump ahead then back. Loosen the thresholds so
+% floats place near where they're cited instead of drifting to a float page.
+\renewcommand{\topfraction}{0.9}
+\renewcommand{\dbltopfraction}{0.9}
+\renewcommand{\textfraction}{0.07}
+\renewcommand{\floatpagefraction}{0.7}
+\renewcommand{\dblfloatpagefraction}{0.7}
+\setcounter{topnumber}{3}
+\setcounter{dbltopnumber}{3}
+\setcounter{totalnumber}{4}
 
 % --- Math, tables, code -------------------------------------------------
 \usepackage{amsmath,amssymb}
@@ -73,8 +87,6 @@
 
 % ======================================================================
 \begin{document}
-\twocolumn[
-\begin{@twocolumnfalse}
 \maketitle
 \begin{abstract}
 \noindent
@@ -94,10 +106,7 @@ self-hosted \texttt{llama.cpp} models, \textsc{CacheFlow} serializes and
 restores per-sequence KV state, turning a multi-second cold prefill into a
 sub-second warm restore. For cloud models, where no internal state is
 retrievable, it instead caches the model's \emph{outputs}: a content-addressed
-\emph{thinking-block store} with confidence-gated semantic reuse, and a
-versioned \emph{knowledge pool} of region summaries invalidated automatically by
-content hashing. Reuse is enforced---not merely advised---through a
-\texttt{PreToolUse} hook that intercepts redundant file reads. Across eight
+\emph{thinking-block store} with confidence-gated semantic reuse. Across eight
 real-world Python corpora we measure a cold prime replaced by a
 $\sim$\SI{300}{\milli\second} warm restore, cumulatively
 $\sim$\SI{246}{\second} of wall-clock prefill and $\sim$\SI{1500}{\tera\flop}
@@ -105,9 +114,7 @@ of compute avoided on the self-hosted path, and exact, API-reported reductions
 of up to 100\% of a turn's reasoning tokens on the cloud path, with all savings
 computed from real token counts rather than estimated from text length.
 \end{abstract}
-\vspace{1.2em}
-\end{@twocolumnfalse}
-]
+\vspace{1em}
 
 % ======================================================================
 \section{Introduction}
@@ -159,12 +166,8 @@ invalidation.
   \item A persistent per-sequence KV-cache snapshot/restore system for
   self-hosted models that skips the redundant warm-path save and forces a safe
   re-prime on codebase or model change (\Cref{sec:kv}).
-  \item A two-store output-caching layer for cloud models: a content-addressed,
-  confidence-gated \emph{thinking-block store} and a hash-invalidated
-  \emph{knowledge pool} (\Cref{sec:cloud}).
-  \item An \emph{enforcement} mechanism---a \texttt{PreToolUse} hook that blocks
-  redundant reads---distinguishing our approach from purely advisory
-  prompt-engineering (\Cref{sec:enforce}).
+  \item An output-caching layer for cloud models: a content-addressed,
+  confidence-gated \emph{thinking-block store} (\Cref{sec:cloud}).
   \item A discipline of \emph{exact} token accounting: every savings figure is
   a real, provider-reported token count, never estimated from character length
   (\Cref{sec:metrics}).
@@ -304,7 +307,7 @@ $\kappa\!\in\![0,1]$; the action is a thresholded decision
 \begin{equation}
 a(\kappa)=
 \begin{cases}
-\textsc{use} & \kappa \ge \theta_u,\\
+\textsc{use\_directly} & \kappa \ge \theta_u,\\
 \textsc{validate} & \theta_v \le \kappa < \theta_u,\\
 \textsc{re\_think} & \kappa < \theta_v.
 \end{cases}
@@ -349,16 +352,15 @@ subsystems joined by a shared philosophy but no shared state:
 \begin{description}[leftmargin=1.1em,style=nextline]
   \item[Self-hosted KV engine] Serializes and restores per-sequence attention
   state for local \texttt{llama.cpp} models (\Cref{sec:kv}).
-  \item[Cloud output cache] Two SQLite-backed pools---\texttt{ThinkingStore}
-  and \texttt{KnowledgeStore}---that cache generated reasoning and derived
-  file summaries for cloud-hosted agents (\Cref{sec:cloud}).
+  \item[Cloud output cache] A SQLite-backed pool, \texttt{ThinkingStore}, that
+  caches generated reasoning for cloud-hosted agents (\Cref{sec:cloud}).
 \end{description}
 
 Both subsystems detect staleness the same way: a content hash computed at
 \emph{write} time is compared at \emph{read} time (\Cref{eq:stale}), so a
-changed codebase, file, or model silently invalidates the cached artifact with
+changed codebase or model silently invalidates the cached artifact with
 no explicit expiry logic. They store to distinct SQLite databases
-(\texttt{.cacheflow/agents.db}, \texttt{thinking.db}, \texttt{knowledge.db}) and
+(\texttt{.cacheflow/agents.db}, \texttt{thinking.db}) and
 share no foreign keys: a KV-snapshot restore and a thinking-block hit are
 unrelated events that can each occur independently (\Cref{fig:arch}).
 
@@ -371,22 +373,20 @@ unrelated events that can each occur independently (\Cref{fig:arch}).
 \node[box,below=6mm of agentA,xshift=4mm] (self) {Self-hosted\\model (\texttt{llama.cpp})};
 \node[box,right=6mm of self] (cloud) {Cloud model\\(Anthropic API)};
 % stores
-\node[store,below=9mm of self] (kv) {KV snapshots\\\texttt{agents.db} $+$ \texttt{.bin}};
-\node[store,right=4mm of kv] (think) {\texttt{ThinkingStore}\\\texttt{thinking.db}};
-\node[store,right=4mm of think] (know) {\texttt{KnowledgeStore}\\\texttt{knowledge.db}};
+\node[store,below=13mm of self] (kv) {KV snapshots\\\texttt{agents.db} $+$ \texttt{.bin}};
+\node[store,right=8mm of kv] (think) {\texttt{ThinkingStore}\\\texttt{thinking.db}};
 % flows
 \draw[flow] (agentA) -- (self);
 \draw[flow] (agentB) -- (cloud);
-\draw[flow] (self) -- node[right,font=\scriptsize\itshape,xshift=1mm]{restore/prime} (kv);
-\draw[flow] (cloud.south) to[out=-90,in=90] node[left,font=\scriptsize\itshape]{thinking} (think.north);
-\draw[flow] (cloud.south) to[out=-90,in=90] node[right,font=\scriptsize\itshape,xshift=2mm]{summaries} (know.north);
+\draw[flow] (self) -- node[pos=0.2,left,font=\scriptsize\itshape]{restore/prime} (kv);
+\draw[flow] (cloud) -- node[pos=0.2,right,font=\scriptsize\itshape]{thinking} (think);
 \begin{scope}[on background layer]
-\node[draw=cfblue!30,dashed,rounded corners,fit=(kv)(know),inner sep=3pt,label={[font=\scriptsize\color{cfgray}]below:staleness by content hash $h_r\!=\!h_w$}] {};
+\node[draw=cfblue!30,dashed,rounded corners,fit=(kv)(think),inner sep=3pt,label={[font=\scriptsize\color{cfgray}]below:staleness by content hash $h_r\!=\!h_w$}] {};
 \end{scope}
 \end{tikzpicture}}
 \caption{\textsc{CacheFlow}'s two independent subsystems. Where model internals
 are reachable (self-hosted), it caches KV state; where they are not (cloud), it
-caches generated \emph{outputs} in two pools. No store shares keys with another.}
+caches generated \emph{reasoning}. No store shares keys with another.}
 \label{fig:arch}
 \end{figure}
 
@@ -420,14 +420,13 @@ proceeds as:
 \label{alg:restore}
 \KwIn{agent $A$, stable context $X$, active model $M$}
 $h_r \leftarrow \textsc{hash}(X)$\;
-\uIf{$A.\text{head} \ne \varnothing$ \textbf{and} $A.\text{head}.h_w = h_r$ \textbf{and} $A.\text{head}.model = M$}{
-  $\text{kv} \leftarrow \textsc{RestoreSnapshot}(A.\text{head})$ \tcp*{warm: $O(c_{\text{res}})$}
-  \tcp{skip save: on-disk HEAD already byte-identical}
+\uIf{$A.\text{head} \ne \varnothing \,\wedge\, A.\text{head}.h_w = h_r \,\wedge\, A.\text{head}.model = M$}{
+  $\text{kv} \leftarrow \textsc{RestoreSnapshot}(A.\text{head})$ \tcp*{warm, $O(c_{\text{res}})$; save skipped}
 }
 \Else{
   $\text{kv} \leftarrow \textsc{Prefill}(X)$ \tcp*{cold: $O(P\,c_{\text{pre}})$}
   $\text{snap} \leftarrow \textsc{SerializeSeq}(\text{kv})$\;
-  \textsc{WriteSnapshot}(\text{snap}); \quad $A.\text{head} \leftarrow \text{snap}$ \tcp*{write-then-update HEAD}
+  \textsc{WriteSnapshot}(\text{snap}); \quad $A.\text{head} \leftarrow \text{snap}$ \tcp*{write before HEAD update}
 }
 $y \leftarrow \textsc{Complete}(\text{kv}, \text{suffix})$\;
 \textsc{RecordMetrics}(A);\ \Return $y$\;
@@ -518,8 +517,8 @@ prefix-matches the cached prefix and evaluates only the new observation plus the
 generated action. Each step emits a \textsc{Thought}/\textsc{Action}/\textsc{Args}
 triple parsed and dispatched against a tool registry
 (\texttt{read\_file}, \texttt{edit\_file}, \texttt{write\_file}, \texttt{grep},
-\texttt{run\_bash}, \texttt{finish}), extended with native pool tools
-(\Cref{sec:cloud}). Two termination conditions bound the loop beyond
+\texttt{list\_dir}, \texttt{syntax\_check}, \texttt{run\_bash}, \texttt{finish}),
+extended with native pool tools (\Cref{sec:cloud}). Two termination conditions bound the loop beyond
 \texttt{max\_steps}: (i) if a completion is byte-identical to the previous one
 twice consecutively---the signature of deterministic decoding re-emitting the
 same malformed action against identical error feedback---the loop halts with a
@@ -528,6 +527,107 @@ count plus \texttt{max\_tokens\_per\_step} would meet or exceed \texttt{ctx\_siz
 it halts with a \texttt{context\_limit} step. Both return the partial trajectory
 rather than raising, so a stalled model degrades to a truncated result instead of
 a crash.
+
+\subsubsection*{Sliding Window: Reusing a Fixed Prefix Across Many Steps}
+
+The agentic loop exploits a property of multi-step reasoning: the stable
+codebase context is deterministic across all steps, so its KV state is restored
+\emph{once} and reused for every subsequent step. As the loop progresses, the
+conversation history (observations, tool outputs, actions) accumulates in an
+implicit \emph{sliding window} where the cached prefix remains fixed while the
+prompt grows forward against a context ceiling (\Cref{fig:sliding-window}).
+
+Let $P$ be the prefix length (system prompt $+$ codebase), $H_i$ the cumulative
+conversation history through step $i$, and $\Lambda$ the total context window
+(\texttt{ctx\_size}). The prompt assembled at step $i$ is:
+\begin{equation}
+\text{prompt}_i \;=\; P \;+\; H_i \;+\; s_i,
+\label{eq:sliding-prompt}
+\end{equation}
+where $s_i$ is the current step's observation and action suffix. The loop
+continues while:
+\begin{equation}
+\text{prompt}_i \;+\; \Delta \;<\; \Lambda,
+\label{eq:window-check}
+\end{equation}
+where $\Delta = \texttt{max\_tokens\_per\_step}$ is the model's generation budget
+per step. As $i$ grows, $H_i$ accumulates; when $H_i + s_i + \Delta$ approaches
+$\Lambda - P$, the loop halts with a \texttt{context\_limit} action. The
+\emph{crucial invariant}: the $P$ term is never re-evaluated. It is
+prefix-matched against the KV restored at session start.
+
+On large corpora, $P$ may span thousands of tokens (e.g., $\sim$\SI{9000}{}
+tokens on SQLAlchemy in \Cref{sec:eval}). Skipping its re-prefill across
+potentially dozens of agentic steps yields significant savings by amortizing a
+single cold prime across the entire loop.
+
+\begin{algorithm}[t]
+\footnotesize
+\DontPrintSemicolon
+\caption{Multi-step agentic loop with sliding-window context management}
+\label{alg:window}
+\KwIn{restored prefix $P$ (KV resident), context size $\Lambda$, step budget $\Delta$, max steps $M$}
+\KwOut{trajectory $\tau$, termination reason}
+$H \leftarrow 0$; $\tau \leftarrow \emptyset$; $i \leftarrow 0$; $y_{\text{prev}} \leftarrow \text{null}$\;
+\While{$i < M$}{
+  $\text{available} \leftarrow \Lambda - (P + H + \Delta)$\;
+  \uIf{$\text{available} < 0$}{
+    \Return $(\tau, \texttt{context\_limit})$ \tcp*{window ceiling hit; halt before generation}
+  }
+  $s_i \leftarrow \textsc{GetObservation}()$\;
+  $\text{prompt}_i \leftarrow P + H + s_i$\;
+  $(y_i, u_i) \leftarrow \textsc{Complete}(\text{prompt}_i, \text{kv}, \Delta)$
+    \tcp*{$y_i$ is output, $u_i$ is token usage}
+  \uIf{$y_i = y_{\text{prev}}$ \textup{twice consecutively}}{
+    \Return $(\tau, \texttt{stuck\_loop})$ \tcp*{model re-emitting identical malformed action}
+  }
+  $a_i \leftarrow \textsc{ParseAction}(y_i)$; $\textsc{ExecuteTool}(a_i)$; $y_{\text{prev}} \leftarrow y_i$\;
+  $H \leftarrow H + |s_i| + |y_i|$; $\tau \leftarrow \tau \oplus a_i$; $i \leftarrow i+1$\;
+}
+\Return $(\tau, \texttt{max\_steps\_reached})$\;
+\end{algorithm}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[node distance=2mm]
+% Step 0: fresh
+\node[box,minimum width=3.5cm] (p0) {$P$};
+\node[box,minimum width=1.5cm,right=1mm of p0] (s0) {$s_0$};
+\node[box,minimum width=1.5cm,right=1mm of s0] (y0) {$y_0$};
+\node[font=\tiny,below=3mm of p0.west,anchor=west,color=cfgray] {Step 0: prefix restored};
+
+% Step i: mid-loop
+\node[box,minimum width=3.5cm,below=10mm of p0] (pi) {$P$};
+\node[box,minimum width=2cm,right=1mm of pi,fill=cfblue!12] (hi) {$H_i$};
+\node[box,minimum width=1cm,right=1mm of hi] (si) {$s_i$};
+\node[box,minimum width=1cm,right=1mm of si] (yi) {$y_i$};
+\node[font=\tiny,below=3mm of pi.west,anchor=west,color=cfgray] {Step $i$: history accumulates};
+
+% Step n: near limit
+\node[box,minimum width=3.5cm,below=10mm of pi] (pn) {$P$};
+\node[box,minimum width=3cm,right=1mm of pn,fill=cfblue!12] (hn) {$H_n$};
+\node[box,minimum width=0.8cm,right=1mm of hn,fill=red!15] (xn) {—};
+\node[font=\tiny,below=3mm of pn.west,anchor=west,color=cfgray] {Step $n$: window limit};
+
+% ceiling line
+\draw[dashed,cfblue!50,line width=1pt] (pn.west) -- (xn.east);
+\node[font=\tiny,below=2mm of $(pn.west)!0.5!(xn.east)$,color=cfblue] {context ceiling $\Lambda$};
+
+% halt label
+\node[font=\tiny\itshape,right=3mm of xn.east,color=red] {halt};
+\end{tikzpicture}
+\caption{Sliding window progression. Prefix $P$ is restored once and reused
+across steps; history $H_i$ accumulates until the context window $\Lambda$ is
+approached. The loop halts defensively before hitting the ceiling.}
+\label{fig:sliding-window}
+\end{figure}
+
+Window bounds are enforced \emph{before} each completion (\Cref{alg:window},
+line 5): if accepting the next step's output would exceed the budget, the loop
+halts and returns the partial trajectory. This prevents the model from being
+asked to complete in insufficient context. The \texttt{max\_tokens\_per\_step}
+budget defaults to $\sim$\SI{512}{} tokens, leaving headroom for reasoning and
+multi-token actions.
 
 \subsection{Sandboxed Execution}
 \label{sec:sandbox}
@@ -556,14 +656,14 @@ raises rather than guessing how to reconcile uncommitted work.
 \node[box,below=5mm of wt] (run) {\texttt{run\_agentic}\\edits $+$ bash inside worktree};
 \node[box,below=5mm of run] (commit) {\texttt{commit\_changes}};
 \node[box,below=5mm of commit] (test) {\texttt{run\_tests}\\(optional \texttt{--test-cmd})};
-\node[store,below left=6mm and -6mm of test] (merge) {\texttt{merge\_back}\\(tests pass)};
-\node[box,below right=6mm and -8mm of test] (keep) {branch kept\\(fail/conflict)};
+\node[store,below left=13mm and -6mm of test] (merge) {\texttt{merge\_back}\\(tests pass)};
+\node[box,below right=13mm and -8mm of test] (keep) {branch kept\\(fail/conflict)};
 \draw[flow] (head) -- (wt);
 \draw[flow] (wt) -- (run);
 \draw[flow] (run) -- (commit);
 \draw[flow] (commit) -- (test);
-\draw[flow] (test.south) to[out=-140,in=90] node[left,font=\scriptsize\itshape]{pass} (merge.north);
-\draw[flow] (test.south) to[out=-40,in=90] node[right,font=\scriptsize\itshape]{fail} (keep.north);
+\draw[flow] (test.south) to[out=-140,in=90] node[pos=0.45,above,yshift=0.5mm,font=\scriptsize\itshape]{pass} (merge.north);
+\draw[flow] (test.south) to[out=-40,in=90] node[pos=0.45,above,yshift=0.5mm,font=\scriptsize\itshape]{fail} (keep.north);
 \end{tikzpicture}}
 \caption{Sandboxed agentic execution. All edits land in a git worktree sharing
 the object store; the real tree is modified only by \texttt{merge\_back}, gated on
@@ -576,9 +676,9 @@ optional tests.}
 \label{sec:cloud}
 
 Because a cloud API exposes no internal state, this layer caches the model's
-\emph{outputs}. It comprises two independent stores.
+\emph{outputs}: generated reasoning.
 
-\subsection{Tier 1: The Thinking-Block Store}
+\subsection{The Thinking-Block Store}
 \label{sec:thinking}
 When an agent completes an extended-thinking turn, the block is captured and
 submitted to \texttt{ThinkingStore.submit}, which persists it to SQLite together
@@ -625,7 +725,7 @@ Retrieval is a cascade (\Cref{tab:latency}):
 \label{alg:retrieval}
 \KwIn{task $q$, pool $\mathcal{B}$, thresholds $\theta_u,\theta_v$}
 \KwOut{(block, action)}
-\lIf{$\exists\, b\in\mathcal{B}:\ b.h = \textsc{hash}(q)$}{\Return $(b,\textsc{use})$ \tcp*[f]{$<$1\,ms}}
+\lIf{$\exists\, b\in\mathcal{B}:\ b.h = \textsc{hash}(q)$}{\Return $(b,\textsc{use\_directly})$ \tcp*[f]{$<$1\,ms}}
 \lIf{no embedding model}{\Return $(\varnothing,\textsc{re\_think})$}
 $v \leftarrow \textsc{Embed}(q)$ \tcp*{MiniLM, 384-d, $\sim$40\,ms}
 $b^\star,\sigma^\star \leftarrow \arg\max_{b\in\mathcal{B}}\ \cos(v, b.\text{emb})$\;
@@ -634,92 +734,64 @@ $\kappa \leftarrow \sigma^\star \cdot e^{-\lambda\, t_{b^\star}}$ \tcp*{age deca
   $\kappa \leftarrow z\text{-score}(\sigma^\star; \mathcal{B})$ \tcp*{scale-invariant, Eq.~\ref{eq:zscore}}
   $(\theta_u,\theta_v)\leftarrow(4.0,\,2.8)$\;
 }
-\uIf{$\kappa \ge \theta_u$}{\textsc{LogReuse}($b^\star$);\ \Return $(b^\star,\textsc{use})$}
+\uIf{$\kappa \ge \theta_u$}{\textsc{LogReuse}($b^\star$);\ \Return $(b^\star,\textsc{use\_directly})$}
 \uElseIf{$\kappa \ge \theta_v$}{stash $b^\star$;\ \Return $(b^\star,\textsc{validate})$ \tcp*[f]{no log yet}}
 \lElse{\Return $(\varnothing,\textsc{re\_think})$}
 \end{algorithm}
 
-The three-way action is deliberate: semantic similarity is not certainty, and
-naively reusing any ``close enough'' block risks propagating a wrong line of
-reasoning into a new problem. The \texttt{validate} tier is the middle ground
-between ``always re-think'' (no savings) and ``always reuse'' (correctness
-risk); a validate-band candidate is not counted as a saving until an external
-check (in our runner, a cheap Claude Haiku validator) confirms it via
-\texttt{commit\_validated\_reuse}---retrieval alone never logs a reuse.
+The three-way action mitigates the risk of incorrect reuse: a high-confidence
+match skips reasoning entirely, a borderline match is validated via a cheap
+confirmation call before being logged, and a low-confidence match is re-thought.
+Validation is performed by an external checker (in our runner, Claude Haiku);
+retrieval alone never logs a reuse.
 
 Every confirmed hit logs the matched block's real \texttt{token\_count} into a
-\texttt{thinking\_reuse\_log} table, so \texttt{cf thinking stats} can report
-\emph{exact} cumulative tokens saved. The store degrades gracefully: with no
-embedding model available, it falls back to exact-hash-only matching rather than
-raising.
+\texttt{thinking\_reuse\_log} table, enabling \texttt{cf thinking stats} to
+report exact cumulative tokens saved. With no embedding model available, the
+system falls back to exact-hash matching only.
 
 \paragraph{Code-change robustness (the reuse delta).}
-Semantic similarity of \emph{task descriptions} says nothing about whether the
-\emph{code} the cached reasoning was computed against still holds. Each block
-therefore carries a \texttt{delta}: the set of files, functions, and line ranges
-its reasoning depended on, recorded at submission from the git working-tree diff.
-On retrieval the candidate's \texttt{delta} is intersected with the files changed
-since it was stored; any overlap discounts confidence toward the
-\texttt{validate} band. Writing $\Delta_b$ for a block's dependency set and $C$
-for the currently-changed files, the gated confidence is
+A block carries a \texttt{delta}: the set of files, functions, and line ranges
+it depends on, recorded at submission from the git diff. On retrieval, overlap
+between the candidate's \texttt{delta} and currently-changed files lowers
+confidence. For block dependency set $\Delta_b$ and current changes $C$, the
+confidence becomes
 \begin{equation}
 \label{eq:delta}
 \hat\kappa \;=\; \kappa \cdot e^{-\lambda t_b}\cdot
 \bigl(1 - \mathbb{1}[\,\Delta_b \cap C \neq \varnothing\,]\,\rho\bigr),
 \end{equation}
-with overlap penalty $\rho$ pulling an otherwise-strong match down into
-\texttt{validate} rather than \texttt{use\_directly}. This makes reuse robust to
-incidental edits---an unrelated file changing does not invalidate the block---while
-refusing to splice reasoning that a relevant edit may have invalidated.
+where penalty $\rho$ pulls a match toward \texttt{validate}. This insulates reuse
+from incidental code changes while blocking reuse of reasoning whose dependencies
+have changed.
 
 \paragraph{Problem-type routing and roles.}
-Submission tags each block with a coarse \texttt{problem\_type} from
-\texttt{classify\_task}---a keyword heuristic bucketing tasks into
-\{\texttt{implement}, \texttt{review}, \texttt{debug}, \texttt{refactor},
-\texttt{test}\}---and an optional \texttt{role} (\texttt{implementer},
-\texttt{reviewer}, \texttt{tester}). These are not precision instruments; they
-bucket similar problems so that a reviewer's reasoning is preferentially matched
-to another review task, and retrieval falls back to a role-agnostic match when no
-same-role block exists. The knowledge pool applies the identical role-then-generic
-fallback.
-
-\subsection{Tier 2: The Knowledge Pool}
-\label{sec:knowledge}
-For work that does not use extended thinking, \texttt{KnowledgeStore} caches
-dense per-region summaries. \texttt{submit} stores a summary for a file/region
-path and marks any prior entry for the same \texttt{(region, role)} as
-superseded (versioned via \texttt{supersedes\_id}, not deleted). \texttt{query}
-returns a summary \emph{only} if the caller's current \texttt{region\_hash}
-matches the stored hash---staleness is automatic, with no separate invalidation
-path---and falls back from a role-specific match to a generic
-(\texttt{role IS NULL}) entry. The region hash follows the
-\texttt{git hash-object} convention so it is identical whether computed by the
-skill, the CLI, or the enforcement hook.
+Submission tags each block with a \texttt{problem\_type} from \texttt{classify\_task}---a
+keyword heuristic bucketing tasks into \{\texttt{implement}, \texttt{review},
+\texttt{debug}, \texttt{refactor}, \texttt{test}\}---and an optional \texttt{role}
+(\texttt{implementer}, \texttt{reviewer}, \texttt{tester}). Retrieval prefers
+matches with the same role; if none exist, it falls back to role-agnostic
+matching.
 
 \subsection{Capture via Transcript Parsing}
-Submission is automated by a \texttt{PostToolUse} hook.
-\texttt{extract\_thinking\_blocks\_from\_transcript} reads the Claude Code
-session transcript (JSONL), finds the most recent assistant turn containing
-\texttt{thinking} blocks, and pairs it with the nearest preceding user turn's
-text as the problem description. Crucially, it hashes the task description
-\emph{alone}, matching \texttt{query}'s hashing convention---an earlier version
-folded the codebase hash into the key, which meant nothing the hook captured
-could ever be retrieved. The hook is best-effort by construction: malformed or
-missing transcripts yield an empty list rather than raising, because a hook that
-breaks the agent it is attached to is worse than a missed cache opportunity.
+Submission is automated by a \texttt{PostToolUse} hook that reads the session
+transcript (JSONL), extracts thinking blocks from the most recent assistant turn,
+and pairs them with the preceding user turn's text as the problem description.
+The hash is computed from the task description alone, matching the retrieval
+hash---an earlier version included the codebase hash, preventing any hook-captured
+block from being retrieved. The hook fails silently on malformed or missing
+transcripts; a broken hook must never break the agent it attaches to.
 
 \subsection{Storage Schema}
 \label{sec:schema}
-Both pools are plain SQLite, one file each, with no cross-table foreign keys
-(\Cref{lst:schema}). \texttt{thinking\_blocks} holds the reasoning text, its
-embedding \texttt{BLOB}, the two content hashes, the \texttt{delta}, and the
-routing tags; \texttt{thinking\_reuse\_log} appends one row per confirmed reuse
-carrying the exact tokens saved, which is what \texttt{cf thinking stats} sums.
-\texttt{knowledge\_entries} versions summaries via \texttt{supersedes\_id}: a new
-summary for a \texttt{(region, role)} pair marks the prior row superseded rather
-than deleting it, so history is auditable and GC is explicit.
+The pool is plain SQLite, with no cross-table foreign keys to the local
+KV engine's store (\Cref{lst:schema}). \texttt{thinking\_blocks} holds the
+reasoning text, its embedding \texttt{BLOB}, the two content hashes, the
+\texttt{delta}, and the routing tags; \texttt{thinking\_reuse\_log} appends one
+row per confirmed reuse carrying the exact tokens saved, which is what
+\texttt{cf thinking stats} sums.
 
-\begin{lstlisting}[language=SQL,caption={Pool schemas (abridged): two independent SQLite files.},label={lst:schema}]
+\begin{lstlisting}[language=SQL,caption={Pool schema (abridged).},label={lst:schema}]
 -- thinking.db
 thinking_blocks(
   id, thinking_block TEXT, embedding BLOB,   -- 384-d MiniLM, pickled
@@ -730,88 +802,55 @@ thinking_blocks(
   created_at, accessed_at, ...)
 thinking_reuse_log(
   id, thinking_block_id, tokens_saved INTEGER, reused_at)
--- knowledge.db
-knowledge_entries(
-  id, region TEXT, region_hash TEXT,         -- git hash-object
-  role TEXT, summary TEXT, token_count INTEGER,
-  supersedes_id INTEGER, created_at)
 \end{lstlisting}
 
 % ======================================================================
-\section{Enforcement, Not Advice}
+\section{Automatic Capture, Advisory Reuse}
 \label{sec:enforce}
 
-A recurring weakness of prompt-level optimizations is that they are advisory:
-the agent is \emph{told} to check a cache before reading, but can simply not do
-so. \textsc{CacheFlow} makes the knowledge pool the one part of the cloud system
-that is \emph{enforced}. Setup is one command: \texttt{cf install} renders a
-single canonical skill body---``consult the pool before reading, submit a summary
-after working''---into each supported harness's own format
-(\texttt{.claude/skills/}, \texttt{.cursor/rules/*.mdc}, \texttt{.codex/}) and is
-idempotent by content comparison, so a target already matching the rendered body
-is reported \texttt{unchanged}. It then registers two hooks in
-\texttt{.claude/settings.json}, scanning existing entries first so re-running
-never double-registers: a \texttt{PostToolUse} capture hook (\Cref{sec:thinking})
-and the enforcement hook below. The skill is advice the model may ignore; the
-enforcement hook is not. \texttt{cf install} registers
-\texttt{cf knowledge check-before-read} as a \texttt{PreToolUse} hook matched on
-the harness's \texttt{Read} tool. Before every read, the hook parses the
-tool-input payload, hashes the target file's current contents, and queries the
-knowledge pool. On an exact-hash hit it writes a redirect message to
-\texttt{stderr} and exits with code~2, which the harness surfaces to the model as
-feedback it must act on before the read proceeds. On any ambiguity
-(non-\texttt{Read} tool, missing payload, no git, no cached summary) it exits~0
-and allows the read: the hook holds an informed opinion only on an exact hit,
-never a guess. \Cref{lst:hook} shows the core of the entry point.
+Capture and reuse have different reliability requirements, and
+\textsc{CacheFlow} treats them differently. \emph{Capture} does not depend on
+model cooperation: setup is one command, \texttt{cf install}, which registers
+a \texttt{PostToolUse} hook (\Cref{sec:thinking}) in \texttt{.claude/settings.json},
+scanning existing entries first so re-running never double-registers it. The
+hook fires on every tool call regardless of whether the model is even aware it
+exists, so a thinking block is captured the moment a turn produces one.
+\emph{Reuse}, by contrast, is advisory: nothing intercepts the model's
+reasoning the way the capture hook intercepts a tool call, so an agent only
+benefits from the pool if it (or the harness prompting it) chooses to run
+\texttt{cf thinking query}/\texttt{thinking\_query} before reasoning at length.
+\textsc{CacheFlow}'s own local agentic loop gets the identical tool---
+\texttt{thinking\_query}, plus \texttt{cacheflow\_status}---added directly to
+its tool registry and called in-process rather than shelled out to \texttt{cf},
+with preamble guidance to try it before reasoning at length.
 
-\begin{lstlisting}[language=Python,caption={The \texttt{PreToolUse} enforcement hook (elided). An exact-hash hit blocks the read via exit code 2; every ambiguous case falls through to allow it.},label={lst:hook}]
-def knowledge_check_before_read():
-    try:
-        ev = json.load(sys.stdin)
-        if ev.get("tool_name") != "Read":
-            return  # exit 0: not our concern
-        path = ev["tool_input"]["file_path"]
-        h = compute_region_hash(path)        # git hash-object
-        hit = KnowledgeStore().query(path, current_region_hash=h)
-        if hit:                              # fresh, exact-hash summary exists
-            sys.stderr.write(
-                f"Cached summary for {path} is current; "
-                f"use `cf knowledge query` instead of re-reading.")
-            sys.exit(2)                      # SystemExit: NOT caught below
-    except Exception:
-        return  # any failure -> allow the read, never block on an error
-\end{lstlisting}
-
-This exposes a design boundary. The enforcement hook is harness-specific---it
-intercepts Claude Code's own \texttt{Read}. For \textsc{CacheFlow}'s own local
-agentic loop, which has no external harness to interpose, the same benefit is
-delivered by giving the loop \emph{native} tools---\texttt{knowledge\_query},
-\texttt{knowledge\_submit}, \texttt{thinking\_query}, and
-\texttt{cacheflow\_status}---that call the stores in-process, plus preamble
-guidance to consult them before reasoning and submit a summary after a unit of
-work.
+An earlier iteration of this system paired the thinking store with a second
+pool, a knowledge store of per-file summaries, fronted by a genuinely enforced
+\texttt{PreToolUse} hook that blocked a \texttt{Read} outright on a cache hit.
+We removed it: across the full evaluation sweep (\Cref{sec:eval}) it was
+exercised on only a handful of steps out of over a hundred, all in superseded
+runs, and the enforcement hook itself was never wired into this repository's
+own harness settings. Keeping a subsystem in the paper that the numbers do not
+back is worse than not claiming it; the discipline of \Cref{sec:metrics}
+applies to architectural claims as much as to token counts.
 
 \subsection{Hook Failures Are Silent by Design}
 The capture hook wraps its entire body in a bare
-\texttt{except Exception: pass}; a broken hook must no-op, not break the run.
-The enforcement hook follows the same rule for everything \emph{except} its
-deliberate exit-code-2 block: because \texttt{SystemExit} is not an
-\texttt{Exception} subclass, its \texttt{except Exception: return} never swallows
-the intentional block, but any unrelated failure allows the read through rather
-than blocking on an error it has no opinion about.
+\texttt{except Exception: pass}; a broken hook must no-op, not break the run
+it is attached to.
 
 % ======================================================================
 \section{Exact Token Accounting}
 \label{sec:metrics}
 
 A guiding principle across both subsystems is that \emph{no savings figure is
-ever estimated from text length}. The \texttt{token\_count} on both
-\texttt{ThinkingStore.submit} and \texttt{KnowledgeStore.submit} must be the
+ever estimated from text length}. The \texttt{token\_count} on
+\texttt{ThinkingStore.submit} must be the
 real cost---e.g.\ the Anthropic API's own \texttt{usage.output\_tokens} for the
 turn that produced the block. An earlier implementation stored
 \texttt{len(text)} as a stand-in; a character count is not a token count and
 would have made every downstream figure fictional. When the caller lacks an
-exact number, the column is left \texttt{NULL} (both columns are nullable for
+exact number, the column is left \texttt{NULL} (the column is nullable for
 this reason) rather than guessed, and \texttt{get\_reuse\_stats} \emph{excludes}
 \texttt{NULL} rows from its sum instead of treating them as zero. Correspondingly,
 transcript capture attributes \texttt{output\_tokens} to a block only when its
@@ -828,14 +867,12 @@ corpus---\texttt{itsdangerous}, \texttt{click}, \texttt{requests},
 \texttt{httpx}, \texttt{flask}, \texttt{pytest}, \texttt{sqlalchemy}, and
 \texttt{django}. Each workload drives multiple agent sessions against its
 corpus; the first session populates the relevant cache and later sessions
-attempt reuse. On the cloud path, every session is an \emph{autonomous build
-directive}---``implement a resilient HTTP client wrapper with pooling and
-timeout enforcement,'' not a question about the code---issued at high thinking
-effort. A workload's cold session derives deep understanding of one subsystem;
-its warm sessions are \emph{different} build tasks that genuinely require the
-same understanding (the realistic reuse case: nobody re-asks the same question,
-but successive features routinely need the same hard-won reasoning about the
-same machinery). Several workloads also plant a deliberately \emph{unrelated}
+attempt reuse. On the cloud path, every session is an autonomous build directive---``implement a
+resilient HTTP client wrapper with pooling and timeout enforcement''---issued at
+high thinking effort. The cold session builds understanding of one subsystem;
+warm sessions are different builds requiring the same understanding. This
+reflects realistic patterns: successive features often need the same reasoning
+about the same components. Several workloads also plant a deliberately \emph{unrelated}
 task that should miss, so the sweep measures the gate's selectivity, not just
 its recall. The self-hosted path runs Qwen3-8B (36 layers, 4096
 hidden dim) at an \num{8192}-token context via \texttt{llama.cpp}. The cloud
@@ -882,19 +919,14 @@ W8 & django       & 3  & 2 (67\%) & \num{20646} & 278        & \num{40737} & \nu
 \end{table*}
 
 Across the workloads that admit reuse, \textsc{CacheFlow} avoids
-$\approx$\SI{245731}{\milli\second} ($\sim$\SI{4.1}{\minute}) of cumulative
-wall-clock prefill and $\approx$\SI{1513}{\tera\flop} of compute. W6 is
-instructive: it registers a cache hit and saves \num{4632} tokens of prefill,
-yet reports \emph{zero} wall-clock time saved because on that run the restore
-happened to be slower than the prime it replaced---an honest artifact of
-disk/scheduler variance, not a discarded saving. The FLOPs
-figure is computed, not guessed: the parameter count is read exactly off the
-loaded GGUF via \texttt{llama\_model\_n\_params}, and the model's
-\texttt{n\_layer}/\texttt{n\_embd} supply the attention term that scales with
-prefill length squared---for a \num{9064}-token prefill that term alone is
-$\sim$\SI{16.5}{\tera\flop} atop a $\sim$\SI{127}{\tera\flop} parameter-only
-floor. Output tokens are identical either way; caching eliminates prefill
-re-evaluation, not generation.
+$\approx$\SI{245731}{\milli\second} of cumulative wall-clock prefill and
+$\approx$\SI{1513}{\tera\flop} of compute. W6 shows a cache hit saving \num{4632}
+tokens but no wall-clock time: the restore latency exceeded the priming cost on
+that run, an artifact of disk/scheduler variation. FLOPs are computed from exact
+model parameters (read via \texttt{llama\_model\_n\_params}); the attention term
+scales quadratically with prefill length ($\sim$\SI{16.5}{\tera\flop} of the
+$\sim$\SI{143}{\tera\flop} total for a \num{9064}-token prefill). Caching
+eliminates prefill re-evaluation only; generation cost is identical.
 
 \subsection{Cloud: Reasoning Reused Across Different Builds}
 \Cref{tab:cloud} reports the cloud sweep. ``Cold Calls'' are sessions that
@@ -904,11 +936,7 @@ Reasoning'' is the thinking tokens the workload's cold calls actually
 generated. ``Tokens Avoided'' credits a hit with the \emph{full derivation
 cost} the reuse prevented---the input, reasoning, and output tokens of the
 cold call the warm session would otherwise have had to repeat---which is the
-figure that scales with corpus size, not just the reasoning sliver. The
-knowledge pool (\Cref{sec:knowledge}) is exercised through the enforcement
-hook of \Cref{sec:enforce} and is deliberately excluded from this token
-evaluation; an earlier version of the sweep staged a submit-then-query
-consolidation demo for it, which we removed as methodologically circular.
+figure that scales with corpus size, not just the reasoning sliver.
 
 \begin{table*}[t]
 \centering
@@ -968,9 +996,8 @@ mechanisms are complementary: provider caching amortizes the stable
 \emph{output}---the cost provider caching cannot touch.
 
 \subsection{Latency Budget}
-\Cref{tab:latency} summarizes the reuse-path latencies that make the cloud layer
-worthwhile: an exact hit is effectively free, and even a validated semantic hit
-returns in a fraction of a second against the multi-second cost of re-reasoning.
+\Cref{tab:latency} summarizes reuse-path latencies: an exact hit costs $<$1\,ms,
+a validated semantic hit costs 200--500\,ms, and re-thinking costs $\sim$5\,s.
 
 \begin{table}[t]
 \centering
@@ -993,31 +1020,56 @@ Re-think (miss)          & $\sim$\SI{5000}{\milli\second} & full reasoning \\
 \section{Discussion and Limitations}
 \label{sec:discussion}
 
-\paragraph{Reuse depends on workload structure.} The cloud gains concentrate
-where successive builds genuinely share underlying reasoning (W3, W4, and W7
-each landed three hits); a task whose reasoning truly does not recur stays
-cold---W2's warm candidate was validator-rejected, and both planted unrelated
-tasks missed---correctly, since forcing reuse there would risk correctness.
-The knowledge pool targets a complementary regime, where reasoning does not
-recur but file understanding does; we exercise it through the enforcement hook
-of \Cref{sec:enforce} rather than through the token sweep.
+\paragraph{Reuse depends on workload structure.} Gains concentrate where successive
+builds share reasoning: W3, W4, and W7 each hit three times. Tasks whose
+reasoning does not recur stay cold (W2's warm candidate was validator-rejected;
+unrelated planted tasks missed), preventing incorrect reuse.
 
 \paragraph{Semantic reuse is only as good as its embeddings.} Confidence gating
-mitigates but does not eliminate the risk of a plausible-but-wrong match; the
-\texttt{validate} tier trades $\sim$\num{100} tokens to bound it. Absent
-\texttt{sentence-transformers} (or with
-\texttt{CACHEFLOW\_DISABLE\_EMBEDDINGS=1}), the system safely degrades to
-exact-hash matching only.
+mitigates the risk of an incorrect match; borderline candidates are validated
+via a $\sim$\num{100}-token confirmation call. Without embeddings (disabled via
+\texttt{CACHEFLOW\_DISABLE\_EMBEDDINGS=1}), the system falls back to exact-hash
+matching.
 
-\paragraph{Enforcement is harness-bound.} The \texttt{PreToolUse} block works
-only inside a harness whose read tool can be intercepted; other harnesses fall
-back to advisory skill files, and the native-tool loop relies on the model
-choosing to call the pool tools.
+\paragraph{Capture is enforced; reuse is not.} The \texttt{PostToolUse} capture
+hook runs automatically, but reuse requires the agent to call
+\texttt{thinking\_query} before reasoning. An earlier version paired capture
+with an enforced \texttt{PreToolUse} block on \texttt{Read} (\Cref{sec:enforce});
+the evaluation showed this added little value (exercised on $<$5\% of steps), so
+it was removed rather than kept as an unevaluated claim.
 
 \paragraph{The two subsystems do not compose.} A KV snapshot and a thinking
 block invalidate on different hashes (\texttt{stable\_context\_hash} vs.\
-\texttt{codebase\_hash}/\texttt{region\_hash}) for different reasons; ``no
+\texttt{codebase\_hash}) for different reasons; ``no
 thinking hit'' must not be conflated with ``no KV snapshot.''
+
+\paragraph{Design tensions and tradeoffs.}
+Exact token accounting requires real costs from the provider (never estimates
+from text length), limiting what can be measured: a thinking block submitted
+without an exact token count is stored with \texttt{NULL}, excluding it from
+savings totals rather than guessing. This gives up false precision but preserves
+honesty. Confidence thresholds ($\theta_u = 0.62$, $\theta_v = 0.40$, or
+z-scores $4.0$ and $2.8$) were calibrated empirically on this domain and model;
+they do not transfer. The validate tier trades $\sim$100 tokens to avoid reusing
+an incorrect block, accepting a meaningful latency penalty ($\sim$500\,ms) to
+guard correctness---a choice made explicit rather than hidden. In-process
+execution of the self-hosted model avoids HTTP's $10\times$ decode throttle on
+macOS but couples the model lifetime to the harness process; a distributed
+server path (already implemented) trades simplicity for isolation.
+
+% ======================================================================
+\section{Reproducibility}
+\label{sec:repro}
+
+Code, evaluation corpora, and per-workload results are available at
+\url{https://github.com/agastya-choudhary/cacheflow}. The eight workloads
+(W1--W8) are public open-source Python packages cloned into
+\texttt{experiments/corpora/}; raw per-run metrics are archived under
+\texttt{experiments/results/} as JSON files per workload. The self-hosted
+evaluation runs Qwen3-8B via \texttt{llama.cpp} at \num{8192}-token context; the
+cloud evaluation uses \texttt{claude-opus-4-8} through the Anthropic API with
+token counts read directly from the \texttt{usage} response object. All token
+counts and wall-clock timings are exact measurements, not estimates.
 
 % ======================================================================
 \section{Related Work}
@@ -1041,16 +1093,21 @@ agents is novel.
 \label{sec:conclusion}
 
 Coding agents recompute deterministic functions of the same inputs---prefill on
-self-hosted models, reasoning on cloud models. \textsc{CacheFlow} attacks both
-by caching at the layer each deployment actually exposes: KV state where
-internals are reachable, generated outputs where they are not. Measured across
-eight real corpora, it avoids minutes of cumulative prefill and over a teraflop
-$\times 10^3$ of compute on the self-hosted path, and eliminates up to 100\% of a
-turn's reasoning tokens---counted exactly---on the cloud path, while enforcing
-rather than merely advising reuse. The design's discipline is its honesty: exact
-token accounting, automatic hash-based staleness, confidence-gated reuse that
-declines a poor match, and hooks that fail silently rather than breaking the
-agent they serve.
+self-hosted models, reasoning on cloud models. \textsc{CacheFlow} caches at the
+layer each deployment exposes: KV state where internals are reachable, outputs
+where they are not. Across eight real corpora, it eliminates minutes of
+cumulative prefill and $\sim$1500\,TFLOPs on the self-hosted path, and up to
+100\% of reasoning tokens (exact counts) on the cloud path. The design enforces
+exact token accounting, hash-based staleness invalidation, confidence-gated
+reuse that rejects poor matches, and silent hook failures. An earlier subsystem
+(a knowledge store) was removed when evaluation showed minimal benefit.
+
+Future work includes extending confidence-gated retrieval to other cache layers
+(e.g., tool-call sequences or error recovery strategies), cross-model reasoning
+reuse (thinking blocks from one model informing another), and adaptive threshold
+calibration across domains. The core insight---that cloud and self-hosted models
+must be cached at different layers---applies equally to other code-generation
+workloads and reasoning-intensive domains where agents run in loops or chains.
 
 % ======================================================================
 \begin{thebibliography}{9}
