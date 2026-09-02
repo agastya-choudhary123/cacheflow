@@ -15,7 +15,6 @@ from cacheflow.store import CacheFlowStore
 from cacheflow.ollama import list_ollama_models, get_ollama_model_path, ollama_is_installed
 from cacheflow.sandbox import GitWorktreeSandbox, SandboxError
 from cacheflow.thinking_store import ThinkingStore
-from cacheflow.knowledge_store import KnowledgeStore
 from cacheflow import hooks as thinking_hooks
 from cacheflow import installer
 
@@ -123,11 +122,10 @@ def ensure_initialized(
     store = CacheFlowStore(db_path)
     store.init_db()
 
-    # Create the thinking/knowledge dbs now rather than lazily on first
-    # `cf thinking`/`cf knowledge` call, so a fresh `cf init` leaves the
-    # project fully ready for the capture-block hook on its very first turn.
+    # Create the thinking db now rather than lazily on first `cf thinking`
+    # call, so a fresh `cf init` leaves the project fully ready for the
+    # capture-block hook on its very first turn.
     ThinkingStore(str(base_path / ".cacheflow" / "thinking.db"))
-    KnowledgeStore(str(base_path / ".cacheflow" / "knowledge.db"))
 
     try:
         register_project(base_path.resolve(), db_path.resolve())
@@ -162,28 +160,14 @@ def init(ctx_size, n_gpu_layers, base_path):
 @cli.command()
 @click.option("--base-path", default=".", help="Project root")
 def install(base_path):
-    """Install the knowledge-sharing skill/rule files (Claude Code, Cursor,
-    Codex) and wire two hooks: a PostToolUse hook that captures extended
-    thinking blocks, and a PreToolUse hook that blocks a Read when a
-    knowledge-pool summary already exists for that exact file content (the
-    one enforced piece -- everything else is advisory skill text the model
-    can choose to follow or not). Safe to run repeatedly -- unchanged
-    targets are left as-is.
+    """Wire the PostToolUse hook that captures extended thinking blocks into
+    .claude/settings.json. Safe to run repeatedly -- an already-registered
+    hook is left as-is.
     """
     try:
         base_path = Path(base_path)
-        results = installer.install(base_path)
         post_hook_result = installer.install_hook(base_path)
-        pre_hook_result = installer.install_pretooluse_hook(base_path)
-
-        click.echo("Skill/rule files:")
-        for rel_path, action in results:
-            marker = {"created": "+", "updated": "~", "unchanged": "="}[action]
-            click.echo(f"  {marker} {rel_path} ({action})")
-
-        click.echo()
         click.echo(f"PostToolUse hook -- thinking capture (.claude/settings.json): {post_hook_result}")
-        click.echo(f"PreToolUse hook -- knowledge-pool enforcement on Read (.claude/settings.json): {pre_hook_result}")
     except Exception as e:
         raise click.ClickException(str(e))
 
@@ -932,168 +916,6 @@ def thinking_gc(older_than_days, base_path):
     except Exception as e:
         raise click.ClickException(str(e))
 
-
-@cli.group()
-def knowledge():
-    """Query and manage code understanding summaries."""
-    pass
-
-
-@knowledge.command("query")
-@click.argument("region")
-@click.option("--role", default=None, help="Role filter (implementer/reviewer/tester)")
-@click.option("--region-hash", required=True, help="Hash of region contents")
-@click.option("--base-path", default=".", help="Project root")
-def knowledge_query(region, role, region_hash, base_path):
-    """Query for knowledge summaries for a region."""
-    try:
-        base_path = Path(base_path)
-        db_path = base_path / ".cacheflow" / "knowledge.db"
-
-        store = KnowledgeStore(str(db_path))
-        summary = store.query(region, current_region_hash=region_hash, role=role)
-
-        if summary:
-            click.echo(f"Found knowledge summary for {region}:")
-            click.echo()
-            click.echo(summary)
-        else:
-            click.echo(f"No knowledge summary found for {region}.")
-    except Exception as e:
-        raise click.ClickException(str(e))
-
-
-@knowledge.command("check-before-read")
-@click.option("--base-path", default=".", help="Project root")
-def knowledge_check_before_read(base_path):
-    """Claude Code PreToolUse hook entry point (matcher: Read). Unlike the
-    cacheflow-knowledge skill -- advisory text the model can simply not
-    read or not follow -- this is enforced: on a knowledge-pool hit for the
-    exact file content about to be read, it blocks the Read (exit code 2,
-    which Claude Code surfaces to the model as feedback it must act on
-    before retrying) and tells the model to use `cf knowledge query`
-    instead. Best-effort otherwise: any ambiguity (missing payload, no git,
-    no stored summary) allows the read through rather than guessing.
-    """
-    import sys
-
-    try:
-        base_path = Path(base_path)
-        payload = json.loads(sys.stdin.read() or "{}")
-        if payload.get("tool_name") != "Read":
-            return
-
-        file_path = (payload.get("tool_input") or {}).get("file_path")
-        if not file_path:
-            return
-
-        resolved = Path(file_path)
-        if not resolved.is_absolute():
-            resolved = base_path / resolved
-        resolved = resolved.resolve()
-
-        region_hash = thinking_hooks.compute_region_hash(resolved)
-        if not region_hash:
-            return  # no git / missing file -- nothing to check against
-
-        try:
-            region = str(resolved.relative_to(base_path.resolve()))
-        except ValueError:
-            region = str(resolved)
-
-        db_path = base_path / ".cacheflow" / "knowledge.db"
-        store = KnowledgeStore(str(db_path))
-        summary = store.query(region, current_region_hash=region_hash)
-        if not summary:
-            return  # no cached summary for this exact content -- read normally
-
-        sys.stderr.write(
-            f"A knowledge summary already exists for {region} (content unchanged "
-            f"since it was written). Run this instead of reading the raw file:\n\n"
-            f'  cf knowledge query "{region}" --region-hash {region_hash}\n\n'
-            "It costs far fewer tokens than the raw file and was written by a prior "
-            "agent specifically to save you from re-reading and re-understanding it.\n"
-        )
-        sys.exit(2)
-    except Exception:
-        # Never let a hook failure block a real read it has no informed
-        # opinion about.
-        return
-
-
-@knowledge.command("submit")
-@click.argument("region")
-@click.option("--region-hash", required=True, help="Hash of region contents")
-@click.option("--role", default=None, help="Role (implementer/reviewer/tester)")
-@click.option("--summary-file", type=click.File("r"), required=True, help="Path to summary file (or - for stdin)")
-@click.option("--source-agent", default="claude", help="Source agent")
-@click.option(
-    "--token-count", default=None, type=int,
-    help="Exact token count for this summary, e.g. from your own API "
-         "usage.output_tokens. Omit if unknown -- stored as NULL rather "
-         "than guessed from text length.",
-)
-@click.option("--base-path", default=".", help="Project root")
-def knowledge_submit(region, region_hash, role, summary_file, source_agent, token_count, base_path):
-    """Submit a knowledge summary for a region."""
-    try:
-        base_path = Path(base_path)
-        db_path = base_path / ".cacheflow" / "knowledge.db"
-
-        summary = summary_file.read()
-        store = KnowledgeStore(str(db_path))
-        entry_id = store.submit(
-            region=region,
-            summary=summary,
-            source_agent=source_agent,
-            region_hash=region_hash,
-            role=role,
-            token_count=token_count,
-        )
-        click.echo(f"✓ Submitted knowledge summary (ID: {entry_id}, {len(summary)} chars, token_count={token_count})")
-    except Exception as e:
-        raise click.ClickException(str(e))
-
-
-@knowledge.command("list")
-@click.option("--region", default=None, help="Filter by region")
-@click.option("--limit", default=20, type=int, help="Max entries to show")
-@click.option("--base-path", default=".", help="Project root")
-def knowledge_list(region, limit, base_path):
-    """List knowledge summaries."""
-    try:
-        base_path = Path(base_path)
-        db_path = base_path / ".cacheflow" / "knowledge.db"
-
-        store = KnowledgeStore(str(db_path))
-        entries = store.list_entries(region=region, limit=limit)
-
-        if not entries:
-            click.echo("No knowledge entries found.")
-            return
-
-        click.echo(f"Knowledge entries ({len(entries)}):\n")
-        for entry in entries:
-            click.echo(f"  ID: {entry['id']} | Region: {entry['region']} | Role: {entry['role']}")
-            click.echo(f"     Source: {entry['source_agent']} | Created: {entry['created_at']}")
-    except Exception as e:
-        raise click.ClickException(str(e))
-
-
-@knowledge.command("gc")
-@click.option("--older-than-days", default=60, type=int, help="Delete entries older than N days")
-@click.option("--base-path", default=".", help="Project root")
-def knowledge_gc(older_than_days, base_path):
-    """Garbage collect old knowledge entries."""
-    try:
-        base_path = Path(base_path)
-        db_path = base_path / ".cacheflow" / "knowledge.db"
-
-        store = KnowledgeStore(str(db_path))
-        deleted = store.garbage_collect(older_than_days=older_than_days)
-        click.echo(f"✓ Deleted {deleted} knowledge entries older than {older_than_days} days")
-    except Exception as e:
-        raise click.ClickException(str(e))
 
 
 if __name__ == "__main__":

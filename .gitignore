@@ -22,3 +22,9 @@ test_all_commands.py
 real_test_commands.py
 run_on_codebase.py
 scripts/validate_llama_api.py
+
+# vendored benchmark corpora (third-party checkouts, fetched by experiments/)
+experiments/corpora/
+experiments/results/
+
+.DS_Store

@@ -342,54 +342,6 @@ def _cacheflow_status(args: dict, ctx: ToolContext) -> str:
     )
 
 
-def _knowledge_query(args: dict, ctx: ToolContext) -> str:
-    """Check the knowledge pool before reading/re-analyzing a file -- the
-    same pool the cacheflow-knowledge skill tells external (Claude Code/
-    Cursor/Codex) agents to check, wired in directly here instead of via a
-    `cf knowledge query` subprocess so this loop's own model can use it.
-    Computes region_hash itself (git hash-object) rather than asking the
-    model to compute and pass one, since that's pure boilerplate for it.
-    """
-    from cacheflow import hooks as cf_hooks
-    from cacheflow.knowledge_store import KnowledgeStore
-
-    target = _resolve_in_workspace(ctx, args["path"])
-    region_hash = cf_hooks.compute_region_hash(target)
-    if not region_hash:
-        return f"ERROR: could not hash {args['path']} (missing file, or not in a git repo)"
-
-    store = KnowledgeStore(str(ctx.base_path / ".cacheflow" / "knowledge.db"))
-    summary = store.query(args["path"], current_region_hash=region_hash, role=args.get("role"))
-    if not summary:
-        return f"No knowledge summary found for {args['path']} (read it directly)."
-    return f"Knowledge summary for {args['path']} (skip reading the raw file):\n\n{summary}"
-
-
-def _knowledge_submit(args: dict, ctx: ToolContext) -> str:
-    """Submit a summary of a file/region this agent just analyzed, so a
-    later agent (local or, via the same pool, an external Claude Code/
-    Cursor/Codex agent) can reuse it instead of re-reading and
-    re-understanding the raw code. Needs --auto, same as write_file/
-    edit_file -- it's a side effect on shared local state, not a read.
-    """
-    if not ctx.allow_writes:
-        return "ERROR: knowledge_submit is disabled (run with --auto to enable)"
-    from cacheflow import hooks as cf_hooks
-    from cacheflow.knowledge_store import KnowledgeStore
-
-    target = _resolve_in_workspace(ctx, args["path"])
-    region_hash = cf_hooks.compute_region_hash(target)
-    if not region_hash:
-        return f"ERROR: could not hash {args['path']} (missing file, or not in a git repo)"
-
-    store = KnowledgeStore(str(ctx.base_path / ".cacheflow" / "knowledge.db"))
-    entry_id = store.submit(
-        region=args["path"], summary=args["summary"], source_agent="cacheflow-local-agent",
-        region_hash=region_hash, role=args.get("role"),
-    )
-    return f"OK: submitted knowledge summary for {args['path']} (ID: {entry_id})"
-
-
 def _thinking_query(args: dict, ctx: ToolContext) -> str:
     """Check the thinking-block pool before reasoning at length about a
     problem this agent (or another agent, local or cloud) may have already
@@ -425,8 +377,6 @@ TOOLS: Dict[str, tuple[Callable[[dict, ToolContext], str], str]] = {
     "syntax_check": (_syntax_check, 'syntax_check {"path": "rel/path"} — verify a file parses (Python/JSON); run this after editing to catch mistakes'),
     "run_bash": (_run_bash, 'run_bash {"command": "..."} — run a shell command (needs --allow-bash)'),
     "cacheflow_status": (_cacheflow_status, 'cacheflow_status {} — this agent\'s own KV-cache session metrics (baseline/cumulative tokens saved), same numbers `cf status` shows a human'),
-    "knowledge_query": (_knowledge_query, 'knowledge_query {"path": "rel/path", "role"?: "implementer|reviewer|tester"} — check the knowledge pool before reading a file; use the returned summary instead of read_file if found'),
-    "knowledge_submit": (_knowledge_submit, 'knowledge_submit {"path": "rel/path", "summary": "...", "role"?: "..."} — submit a dense summary of a file you analyzed, for later agents to reuse (needs --auto)'),
     "thinking_query": (_thinking_query, 'thinking_query {"problem": "description", "role"?: "..."} — check the thinking-block pool before reasoning at length about a problem; reuse if a confident match exists'),
     "finish": (None, 'finish {"answer": "..."} — end the task with a final answer'),
 }
